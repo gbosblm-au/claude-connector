@@ -66,7 +66,7 @@ let serverError = "";
 
 serverProc.stderr.on("data", (d) => {
   const msg = d.toString();
-  if (msg.includes("listening on")) serverReady = true;
+  if (msg.includes("on http://") || msg.includes("listening on")) serverReady = true;
   if (msg.includes("error") || msg.includes("Error")) serverError = msg;
 });
 

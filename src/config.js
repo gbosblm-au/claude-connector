@@ -1,10 +1,6 @@
 // config.js
 // Reads and validates environment configuration at startup.
 
-const REQUIRED_FOR_BRAVE = ["BRAVE_API_KEY"];
-const REQUIRED_FOR_TAVILY = ["TAVILY_API_KEY"];
-const REQUIRED_FOR_NEWSAPI = ["NEWS_API_KEY"];
-
 export const config = {
   // Search provider: "brave" | "tavily"
   searchProvider: (process.env.SEARCH_PROVIDER || "brave").toLowerCase(),
@@ -12,7 +8,7 @@ export const config = {
   // News provider: "brave" | "newsapi"
   newsProvider: (process.env.NEWS_PROVIDER || "brave").toLowerCase(),
 
-  // API keys
+  // API keys - search & news
   braveApiKey: process.env.BRAVE_API_KEY || "",
   tavilyApiKey: process.env.TAVILY_API_KEY || "",
   newsApiKey: process.env.NEWS_API_KEY || "",
@@ -27,6 +23,16 @@ export const config = {
     process.env.LINKEDIN_PROFILE_PATH ||
     new URL("../../data/profile.json", import.meta.url).pathname,
 
+  // LinkedIn OAuth 2.0 (optional - for live profile fetching)
+  // Get these from https://www.linkedin.com/developers/apps/new
+  linkedinClientId: process.env.LINKEDIN_CLIENT_ID || "",
+  linkedinClientSecret: process.env.LINKEDIN_CLIENT_SECRET || "",
+  linkedinRedirectUri:
+    process.env.LINKEDIN_REDIRECT_URI ||
+    (process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/auth/linkedin/callback`
+      : "http://localhost:3000/auth/linkedin/callback"),
+
   // Default result limits
   defaultWebResults: parseInt(process.env.DEFAULT_WEB_RESULTS || "10", 10),
   defaultNewsResults: parseInt(process.env.DEFAULT_NEWS_RESULTS || "10", 10),
@@ -37,22 +43,22 @@ export const config = {
 };
 
 // -----------------------------------------------------------------------
-// Validation helpers (called lazily per tool so the server still starts
-// even if only some keys are missing)
+// Validation helpers (called lazily per tool)
 // -----------------------------------------------------------------------
 
 export function requireBraveKey() {
   if (!config.braveApiKey) {
     throw new Error(
-      "BRAVE_API_KEY is not set. Add it to your .env file or MCP environment configuration."
+      "BRAVE_API_KEY is not set. Add it in Railway Variables."
     );
   }
 }
 
 export function requireTavilyKey() {
-  if (!config.tavilyApiKey) {
+  if (!config.tavilyApiKey || config.tavilyApiKey === "your_tavily_api_key_here") {
     throw new Error(
-      "TAVILY_API_KEY is not set. Add it to your .env file or MCP environment configuration."
+      "TAVILY_API_KEY is not set or is still the placeholder value. " +
+      "Either set a real key at https://app.tavily.com or switch to SEARCH_PROVIDER=brave."
     );
   }
 }
@@ -60,7 +66,20 @@ export function requireTavilyKey() {
 export function requireNewsApiKey() {
   if (!config.newsApiKey) {
     throw new Error(
-      "NEWS_API_KEY is not set. Add it to your .env file or MCP environment configuration."
+      "NEWS_API_KEY is not set. Add it in Railway Variables or switch NEWS_PROVIDER=brave."
+    );
+  }
+}
+
+export function requireLinkedinOAuth() {
+  if (!config.linkedinClientId) {
+    throw new Error(
+      "LINKEDIN_CLIENT_ID is not set. See linkedin_start_oauth tool for setup instructions."
+    );
+  }
+  if (!config.linkedinClientSecret) {
+    throw new Error(
+      "LINKEDIN_CLIENT_SECRET is not set. See linkedin_start_oauth tool for setup instructions."
     );
   }
 }

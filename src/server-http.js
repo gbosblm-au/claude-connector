@@ -1,76 +1,52 @@
-// src/server-http.js
-// HTTP-based MCP server for use with browser-based Claude (claude.ai).
+// src/server-http.js  v2.0.0
+// HTTP MCP server for browser-based Claude (claude.ai)
 //
-// Architecture:
-//   - Primary transport:  Streamable HTTP  (POST/GET /mcp)   - required for claude.ai
-//   - Legacy transport:   SSE              (GET /sse, POST /messages) - for older clients
-//   - Upload endpoint:    POST /upload/connections  - lets you push a new connections.csv
-//   - Health endpoint:    GET /health               - liveness check
-//
-// Claude.ai connects to this server from Anthropic's cloud infrastructure.
-// The server must be reachable over public HTTPS.
-// For local development, use ngrok or Cloudflare Tunnel to expose it.
+// v2 CHANGES:
+//   - REMOVED Bearer token auth from /mcp endpoint (was blocking claude.ai)
+//   - ADDED LinkedIn OAuth 2.0 callback at GET /auth/linkedin/callback
+//   - ADDED 4 new LinkedIn OAuth tools
+//   - UPLOAD_API_KEY still protects the CSV upload endpoint
 
 import "dotenv/config";
 import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { writeFileSync, existsSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
+import { dirname } from "path";
 import { fileURLToPath } from "url";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { isInitializeRequest, CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
+import { webSearchToolDefinition, handleWebSearch } from "./tools/webSearch.js";
+import { newsSearchToolDefinition, handleNewsSearch } from "./tools/newsSearch.js";
 import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-
-import {
-  webSearchToolDefinition,
-  handleWebSearch,
-} from "./tools/webSearch.js";
-import {
-  newsSearchToolDefinition,
-  handleNewsSearch,
-} from "./tools/newsSearch.js";
-import {
-  linkedinLoadToolDefinition,
-  linkedinSearchToolDefinition,
-  linkedinCountToolDefinition,
-  linkedinProfileToolDefinition,
-  handleLinkedinLoad,
-  handleLinkedinSearch,
-  handleLinkedinCount,
-  handleLinkedinProfile,
+  linkedinLoadToolDefinition, linkedinSearchToolDefinition,
+  linkedinCountToolDefinition, linkedinProfileToolDefinition,
+  handleLinkedinLoad, handleLinkedinSearch,
+  handleLinkedinCount, handleLinkedinProfile,
 } from "./tools/linkedin.js";
+import {
+  linkedinOAuthStartToolDefinition, linkedinOAuthStatusToolDefinition,
+  linkedinOAuthLogoutToolDefinition, linkedinLiveProfileToolDefinition,
+  handleLinkedinOAuthStart, handleLinkedinOAuthStatus,
+  handleLinkedinOAuthLogout, handleLinkedinLiveProfile,
+} from "./tools/linkedinOAuth.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// -----------------------------------------------------------------------
-// Configuration
-// -----------------------------------------------------------------------
+import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
+import { config } from "./config.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
-
-// Optional API key to protect the upload and admin endpoints.
-// If not set, upload endpoint is disabled.
 const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
 
-// Optional API key to restrict MCP access (recommended for production).
-// If set, requests must include: Authorization: Bearer <MCP_API_KEY>
-const MCP_API_KEY = process.env.MCP_API_KEY || "";
-
 // -----------------------------------------------------------------------
-// Tool registry (same as stdio server)
+// Tool registry
 // -----------------------------------------------------------------------
-
 const TOOLS = [
   webSearchToolDefinition,
   newsSearchToolDefinition,
@@ -78,55 +54,51 @@ const TOOLS = [
   linkedinSearchToolDefinition,
   linkedinCountToolDefinition,
   linkedinProfileToolDefinition,
+  linkedinOAuthStartToolDefinition,
+  linkedinOAuthStatusToolDefinition,
+  linkedinOAuthLogoutToolDefinition,
+  linkedinLiveProfileToolDefinition,
   {
     name: "get_current_datetime",
-    description:
-      "Returns the current UTC date and time. Useful for anchoring time-sensitive queries.",
+    description: "Returns the current UTC date and time.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
 ];
 
 // -----------------------------------------------------------------------
 // MCP Server factory
-// Each Streamable HTTP session gets its own Server instance to avoid
-// request-ID collisions across concurrent sessions.
 // -----------------------------------------------------------------------
-
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "1.0.0" },
+    { name: "claude-connector", version: "2.0.0" },
     { capabilities: { tools: {} } }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    log("debug", "ListTools");
-    return { tools: TOOLS };
-  });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    log("info", `Tool call: ${name}`);
+    log("info", `Tool: ${name}`);
     try {
       switch (name) {
-        case "web_search":               return await handleWebSearch(args);
-        case "news_search":              return await handleNewsSearch(args);
-        case "linkedin_load_connections": return await handleLinkedinLoad(args);
+        case "web_search":                  return await handleWebSearch(args);
+        case "news_search":                 return await handleNewsSearch(args);
+        case "linkedin_load_connections":   return await handleLinkedinLoad(args);
         case "linkedin_search_connections": return await handleLinkedinSearch(args);
-        case "linkedin_connection_count":  return await handleLinkedinCount(args);
-        case "linkedin_get_profile":      return await handleLinkedinProfile(args);
-        case "get_current_datetime": {
-          const dt = getCurrentDateTime();
-          return { content: [{ type: "text", text: JSON.stringify(dt, null, 2) }] };
-        }
+        case "linkedin_connection_count":   return await handleLinkedinCount(args);
+        case "linkedin_get_profile":        return await handleLinkedinProfile(args);
+        case "linkedin_start_oauth":        return await handleLinkedinOAuthStart(args);
+        case "linkedin_oauth_status":       return await handleLinkedinOAuthStatus(args);
+        case "linkedin_oauth_logout":       return await handleLinkedinOAuthLogout(args);
+        case "linkedin_get_live_profile":   return await handleLinkedinLiveProfile(args);
+        case "get_current_datetime":
+          return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
         default:
           throw new Error(`Unknown tool: "${name}"`);
       }
     } catch (err) {
       log("error", `Tool "${name}" error: ${err.message}`);
-      return {
-        content: [{ type: "text", text: `Error: ${err.message}` }],
-        isError: true,
-      };
+      return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
     }
   });
 
@@ -136,297 +108,234 @@ function createMcpServer() {
 // -----------------------------------------------------------------------
 // Express app
 // -----------------------------------------------------------------------
-
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// CORS: Anthropic's cloud infrastructure must be able to reach this server.
-// The wildcard is safe here because MCP_API_KEY provides authentication.
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Mcp-Session-Id, Accept"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Accept");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  if (req.method === "OPTIONS") {
-    res.sendStatus(204);
-    return;
-  }
+  if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
 
 // -----------------------------------------------------------------------
-// Optional Bearer token auth for MCP endpoints
+// Health
 // -----------------------------------------------------------------------
-
-function mcpAuthMiddleware(req, res, next) {
-  if (!MCP_API_KEY) return next(); // auth disabled
-
-  const authHeader = req.headers["authorization"] || "";
-  const token = authHeader.startsWith("Bearer ")
-    ? authHeader.slice(7).trim()
-    : "";
-
-  if (token !== MCP_API_KEY) {
-    log("warn", `Rejected request to ${req.path} - invalid or missing API key`);
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-  next();
-}
-
-// -----------------------------------------------------------------------
-// Health endpoint (unprotected - for uptime monitors and deployment checks)
-// -----------------------------------------------------------------------
-
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "1.0.0",
+    version: "2.0.0",
     transport: ["streamable-http", "sse-legacy"],
+    linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
     timestamp: new Date().toISOString(),
   });
 });
 
 // -----------------------------------------------------------------------
-// Streamable HTTP transport  (primary - required for claude.ai)
-// Endpoint: POST /mcp  and  GET /mcp
+// LinkedIn OAuth callback
 // -----------------------------------------------------------------------
+app.get("/auth/linkedin/callback", async (req, res) => {
+  const { code, state, error, error_description } = req.query;
 
-// Session store for stateful Streamable HTTP connections
-const streamableSessions = {};
-
-app.all("/mcp", mcpAuthMiddleware, async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
-
-  try {
-    // ---- Re-use existing session ----
-    if (sessionId && streamableSessions[sessionId]) {
-      const transport = streamableSessions[sessionId];
-      await transport.handleRequest(req, res, req.body);
-      return;
-    }
-
-    // ---- New session: must be an Initialize request ----
-    if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-      });
-
-      const server = createMcpServer();
-
-      // Clean up when session closes
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          log("info", `Session closed: ${transport.sessionId}`);
-          delete streamableSessions[transport.sessionId];
-        }
-      };
-
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-
-      // Store after handling so sessionId is populated
-      if (transport.sessionId) {
-        streamableSessions[transport.sessionId] = transport;
-        log("info", `New session created: ${transport.sessionId}`);
-      }
-      return;
-    }
-
-    // ---- GET without session: open SSE notification stream ----
-    if (req.method === "GET" && !sessionId) {
-      // Stateless GET - return 405 to signal the client should use POST
-      res.status(405).json({ error: "Session required for GET requests" });
-      return;
-    }
-
-    // ---- Anything else is invalid ----
-    res
-      .status(400)
-      .json({ error: "Bad Request: missing or invalid session ID" });
-  } catch (err) {
-    log("error", `Streamable HTTP error: ${err.message}`);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Internal server error" });
-    }
-  }
-});
-
-// -----------------------------------------------------------------------
-// Legacy SSE transport (for backwards compatibility with older clients)
-// Endpoints: GET /sse  and  POST /messages
-// -----------------------------------------------------------------------
-
-const sseSessions = {};
-
-app.get("/sse", mcpAuthMiddleware, async (req, res) => {
-  log("info", "New SSE connection");
-  const transport = new SSEServerTransport("/messages", res);
-  sseSessions[transport.sessionId] = transport;
-
-  res.on("close", () => {
-    log("info", `SSE session closed: ${transport.sessionId}`);
-    delete sseSessions[transport.sessionId];
-  });
-
-  const server = createMcpServer();
-  await server.connect(transport);
-});
-
-app.post("/messages", mcpAuthMiddleware, async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = sseSessions[sessionId];
-
-  if (!transport) {
-    log("warn", `SSE message for unknown session: ${sessionId}`);
-    res.status(404).json({ error: "Session not found" });
+  if (error) {
+    res.status(400).send(`<html><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px">
+      <h2 style="color:#c00">LinkedIn Authorization Failed</h2>
+      <p><strong>Error:</strong> ${error}</p><p>${error_description || ""}</p>
+      <p>Close this tab and call <code>linkedin_start_oauth</code> again in Claude.</p>
+    </body></html>`);
     return;
   }
 
+  if (!code || !state) {
+    res.status(400).send(`<html><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px">
+      <h2 style="color:#c00">Invalid Callback</h2><p>Missing code or state. Try the authorization flow again.</p>
+    </body></html>`);
+    return;
+  }
+
+  if (!validateAndConsumeState(state)) {
+    res.status(400).send(`<html><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px">
+      <h2 style="color:#c00">Expired or Invalid State</h2>
+      <p>The authorization link expired (10 min limit) or was already used.</p>
+      <p>Call <code>linkedin_start_oauth</code> in Claude to get a fresh link.</p>
+    </body></html>`);
+    return;
+  }
+
+  try {
+    const tokenResp = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: config.linkedinRedirectUri,
+        client_id: config.linkedinClientId,
+        client_secret: config.linkedinClientSecret,
+      }).toString(),
+    });
+
+    if (!tokenResp.ok) {
+      const errBody = await tokenResp.text().catch(() => "");
+      throw new Error(`LinkedIn token exchange failed (${tokenResp.status}): ${errBody}`);
+    }
+
+    const tokenData = await tokenResp.json();
+    storeToken(tokenData);
+    log("info", "LinkedIn token stored successfully");
+
+    const expiresHours = tokenData.expires_in ? Math.round(tokenData.expires_in / 3600) : "unknown";
+
+    res.send(`<html>
+    <head><title>LinkedIn Connected</title></head>
+    <body style="font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center">
+      <div style="background:#e8f5e9;border:2px solid #4caf50;border-radius:10px;padding:40px">
+        <h2 style="color:#2e7d32;margin-top:0">LinkedIn Connected!</h2>
+        <p style="font-size:16px">Your LinkedIn account is now authorized.</p>
+        <p>Close this tab and return to Claude.</p>
+        <p>Call <strong>linkedin_get_live_profile</strong> to fetch your profile,
+        or <strong>linkedin_oauth_status</strong> to confirm the connection.</p>
+      </div>
+      <p style="color:#888;font-size:12px;margin-top:20px">Token expires in approx. ${expiresHours} hours</p>
+    </body></html>`);
+  } catch (err) {
+    log("error", `LinkedIn callback error: ${err.message}`);
+    res.status(500).send(`<html><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px">
+      <h2 style="color:#c00">Server Error</h2><p>${err.message}</p>
+      <p>Try <code>linkedin_start_oauth</code> again in Claude.</p>
+    </body></html>`);
+  }
+});
+
+// -----------------------------------------------------------------------
+// Streamable HTTP - PRIMARY MCP TRANSPORT FOR CLAUDE.AI
+// NO authentication on this endpoint - claude.ai does not support
+// custom Bearer token auth when connecting to custom connectors.
+// -----------------------------------------------------------------------
+const streamableSessions = {};
+
+app.all("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  try {
+    if (sessionId && streamableSessions[sessionId]) {
+      await streamableSessions[sessionId].handleRequest(req, res, req.body);
+      return;
+    }
+    if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+      const server = createMcpServer();
+      transport.onclose = () => {
+        if (transport.sessionId) { delete streamableSessions[transport.sessionId]; }
+      };
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      if (transport.sessionId) {
+        streamableSessions[transport.sessionId] = transport;
+        log("info", `New session: ${transport.sessionId}`);
+      }
+      return;
+    }
+    if (req.method === "GET" && !sessionId) {
+      res.status(405).json({ error: "Session required for GET" });
+      return;
+    }
+    res.status(400).json({ error: "Bad request: missing or invalid session" });
+  } catch (err) {
+    log("error", `MCP error: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// -----------------------------------------------------------------------
+// Legacy SSE transport
+// -----------------------------------------------------------------------
+const sseSessions = {};
+
+app.get("/sse", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  sseSessions[transport.sessionId] = transport;
+  res.on("close", () => { delete sseSessions[transport.sessionId]; });
+  await createMcpServer().connect(transport);
+});
+
+app.post("/messages", async (req, res) => {
+  const transport = sseSessions[req.query.sessionId];
+  if (!transport) { res.status(404).json({ error: "Session not found" }); return; }
   await transport.handlePostMessage(req, res, req.body);
 });
 
 // -----------------------------------------------------------------------
-// Upload endpoint - push a new Connections.csv to the server
-// Protected by UPLOAD_API_KEY (must be set in .env to enable)
+// CSV upload endpoint (protected by UPLOAD_API_KEY)
 // -----------------------------------------------------------------------
-
 app.post("/upload/connections", async (req, res) => {
   if (!UPLOAD_API_KEY) {
-    res.status(403).json({
-      error:
-        "Upload endpoint is disabled. Set UPLOAD_API_KEY in your environment to enable it.",
-    });
+    res.status(403).json({ error: "Upload disabled. Set UPLOAD_API_KEY in Railway Variables." });
     return;
   }
-
-  const key = req.headers["x-upload-key"] || "";
-  if (key !== UPLOAD_API_KEY) {
+  if ((req.headers["x-upload-key"] || "") !== UPLOAD_API_KEY) {
     res.status(401).json({ error: "Invalid upload key" });
     return;
   }
 
-  // Accept either raw CSV text in body, or a base64-encoded CSV
-  const contentType = req.headers["content-type"] || "";
+  const ct = req.headers["content-type"] || "";
   let csvContent = "";
-
-  if (contentType.includes("text/csv") || contentType.includes("text/plain")) {
-    // Raw text body - express.json() won't parse this, read raw
-    csvContent = await readRawBody(req);
-  } else if (req.body && req.body.csv_base64) {
-    // JSON body with base64-encoded CSV
+  if (ct.includes("text/csv") || ct.includes("text/plain")) {
+    csvContent = await new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on("data", c => chunks.push(c));
+      req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+      req.on("error", reject);
+    });
+  } else if (req.body?.csv_base64) {
     csvContent = Buffer.from(req.body.csv_base64, "base64").toString("utf-8");
-  } else if (req.body && req.body.csv) {
-    // JSON body with raw CSV string
+  } else if (req.body?.csv) {
     csvContent = req.body.csv;
   } else {
-    res.status(400).json({
-      error:
-        "Provide CSV as: (a) raw text/csv body, (b) JSON {csv: '...'}, or (c) JSON {csv_base64: '...'}",
-    });
+    res.status(400).json({ error: "Provide CSV as text/csv body, JSON {csv: '...'} or {csv_base64: '...'}" });
     return;
   }
 
-  if (!csvContent || csvContent.trim().length === 0) {
-    res.status(400).json({ error: "CSV content is empty" });
-    return;
-  }
+  if (!csvContent?.trim()) { res.status(400).json({ error: "CSV is empty" }); return; }
 
-  // Determine write path
-  const { config } = await import("./config.js");
   const targetPath = config.linkedinCsvPath;
-
-  // Ensure directory exists
   const dir = dirname(targetPath);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   try {
     writeFileSync(targetPath, csvContent, "utf-8");
-    log("info", `Connections CSV uploaded: ${csvContent.length} bytes -> ${targetPath}`);
-    res.json({
-      success: true,
-      message: `Connections CSV saved to ${targetPath}`,
-      bytes: csvContent.length,
-    });
+    log("info", `CSV uploaded: ${csvContent.length} bytes`);
+    res.json({ success: true, bytes: csvContent.length });
   } catch (err) {
-    log("error", `CSV write failed: ${err.message}`);
-    res.status(500).json({ error: `Failed to save CSV: ${err.message}` });
+    res.status(500).json({ error: `Write failed: ${err.message}` });
   }
 });
 
-// Helper: read raw body from request (for text/csv uploads)
-function readRawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    req.on("error", reject);
-  });
-}
-
 // -----------------------------------------------------------------------
-// 404 fallback
+// 404
 // -----------------------------------------------------------------------
-
 app.use((_req, res) => {
   res.status(404).json({
     error: "Not found",
     endpoints: {
-      mcp: "POST /mcp  (Streamable HTTP - claude.ai compatible)",
-      sse: "GET /sse   (Legacy SSE transport)",
-      messages: "POST /messages  (Legacy SSE message endpoint)",
+      mcp: "POST /mcp",
       health: "GET /health",
-      upload: "POST /upload/connections  (requires UPLOAD_API_KEY header)",
+      linkedinCallback: "GET /auth/linkedin/callback",
+      upload: "POST /upload/connections",
     },
   });
 });
 
 // -----------------------------------------------------------------------
-// Start server
+// Start
 // -----------------------------------------------------------------------
-
 const httpServer = createServer(app);
-
 httpServer.listen(PORT, HOST, () => {
-  log(
-    "info",
-    `claude-connector HTTP server listening on http://${HOST}:${PORT}`
-  );
-  log("info", `MCP endpoint (Streamable HTTP): http://${HOST}:${PORT}/mcp`);
-  log("info", `MCP endpoint (Legacy SSE):       http://${HOST}:${PORT}/sse`);
-  log("info", `Health check:                    http://${HOST}:${PORT}/health`);
-
-  if (MCP_API_KEY) {
-    log("info", "MCP API key authentication is ENABLED");
-  } else {
-    log(
-      "warn",
-      "MCP API key authentication is DISABLED. Set MCP_API_KEY in .env for production use."
-    );
-  }
-
-  if (UPLOAD_API_KEY) {
-    log("info", "CSV upload endpoint is ENABLED at POST /upload/connections");
-  }
+  log("info", `claude-connector v2.0.0 on http://${HOST}:${PORT}`);
+  log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
+  log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
 });
 
-// Graceful shutdown
-process.on("SIGINT",  () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-async function shutdown(signal) {
-  log("info", `${signal} received, shutting down gracefully...`);
-  httpServer.close(() => {
-    log("info", "HTTP server closed");
-    process.exit(0);
-  });
-  setTimeout(() => {
-    log("warn", "Forced shutdown after timeout");
-    process.exit(1);
-  }, 5000);
-}
+process.on("SIGINT",  () => { httpServer.close(() => process.exit(0)); });
+process.on("SIGTERM", () => { httpServer.close(() => process.exit(0)); });
