@@ -1,0 +1,16 @@
+# railway.toml
+# Railway deployment configuration for claude-connector.
+# https://railway.app
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "node src/server-http.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "claude-connector"

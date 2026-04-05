@@ -1,0 +1,12 @@
+{
+  "name": "Your Full Name",
+  "headline": "Your Job Title at Your Company",
+  "location": "Melbourne, VIC, Australia",
+  "industry": "Technology",
+  "summary": "Brief professional summary here.",
+  "email": "you@example.com",
+  "linkedinUrl": "https://www.linkedin.com/in/yourprofile",
+  "currentCompany": "Your Company",
+  "currentPosition": "Your Job Title",
+  "note": "Edit this file with your actual LinkedIn profile details, or replace it with a profile.json from your LinkedIn data export."
+}

@@ -1,0 +1,33 @@
+{
+  "name": "claude-connector",
+  "version": "1.0.0",
+  "description": "MCP server for Claude with real-time web search, news search, and LinkedIn connections lookup",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:http": "node src/server-http.js",
+    "dev": "node --watch src/index.js",
+    "dev:http": "node --watch src/server-http.js",
+    "test": "node src/test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "anthropic",
+    "linkedin",
+    "web-search",
+    "news",
+    "ai-agent"
+  ],
+  "license": "MIT"
+}
