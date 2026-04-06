@@ -15,6 +15,13 @@ A fully functional **MCP (Model Context Protocol) server** that gives Claude rea
 ---
 
 
+## What's New in v5.0.0
+
+- **`wordpress_set_seo_meta`** — Sets Yoast SEO and RankMath meta title and description on any page or post directly from Claude. Validates character length and provides feedback.
+- **`wordpress_create_service_page`** — Creates a fully structured, brand-consistent TrueSource service page with hero, intro section, outcomes list, capabilities grid, FAQs, and CTA. Output is Elementor-compatible HTML. Accepts `custom_css_overrides` for page-specific style adjustments.
+- **Market Intelligence and Service Page Publisher skill** — See `SKILL-market-intelligence-publisher.md`. Orchestrates the full workflow: website analysis, competitor research, gap identification, service page drafting, publishing, SEO meta tagging, and navigation menu update.
+- **Backward compatible** — All v4 tools continue to work unchanged.
+
 ## What's New in v4.0.0
 
 - **Runtime credential management** — Set WordPress and LinkedIn credentials directly from the Claude chat window using new MCP tools. No Railway dashboard required after initial deployment.

@@ -1,18 +1,11 @@
-// src/server-http.js  v4.0.0
+// src/server-http.js  v5.0.0
 // HTTP MCP server for browser-based Claude (claude.ai)
 //
-// v4 CHANGES:
-//   - ADDED runtime credential management tools (set/get/clear for WordPress and LinkedIn)
-//   - WordPress and LinkedIn credentials can now be set from Claude chat without Railway redeploy
-//   - wordpress.js and linkedinOAuth.js now read from credentialStore with env var fallback
-//   - LinkedIn OAuth callback updated to resolve client_id/secret from credentialStore
-//   - Version bumped to 4.0.0
-//
-// v3 CHANGES:
-//   - REMOVED Bearer token auth from /mcp endpoint (was blocking claude.ai)
-//   - ADDED LinkedIn OAuth 2.0 callback at GET /auth/linkedin/callback
-//   - ADDED 4 new LinkedIn OAuth tools
-//   - UPLOAD_API_KEY still protects the CSV upload endpoint
+// v5 CHANGES:
+//   - ADDED wordpress_set_seo_meta — sets Yoast SEO / RankMath meta on any page or post
+//   - ADDED wordpress_create_service_page — creates brand-consistent TrueSource service pages
+//     with Elementor-compatible HTML structure, capabilities grid, FAQs, hero and CTA sections
+//   - Both tools are consumed by the Market Intelligence & Service Page Publisher skill
 
 import "dotenv/config";
 import { createServer } from "http";
@@ -82,6 +75,13 @@ import {
   handleClearLinkedInCredentials,
 } from "./tools/credentials.js";
 
+import {
+  wpSetSeoMetaToolDefinition,
+  wpCreateServicePageToolDefinition,
+  handleWpSetSeoMeta,
+  handleWpCreateServicePage,
+} from "./tools/marketPublisher.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
@@ -125,6 +125,8 @@ const TOOLS = [
   wpCreatePageToolDefinition,
   wpAddMenuItemToolDefinition,
   wpUpdateContentToolDefinition,
+  wpSetSeoMetaToolDefinition,
+  wpCreateServicePageToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -137,7 +139,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "4.0.0" },
+    { name: "claude-connector", version: "5.0.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -177,6 +179,8 @@ function createMcpServer() {
         case "wordpress_create_page":       return await handleWpCreatePage(args);
         case "wordpress_add_menu_item":     return await handleWpAddMenuItem(args);
         case "wordpress_update_content":    return await handleWpUpdateContent(args);
+        case "wordpress_set_seo_meta":      return await handleWpSetSeoMeta(args);
+        case "wordpress_create_service_page": return await handleWpCreateServicePage(args);
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
         default:
