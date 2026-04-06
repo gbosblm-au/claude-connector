@@ -1,7 +1,14 @@
-// src/server-http.js  v2.0.0
+// src/server-http.js  v4.0.0
 // HTTP MCP server for browser-based Claude (claude.ai)
 //
-// v2 CHANGES:
+// v4 CHANGES:
+//   - ADDED runtime credential management tools (set/get/clear for WordPress and LinkedIn)
+//   - WordPress and LinkedIn credentials can now be set from Claude chat without Railway redeploy
+//   - wordpress.js and linkedinOAuth.js now read from credentialStore with env var fallback
+//   - LinkedIn OAuth callback updated to resolve client_id/secret from credentialStore
+//   - Version bumped to 4.0.0
+//
+// v3 CHANGES:
 //   - REMOVED Bearer token auth from /mcp endpoint (was blocking claude.ai)
 //   - ADDED LinkedIn OAuth 2.0 callback at GET /auth/linkedin/callback
 //   - ADDED 4 new LinkedIn OAuth tools
@@ -60,9 +67,25 @@ import {
   handleWpUpdateContent,
 } from "./tools/wordpress.js";
 
+import {
+  setWordPressCredentialsToolDefinition,
+  getWordPressCredentialsToolDefinition,
+  clearWordPressCredentialsToolDefinition,
+  setLinkedInCredentialsToolDefinition,
+  getLinkedInCredentialsToolDefinition,
+  clearLinkedInCredentialsToolDefinition,
+  handleSetWordPressCredentials,
+  handleGetWordPressCredentials,
+  handleClearWordPressCredentials,
+  handleSetLinkedInCredentials,
+  handleGetLinkedInCredentials,
+  handleClearLinkedInCredentials,
+} from "./tools/credentials.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
+import { getLinkedInCredentials } from "./utils/credentialStore.js";
 import { config } from "./config.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -83,7 +106,14 @@ const TOOLS = [
   linkedinOAuthStatusToolDefinition,
   linkedinOAuthLogoutToolDefinition,
   linkedinLiveProfileToolDefinition,
-  // WordPress tools - only invoked when explicitly called by Claude
+  // Credential management tools — set WP and LinkedIn credentials from within Claude
+  setWordPressCredentialsToolDefinition,
+  getWordPressCredentialsToolDefinition,
+  clearWordPressCredentialsToolDefinition,
+  setLinkedInCredentialsToolDefinition,
+  getLinkedInCredentialsToolDefinition,
+  clearLinkedInCredentialsToolDefinition,
+  // WordPress publishing tools - only invoked when explicitly called by Claude
   wpSiteInfoToolDefinition,
   wpListPostsToolDefinition,
   wpListPagesToolDefinition,
@@ -107,7 +137,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "3.0.0" },
+    { name: "claude-connector", version: "4.0.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -128,6 +158,13 @@ function createMcpServer() {
         case "linkedin_oauth_status":       return await handleLinkedinOAuthStatus(args);
         case "linkedin_oauth_logout":       return await handleLinkedinOAuthLogout(args);
         case "linkedin_get_live_profile":   return await handleLinkedinLiveProfile(args);
+        // Credential management
+        case "set_wordpress_credentials":      return await handleSetWordPressCredentials(args);
+        case "get_wordpress_credentials":      return await handleGetWordPressCredentials(args);
+        case "clear_wordpress_credentials":    return await handleClearWordPressCredentials(args);
+        case "set_linkedin_credentials":       return await handleSetLinkedInCredentials(args);
+        case "get_linkedin_credentials":       return await handleGetLinkedInCredentials(args);
+        case "clear_linkedin_credentials":     return await handleClearLinkedInCredentials(args);
         // WordPress tools
         case "wordpress_site_info":         return await handleWpSiteInfo(args);
         case "wordpress_list_posts":        return await handleWpListPosts(args);
@@ -175,7 +212,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "2.0.0",
+    version: "4.0.0",
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
     timestamp: new Date().toISOString(),
@@ -220,9 +257,9 @@ app.get("/auth/linkedin/callback", async (req, res) => {
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code,
-        redirect_uri: config.linkedinRedirectUri,
-        client_id: config.linkedinClientId,
-        client_secret: config.linkedinClientSecret,
+        redirect_uri: getLinkedInCredentials().redirectUri,
+        client_id: getLinkedInCredentials().clientId,
+        client_secret: getLinkedInCredentials().clientSecret,
       }).toString(),
     });
 
@@ -381,7 +418,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v3.0.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v4.0.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
 });

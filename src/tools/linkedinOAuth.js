@@ -23,6 +23,7 @@
 import { getTokenStatus, clearToken, createState, getToken } from "../utils/tokenStore.js";
 import { log } from "../utils/logger.js";
 import { config } from "../config.js";
+import { getLinkedInCredentials } from "../utils/credentialStore.js";
 
 // -----------------------------------------------------------------------
 // Tool definitions
@@ -86,8 +87,10 @@ export const linkedinLiveProfileToolDefinition = {
 // -----------------------------------------------------------------------
 
 export async function handleLinkedinOAuthStart(_args) {
-  const clientId = config.linkedinClientId;
-  const redirectUri = config.linkedinRedirectUri;
+  // Credential resolution order:
+  //   1. Runtime credentials stored via set_linkedin_credentials MCP tool
+  //   2. Environment variables (LINKEDIN_CLIENT_ID, etc.) — Railway
+  const { clientId, clientSecret: _secret, redirectUri } = getLinkedInCredentials();
 
   if (!clientId) {
     return {
@@ -95,17 +98,21 @@ export async function handleLinkedinOAuthStart(_args) {
         {
           type: "text",
           text:
-            "LinkedIn OAuth is not configured. To set it up:\n\n" +
-            "1. Go to https://www.linkedin.com/developers/apps/new\n" +
-            "2. Create a free LinkedIn App\n" +
-            "3. Under the Auth tab, add this as an Authorized Redirect URL:\n" +
-            `   ${redirectUri || "https://YOUR-RAILWAY-URL.up.railway.app/auth/linkedin/callback"}\n` +
-            "4. Copy your Client ID and Client Secret\n" +
-            "5. In Railway dashboard > Variables, add:\n" +
-            "   LINKEDIN_CLIENT_ID = your_client_id\n" +
-            "   LINKEDIN_CLIENT_SECRET = your_client_secret\n" +
-            `   LINKEDIN_REDIRECT_URI = ${redirectUri || "https://YOUR-RAILWAY-URL.up.railway.app/auth/linkedin/callback"}\n` +
-            "6. Railway will auto-redeploy. Then call this tool again.",
+            "LinkedIn OAuth is not configured.\n\n" +
+            "Option 1 — Set credentials from Claude (recommended):\n" +
+            "  Call set_linkedin_credentials with:\n" +
+            "    linkedin_client_id:     your_client_id\n" +
+            "    linkedin_client_secret: your_client_secret\n\n" +
+            "Option 2 — Set Railway environment variables:\n" +
+            "  LINKEDIN_CLIENT_ID     = your_client_id\n" +
+            "  LINKEDIN_CLIENT_SECRET = your_client_secret\n" +
+            `  LINKEDIN_REDIRECT_URI  = ${redirectUri}\n\n` +
+            "To create a LinkedIn Developer App:\n" +
+            "  1. Go to https://www.linkedin.com/developers/apps/new\n" +
+            "  2. Create a free LinkedIn App\n" +
+            "  3. Under the Auth tab, add this as an Authorized Redirect URL:\n" +
+            `     ${redirectUri}\n` +
+            "  4. Copy your Client ID and Client Secret",
         },
       ],
     };
@@ -117,8 +124,7 @@ export async function handleLinkedinOAuthStart(_args) {
         {
           type: "text",
           text:
-            "LINKEDIN_REDIRECT_URI is not set. Add it to Railway Variables:\n" +
-            "  LINKEDIN_REDIRECT_URI = https://YOUR-RAILWAY-URL.up.railway.app/auth/linkedin/callback",
+            "LinkedIn redirect URI could not be determined. Call set_linkedin_credentials and include the linkedin_redirect_uri parameter.",
         },
       ],
       isError: true,

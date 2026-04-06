@@ -14,6 +14,17 @@ A fully functional **MCP (Model Context Protocol) server** that gives Claude rea
 
 ---
 
+
+## What's New in v4.0.0
+
+- **Runtime credential management** — Set WordPress and LinkedIn credentials directly from the Claude chat window using new MCP tools. No Railway dashboard required after initial deployment.
+- **Auto WordPress publish prompt** — The TrueSource Article Writer skill now asks after every article whether to publish to WordPress as a post or page with menu item.
+- **Credential persistence** — Credentials are stored to `./data/credentials.json`. Add a Railway Volume at `/app/data` for persistence across redeployments.
+- **Backward compatible** — Existing Railway environment variables continue to work as fallback credentials.
+
+See `USER-GUIDE.md` for full setup and usage instructions.
+
+
 ## Requirements
 
 - **Node.js 18+** (for built-in `fetch` support)

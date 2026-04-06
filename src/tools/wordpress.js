@@ -29,37 +29,41 @@
 
 import { log } from "../utils/logger.js";
 import { truncate } from "../utils/helpers.js";
+import { getWordPressCredentials } from "../utils/credentialStore.js";
 
 // -----------------------------------------------------------------------
 // Config helpers
 // -----------------------------------------------------------------------
 
 function getWpConfig() {
-  const url = (process.env.WP_URL || "").replace(/\/$/, "");
-  const username = process.env.WP_USERNAME || "";
-  const appPassword = process.env.WP_APP_PASSWORD || "";
+  // Credential resolution order:
+  //   1. Runtime credentials stored via set_wordpress_credentials MCP tool
+  //   2. Environment variables (WP_URL, WP_USERNAME, WP_APP_PASSWORD) — Railway
+  // The credentialStore handles this priority internally.
+  const creds = getWordPressCredentials();
 
-  if (!url || !username || !appPassword) {
+  if (!creds) {
     throw new Error(
-      "WordPress is not configured. Add these to Railway Variables:\n" +
+      "WordPress is not configured.\n\n" +
+      "Option 1 — Set credentials from Claude (recommended):\n" +
+      "  Call set_wordpress_credentials with:\n" +
+      "    wp_url:      https://yoursite.com\n" +
+      "    wp_username: your_wordpress_username\n" +
+      "    wp_password: your Application Password\n\n" +
+      "Option 2 — Set Railway environment variables:\n" +
       "  WP_URL          = https://yoursite.com\n" +
       "  WP_USERNAME     = your_wp_username\n" +
-      "  WP_APP_PASSWORD = the Application Password from WP Admin > Users > Profile\n\n" +
-      "To create an Application Password:\n" +
+      "  WP_APP_PASSWORD = Application Password from WP Admin > Users > Profile\n\n" +
+      "To create an Application Password in WordPress:\n" +
       "  1. Log into WordPress Admin\n" +
       "  2. Go to Users > Your Profile\n" +
       "  3. Scroll to 'Application Passwords'\n" +
       "  4. Enter name 'Claude Connector' and click 'Add New Application Password'\n" +
-      "  5. Copy the generated password (shown only once) to WP_APP_PASSWORD"
+      "  5. Copy the generated password (shown only once)"
     );
   }
 
-  // Application passwords are used with spaces removed when stored,
-  // but the Basic Auth value uses them as-is (spaces or without)
-  const authHeader =
-    "Basic " + Buffer.from(`${username}:${appPassword}`).toString("base64");
-
-  return { url, username, authHeader, baseApi: `${url}/wp-json/wp/v2` };
+  return creds;
 }
 
 async function wpFetch(path, options = {}) {
