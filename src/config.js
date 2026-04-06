@@ -24,7 +24,6 @@ export const config = {
     new URL("../../data/profile.json", import.meta.url).pathname,
 
   // LinkedIn OAuth 2.0 (optional - for live profile fetching)
-  // Get these from https://www.linkedin.com/developers/apps/new
   linkedinClientId: process.env.LINKEDIN_CLIENT_ID || "",
   linkedinClientSecret: process.env.LINKEDIN_CLIENT_SECRET || "",
   linkedinRedirectUri:
@@ -32,6 +31,14 @@ export const config = {
     (process.env.RAILWAY_PUBLIC_DOMAIN
       ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/auth/linkedin/callback`
       : "http://localhost:3000/auth/linkedin/callback"),
+
+  // WordPress REST API (optional - for publishing to WordPress)
+  // WP_URL:          your WordPress site URL, e.g. https://yoursite.com
+  // WP_USERNAME:     your WordPress login username
+  // WP_APP_PASSWORD: Application Password from WP Admin > Users > Profile
+  wpUrl: (process.env.WP_URL || "").replace(/\/$/, ""),
+  wpUsername: process.env.WP_USERNAME || "",
+  wpAppPassword: process.env.WP_APP_PASSWORD || "",
 
   // Default result limits
   defaultWebResults: parseInt(process.env.DEFAULT_WEB_RESULTS || "10", 10),
@@ -48,9 +55,7 @@ export const config = {
 
 export function requireBraveKey() {
   if (!config.braveApiKey) {
-    throw new Error(
-      "BRAVE_API_KEY is not set. Add it in Railway Variables."
-    );
+    throw new Error("BRAVE_API_KEY is not set. Add it in Railway Variables.");
   }
 }
 
@@ -73,13 +78,23 @@ export function requireNewsApiKey() {
 
 export function requireLinkedinOAuth() {
   if (!config.linkedinClientId) {
-    throw new Error(
-      "LINKEDIN_CLIENT_ID is not set. See linkedin_start_oauth tool for setup instructions."
-    );
+    throw new Error("LINKEDIN_CLIENT_ID is not set. See linkedin_start_oauth tool for setup instructions.");
   }
   if (!config.linkedinClientSecret) {
+    throw new Error("LINKEDIN_CLIENT_SECRET is not set. See linkedin_start_oauth tool for setup instructions.");
+  }
+}
+
+export function requireWordPress() {
+  if (!config.wpUrl) {
     throw new Error(
-      "LINKEDIN_CLIENT_SECRET is not set. See linkedin_start_oauth tool for setup instructions."
+      "WordPress is not configured. Add WP_URL, WP_USERNAME, and WP_APP_PASSWORD to Railway Variables."
+    );
+  }
+  if (!config.wpUsername || !config.wpAppPassword) {
+    throw new Error(
+      "WP_USERNAME and WP_APP_PASSWORD must both be set. " +
+      "Create an Application Password in WordPress Admin > Users > Your Profile."
     );
   }
 }

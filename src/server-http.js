@@ -35,6 +35,31 @@ import {
   handleLinkedinOAuthLogout, handleLinkedinLiveProfile,
 } from "./tools/linkedinOAuth.js";
 
+import {
+  wpSiteInfoToolDefinition,
+  wpListPostsToolDefinition,
+  wpListPagesToolDefinition,
+  wpListCategoriesToolDefinition,
+  wpListTagsToolDefinition,
+  wpListMenusToolDefinition,
+  wpListMenuItemsToolDefinition,
+  wpCreatePostToolDefinition,
+  wpCreatePageToolDefinition,
+  wpAddMenuItemToolDefinition,
+  wpUpdateContentToolDefinition,
+  handleWpSiteInfo,
+  handleWpListPosts,
+  handleWpListPages,
+  handleWpListCategories,
+  handleWpListTags,
+  handleWpListMenus,
+  handleWpListMenuItems,
+  handleWpCreatePost,
+  handleWpCreatePage,
+  handleWpAddMenuItem,
+  handleWpUpdateContent,
+} from "./tools/wordpress.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
@@ -58,6 +83,18 @@ const TOOLS = [
   linkedinOAuthStatusToolDefinition,
   linkedinOAuthLogoutToolDefinition,
   linkedinLiveProfileToolDefinition,
+  // WordPress tools - only invoked when explicitly called by Claude
+  wpSiteInfoToolDefinition,
+  wpListPostsToolDefinition,
+  wpListPagesToolDefinition,
+  wpListCategoriesToolDefinition,
+  wpListTagsToolDefinition,
+  wpListMenusToolDefinition,
+  wpListMenuItemsToolDefinition,
+  wpCreatePostToolDefinition,
+  wpCreatePageToolDefinition,
+  wpAddMenuItemToolDefinition,
+  wpUpdateContentToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -70,7 +107,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "2.0.0" },
+    { name: "claude-connector", version: "3.0.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -91,6 +128,18 @@ function createMcpServer() {
         case "linkedin_oauth_status":       return await handleLinkedinOAuthStatus(args);
         case "linkedin_oauth_logout":       return await handleLinkedinOAuthLogout(args);
         case "linkedin_get_live_profile":   return await handleLinkedinLiveProfile(args);
+        // WordPress tools
+        case "wordpress_site_info":         return await handleWpSiteInfo(args);
+        case "wordpress_list_posts":        return await handleWpListPosts(args);
+        case "wordpress_list_pages":        return await handleWpListPages(args);
+        case "wordpress_list_categories":   return await handleWpListCategories(args);
+        case "wordpress_list_tags":         return await handleWpListTags(args);
+        case "wordpress_list_menus":        return await handleWpListMenus(args);
+        case "wordpress_list_menu_items":   return await handleWpListMenuItems(args);
+        case "wordpress_create_post":       return await handleWpCreatePost(args);
+        case "wordpress_create_page":       return await handleWpCreatePage(args);
+        case "wordpress_add_menu_item":     return await handleWpAddMenuItem(args);
+        case "wordpress_update_content":    return await handleWpUpdateContent(args);
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
         default:
@@ -332,7 +381,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v2.0.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v3.0.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
 });
