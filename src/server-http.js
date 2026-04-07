@@ -216,7 +216,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "4.0.0",
+    version: "5.0.0",
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
     timestamp: new Date().toISOString(),
