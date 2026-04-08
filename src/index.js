@@ -1,10 +1,5 @@
-// src/index.js  v5.0.0
+// src/index.js  v3.0.0
 // Stdio MCP server - for Claude Desktop usage
-//
-// v5 CHANGES:
-//   - ADDED wordpress_set_seo_meta, wordpress_create_service_page (market publisher tools)
-//   - ADDED set/get/clear credential tools for WordPress and LinkedIn
-//   - Version aligned with server-http.js v5.0.0
 import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -24,7 +19,6 @@ import {
   handleLinkedinOAuthStart, handleLinkedinOAuthStatus,
   handleLinkedinOAuthLogout, handleLinkedinLiveProfile,
 } from "./tools/linkedinOAuth.js";
-
 import {
   wpSiteInfoToolDefinition,
   wpListPostsToolDefinition,
@@ -50,33 +44,11 @@ import {
   handleWpUpdateContent,
 } from "./tools/wordpress.js";
 
-import {
-  setWordPressCredentialsToolDefinition,
-  getWordPressCredentialsToolDefinition,
-  clearWordPressCredentialsToolDefinition,
-  setLinkedInCredentialsToolDefinition,
-  getLinkedInCredentialsToolDefinition,
-  clearLinkedInCredentialsToolDefinition,
-  handleSetWordPressCredentials,
-  handleGetWordPressCredentials,
-  handleClearWordPressCredentials,
-  handleSetLinkedInCredentials,
-  handleGetLinkedInCredentials,
-  handleClearLinkedInCredentials,
-} from "./tools/credentials.js";
-
-import {
-  wpSetSeoMetaToolDefinition,
-  wpCreateServicePageToolDefinition,
-  handleWpSetSeoMeta,
-  handleWpCreateServicePage,
-} from "./tools/marketPublisher.js";
-
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 
 const server = new Server(
-  { name: "claude-connector", version: "5.0.0" },
+  { name: "claude-connector", version: "3.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -91,14 +63,6 @@ const TOOLS = [
   linkedinOAuthStatusToolDefinition,
   linkedinOAuthLogoutToolDefinition,
   linkedinLiveProfileToolDefinition,
-  // Credential management tools
-  setWordPressCredentialsToolDefinition,
-  getWordPressCredentialsToolDefinition,
-  clearWordPressCredentialsToolDefinition,
-  setLinkedInCredentialsToolDefinition,
-  getLinkedInCredentialsToolDefinition,
-  clearLinkedInCredentialsToolDefinition,
-  // WordPress publishing tools
   wpSiteInfoToolDefinition,
   wpListPostsToolDefinition,
   wpListPagesToolDefinition,
@@ -110,8 +74,6 @@ const TOOLS = [
   wpCreatePageToolDefinition,
   wpAddMenuItemToolDefinition,
   wpUpdateContentToolDefinition,
-  wpSetSeoMetaToolDefinition,
-  wpCreateServicePageToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -139,14 +101,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "linkedin_oauth_status":       return await handleLinkedinOAuthStatus(args);
       case "linkedin_oauth_logout":       return await handleLinkedinOAuthLogout(args);
       case "linkedin_get_live_profile":   return await handleLinkedinLiveProfile(args);
-      // Credential management
-      case "set_wordpress_credentials":      return await handleSetWordPressCredentials(args);
-      case "get_wordpress_credentials":      return await handleGetWordPressCredentials(args);
-      case "clear_wordpress_credentials":    return await handleClearWordPressCredentials(args);
-      case "set_linkedin_credentials":       return await handleSetLinkedInCredentials(args);
-      case "get_linkedin_credentials":       return await handleGetLinkedInCredentials(args);
-      case "clear_linkedin_credentials":     return await handleClearLinkedInCredentials(args);
-      // WordPress tools
       case "wordpress_site_info":         return await handleWpSiteInfo(args);
       case "wordpress_list_posts":        return await handleWpListPosts(args);
       case "wordpress_list_pages":        return await handleWpListPages(args);
@@ -158,8 +112,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "wordpress_create_page":       return await handleWpCreatePage(args);
       case "wordpress_add_menu_item":     return await handleWpAddMenuItem(args);
       case "wordpress_update_content":    return await handleWpUpdateContent(args);
-      case "wordpress_set_seo_meta":      return await handleWpSetSeoMeta(args);
-      case "wordpress_create_service_page": return await handleWpCreateServicePage(args);
       case "get_current_datetime": {
         const dt = getCurrentDateTime();
         return { content: [{ type: "text", text: JSON.stringify(dt, null, 2) }] };
@@ -176,7 +128,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log("info", "claude-connector v5.0.0 running via stdio");
+  log("info", "claude-connector v3.0.0 running via stdio");
 }
 
 main().catch((err) => {

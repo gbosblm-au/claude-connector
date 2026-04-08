@@ -41,55 +41,22 @@ function getWpConfig() {
 async function wpFetch(path, options = {}) {
   const { url, authHeader, baseApi } = getWpConfig();
   const fullUrl = path.startsWith("http") ? path : `${baseApi}${path}`;
-  const method = (options.method || "GET").toUpperCase();
-
-  // Only send Content-Type for requests that carry a body.
-  // Sending Content-Type: application/json on GET requests can trigger WAF
-  // rules or cause some hosts to return HTML error pages instead of JSON.
-  const contentTypeHeader =
-    method !== "GET" && method !== "HEAD"
-      ? { "Content-Type": "application/json" }
-      : {};
 
   const resp = await fetch(fullUrl, {
     ...options,
     headers: {
-      ...contentTypeHeader,
+      "Content-Type": "application/json",
       Authorization: authHeader,
       ...(options.headers || {}),
     },
   });
 
-  const responseContentType = resp.headers.get("content-type") || "";
   const body = await resp.json().catch(() => null);
 
   if (!resp.ok) {
     const msg =
       body?.message || body?.error || `HTTP ${resp.status} ${resp.statusText}`;
     throw new Error(`WordPress API error: ${msg}`);
-  }
-
-  // If the response was 2xx but body could not be parsed as JSON, the server
-  // returned something unexpected (most commonly an HTML login/redirect page
-  // produced by a security plugin or WAF when authentication fails).
-  // Surface a clear, actionable error instead of returning null and crashing
-  // downstream callers.
-  if (body === null) {
-    const isHtml = responseContentType.includes("text/html");
-    const hint = isHtml
-      ? "The server returned an HTML page instead of JSON. This usually means " +
-        "the Application Password is invalid, expired, or has been revoked, " +
-        "OR a security or firewall plugin is blocking REST API requests that " +
-        "do not pass authentication. " +
-        "Fix: In WordPress Admin go to Users > Your Profile > Application Passwords, " +
-        "revoke the existing Claude Connector password, create a fresh one, " +
-        "then update the WP_APP_PASSWORD environment variable in Railway and redeploy."
-      : "The server returned an empty or non-JSON response (HTTP " +
-        resp.status +
-        "). Verify the REST API is reachable at " +
-        baseApi +
-        " and that no plugin or .htaccess rule is disabling it.";
-    throw new Error(`WordPress API error: ${hint}`);
   }
 
   return body;
@@ -584,11 +551,6 @@ ${ctaSecondary}
     method: "POST",
     body: JSON.stringify(payload),
   });
-
-  // wpFetch now throws on null, but guard here as backstop
-  if (!page || typeof page !== "object") {
-    throw new Error("WordPress API returned an unexpected response when creating the service page. Check credentials.");
-  }
 
   const statusLabel = payload.status === "publish" ? "Published Live" : "Saved as Draft";
 
