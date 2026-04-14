@@ -1,5 +1,57 @@
 # Changelog
 
+## v6.0.1 - Fix: Restore WP Publishing + Security Cleanup
+
+### Fixed
+
+- **Restored `SKILL.md` and `SKILL-market-intelligence-publisher.md`** — These Claude skill
+  definition files were accidentally omitted from the v6.0.0 package. They provide the
+  article-writing and market-intelligence publishing workflows that Claude uses when
+  creating WordPress content. Without them, Claude may not know the correct publishing
+  workflow.
+
+- **Removed hardcoded API keys from `.env.example`** — The Pexels and Unsplash API keys
+  were previously embedded as real values in the `.env.example` template file. They are
+  now replaced with placeholder strings (`your_pexels_api_key_here`,
+  `your_unsplash_access_key_here`) consistent with how other keys are handled.
+  **Set real keys in Railway Variables, not in `.env.example`.**
+
+- **Added WordPress credential documentation to `.env.example`** — Added a dedicated
+  `WORDPRESS` section documenting `WP_URL`, `WP_USERNAME`, and `WP_APP_PASSWORD`
+  environment variables for clarity. These can also be set at runtime via the
+  `set_wordpress_credentials` MCP tool.
+
+- **Aligned version numbers** — All version references (`package.json`, `index.js`,
+  `server-http.js` health endpoint, and MCP server declaration) now consistently
+  report `6.0.1`.
+
+### Railway Deployment Checklist
+
+Ensure these environment variables are set in your Railway service Variables tab:
+
+**Required for WP publishing:**
+```
+WP_URL=https://yoursite.com
+WP_USERNAME=your_wordpress_username
+WP_APP_PASSWORD=your_application_password
+```
+
+**Required for image search:**
+```
+PEXELS_API_KEY=<your-pexels-api-key>
+UNSPLASH_ACCESS_KEY=<your-unsplash-access-key>
+IMAGE_PROVIDER=auto
+```
+
+**Required for web/news search:**
+```
+BRAVE_API_KEY=<your-brave-api-key>
+SEARCH_PROVIDER=brave
+NEWS_PROVIDER=brave
+```
+
+---
+
 ## v6.0.0 - Image Search Integration
 
 ### Added
@@ -40,20 +92,6 @@
 
 - **`.env.example`** - Documented `IMAGE_PROVIDER`, `PEXELS_API_KEY`,
   `UNSPLASH_ACCESS_KEY`, `DEFAULT_IMAGE_RESULTS`, and `MAX_IMAGE_RESULTS`.
-
-### Deployment Notes
-
-Add the following environment variables in Railway (or your `.env` file for local use):
-
-```
-PEXELS_API_KEY=<your-pexels-api-key>
-UNSPLASH_ACCESS_KEY=<your-unsplash-access-key>
-IMAGE_PROVIDER=auto
-```
-
-The `IMAGE_PROVIDER=auto` setting will use Pexels as the primary provider
-and Unsplash as a fallback. Set `IMAGE_PROVIDER=both` to draw results from
-both providers simultaneously.
 
 ### Unchanged
 

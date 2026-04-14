@@ -1,6 +1,6 @@
 {
   "name": "claude-connector",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "description": "MCP server for Claude with real-time web search, news search, and LinkedIn connections lookup",
   "type": "module",
   "main": "src/index.js",

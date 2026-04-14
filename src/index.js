@@ -49,7 +49,7 @@ import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 
 const server = new Server(
-  { name: "claude-connector", version: "3.0.0" },
+  { name: "claude-connector", version: "6.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -131,7 +131,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log("info", "claude-connector v3.0.0 running via stdio");
+  log("info", "claude-connector v6.0.0 running via stdio");
 }
 
 main().catch((err) => {
