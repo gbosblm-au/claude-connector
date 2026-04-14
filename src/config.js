@@ -8,10 +8,20 @@ export const config = {
   // News provider: "brave" | "newsapi"
   newsProvider: (process.env.NEWS_PROVIDER || "brave").toLowerCase(),
 
+  // Image provider: "pexels" | "unsplash" | "both" | "auto"
+  // "auto" prefers Pexels when PEXELS_API_KEY is set, otherwise falls back to Unsplash.
+  imageProvider: (process.env.IMAGE_PROVIDER || "auto").toLowerCase(),
+
   // API keys - search & news
   braveApiKey: process.env.BRAVE_API_KEY || "",
   tavilyApiKey: process.env.TAVILY_API_KEY || "",
   newsApiKey: process.env.NEWS_API_KEY || "",
+
+  // API keys - image search
+  // Pexels: https://www.pexels.com/api/
+  pexelsApiKey: process.env.PEXELS_API_KEY || "",
+  // Unsplash: https://unsplash.com/developers
+  unsplashAccessKey: process.env.UNSPLASH_ACCESS_KEY || "",
 
   // LinkedIn CSV path (defaults to ./data/connections.csv relative to cwd)
   linkedinCsvPath:
@@ -43,10 +53,12 @@ export const config = {
   // Default result limits
   defaultWebResults: parseInt(process.env.DEFAULT_WEB_RESULTS || "10", 10),
   defaultNewsResults: parseInt(process.env.DEFAULT_NEWS_RESULTS || "10", 10),
+  defaultImageResults: parseInt(process.env.DEFAULT_IMAGE_RESULTS || "5", 10),
 
   // Maximum results the caller is allowed to request
   maxWebResults: parseInt(process.env.MAX_WEB_RESULTS || "20", 10),
   maxNewsResults: parseInt(process.env.MAX_NEWS_RESULTS || "20", 10),
+  maxImageResults: parseInt(process.env.MAX_IMAGE_RESULTS || "20", 10),
 };
 
 // -----------------------------------------------------------------------
@@ -72,6 +84,24 @@ export function requireNewsApiKey() {
   if (!config.newsApiKey) {
     throw new Error(
       "NEWS_API_KEY is not set. Add it in Railway Variables or switch NEWS_PROVIDER=brave."
+    );
+  }
+}
+
+export function requirePexelsKey() {
+  if (!config.pexelsApiKey) {
+    throw new Error(
+      "PEXELS_API_KEY is not set. " +
+      "Get a free key at https://www.pexels.com/api/ and add it to your environment variables."
+    );
+  }
+}
+
+export function requireUnsplashKey() {
+  if (!config.unsplashAccessKey) {
+    throw new Error(
+      "UNSPLASH_ACCESS_KEY is not set. " +
+      "Get a free key at https://unsplash.com/developers and add it to your environment variables."
     );
   }
 }

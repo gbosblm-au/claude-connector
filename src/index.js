@@ -7,6 +7,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 
 import { webSearchToolDefinition, handleWebSearch } from "./tools/webSearch.js";
 import { newsSearchToolDefinition, handleNewsSearch } from "./tools/newsSearch.js";
+import { imageSearchToolDefinition, handleImageSearch } from "./tools/imageSearch.js";
 import {
   linkedinLoadToolDefinition, linkedinSearchToolDefinition,
   linkedinCountToolDefinition, linkedinProfileToolDefinition,
@@ -55,6 +56,7 @@ const server = new Server(
 const TOOLS = [
   webSearchToolDefinition,
   newsSearchToolDefinition,
+  imageSearchToolDefinition,
   linkedinLoadToolDefinition,
   linkedinSearchToolDefinition,
   linkedinCountToolDefinition,
@@ -93,6 +95,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "web_search":                  return await handleWebSearch(args);
       case "news_search":                 return await handleNewsSearch(args);
+      case "image_search":               return await handleImageSearch(args);
       case "linkedin_load_connections":   return await handleLinkedinLoad(args);
       case "linkedin_search_connections": return await handleLinkedinSearch(args);
       case "linkedin_connection_count":   return await handleLinkedinCount(args);

@@ -22,6 +22,7 @@ import { isInitializeRequest, CallToolRequestSchema, ListToolsRequestSchema } fr
 
 import { webSearchToolDefinition, handleWebSearch } from "./tools/webSearch.js";
 import { newsSearchToolDefinition, handleNewsSearch } from "./tools/newsSearch.js";
+import { imageSearchToolDefinition, handleImageSearch } from "./tools/imageSearch.js";
 import {
   linkedinLoadToolDefinition, linkedinSearchToolDefinition,
   linkedinCountToolDefinition, linkedinProfileToolDefinition,
@@ -98,6 +99,7 @@ const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
 const TOOLS = [
   webSearchToolDefinition,
   newsSearchToolDefinition,
+  imageSearchToolDefinition,
   linkedinLoadToolDefinition,
   linkedinSearchToolDefinition,
   linkedinCountToolDefinition,
@@ -152,6 +154,7 @@ function createMcpServer() {
       switch (name) {
         case "web_search":                  return await handleWebSearch(args);
         case "news_search":                 return await handleNewsSearch(args);
+        case "image_search":               return await handleImageSearch(args);
         case "linkedin_load_connections":   return await handleLinkedinLoad(args);
         case "linkedin_search_connections": return await handleLinkedinSearch(args);
         case "linkedin_connection_count":   return await handleLinkedinCount(args);
