@@ -27,7 +27,7 @@ import {
   wpListCategoriesToolDefinition,
   wpListTagsToolDefinition,
   wpCreateCategoryToolDefinition,
-  wpCreateTagToolDefinition,
+  wpCreateTagsToolDefinition,
   wpListMenusToolDefinition,
   wpListMenuItemsToolDefinition,
   wpCreatePostToolDefinition,
@@ -40,7 +40,7 @@ import {
   handleWpListCategories,
   handleWpListTags,
   handleWpCreateCategory,
-  handleWpCreateTag,
+  handleWpCreateTags,
   handleWpListMenus,
   handleWpListMenuItems,
   handleWpCreatePost,
@@ -94,7 +94,7 @@ const TOOLS = [
   wpListCategoriesToolDefinition,
   wpListTagsToolDefinition,
   wpCreateCategoryToolDefinition,
-  wpCreateTagToolDefinition,
+  wpCreateTagsToolDefinition,
   wpListMenusToolDefinition,
   wpListMenuItemsToolDefinition,
   wpCreatePostToolDefinition,
@@ -142,7 +142,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "wordpress_list_categories":   return await handleWpListCategories(args);
       case "wordpress_list_tags":         return await handleWpListTags(args);
       case "wordpress_create_category":   return await handleWpCreateCategory(args);
-      case "wordpress_create_tag":        return await handleWpCreateTag(args);
+      case "wordpress_create_tags":       return await handleWpCreateTags(args);
       case "wordpress_list_menus":        return await handleWpListMenus(args);
       case "wordpress_list_menu_items":   return await handleWpListMenuItems(args);
       case "wordpress_create_post":       return await handleWpCreatePost(args);

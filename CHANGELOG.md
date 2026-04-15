@@ -1,7 +1,3 @@
-## Unreleased
-
-- WordPress taxonomy improvements: added category/tag creation tools and automatic category/tag creation during post publishing.
-
 # Changelog
 
 ## v6.0.1 - Fix: Restore WP Publishing + Security Cleanup
