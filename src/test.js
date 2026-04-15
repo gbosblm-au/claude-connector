@@ -10,28 +10,21 @@ import "dotenv/config";
 
 let passed = 0;
 let failed = 0;
+let testQueue = Promise.resolve();
 
 function test(name, fn) {
-  try {
-    const result = fn();
-    if (result instanceof Promise) {
-      result
-        .then(() => {
-          console.log(`  PASS  ${name}`);
-          passed++;
-        })
-        .catch((err) => {
-          console.error(`  FAIL  ${name}: ${err.message}`);
-          failed++;
-        });
-    } else {
+  testQueue = testQueue.then(async () => {
+    try {
+      await fn();
       console.log(`  PASS  ${name}`);
       passed++;
+    } catch (err) {
+      console.error(`  FAIL  ${name}: ${err.message}`);
+      failed++;
     }
-  } catch (err) {
-    console.error(`  FAIL  ${name}: ${err.message}`);
-    failed++;
-  }
+  });
+
+  return testQueue;
 }
 
 function assert(condition, message) {
@@ -45,7 +38,7 @@ console.log("\n=== claude-connector test suite ===\n");
 // -----------------------------------------------------------------------
 console.log("-- Module imports --");
 
-let config, log, helpers, csvParser, webSearch, newsSearch, linkedin;
+let config, log, helpers, csvParser, webSearch, newsSearch, linkedin, leadSearch;
 
 test("config module loads", async () => {
   const mod = await import("./config.js");
@@ -80,6 +73,13 @@ test("webSearch module loads", async () => {
   webSearch = mod;
   assert(webSearch.webSearchToolDefinition.name === "web_search");
   assert(typeof webSearch.handleWebSearch === "function");
+});
+
+test("leadSearch module loads", async () => {
+  const mod = await import("./tools/leadSearch.js");
+  leadSearch = mod;
+  assert(typeof leadSearch.shouldRunLeadResearch === "function");
+  assert(typeof leadSearch.runLeadResearch === "function");
 });
 
 test("newsSearch module loads", async () => {
@@ -137,24 +137,25 @@ setTimeout(async () => {
 
   console.log("\n-- CSV parser --");
 
-  // Create a temp CSV matching LinkedIn's modern format
-  const tempPath = "/tmp/test_connections.csv";
-
   const modernCsv = `First Name,Last Name,URL,Email Address,Company,Position,Connected On
 Alice,Smith,https://linkedin.com/in/asmith,alice@example.com,Atlassian,Senior Engineer,15 Jan 2023
 Bob,Jones,https://linkedin.com/in/bjones,,Canva,Product Manager,03 Mar 2022
 Carol,Williams,https://linkedin.com/in/cwilliams,carol@acme.com,Acme Corp,CEO,22 Jun 2021
 David,Brown,,,Canva,Designer,01 Dec 2023`;
 
-  writeFileSync(tempPath, modernCsv);
-
   test("parses modern LinkedIn CSV format", () => {
-    const { connections, total, skipped } = parseLinkedInCsv(tempPath);
-    assert(connections.length === 4, `Expected 4 connections, got ${connections.length}`);
-    assert(connections[0].firstName === "Alice", "First name parsed");
-    assert(connections[0].company === "Atlassian", "Company parsed");
-    assert(connections[1].email === "", "Missing email is empty string");
-    assert(connections[0]._search.includes("atlassian"), "Search index includes company");
+    const tempPath = "/tmp/test_connections.csv";
+    writeFileSync(tempPath, modernCsv);
+    try {
+      const { connections } = parseLinkedInCsv(tempPath);
+      assert(connections.length === 4, `Expected 4 connections, got ${connections.length}`);
+      assert(connections[0].firstName === "Alice", "First name parsed");
+      assert(connections[0].company === "Atlassian", "Company parsed");
+      assert(connections[1].email === "", "Missing email is empty string");
+      assert(connections[0]._search.includes("atlassian"), "Search index includes company");
+    } finally {
+      unlinkSync(tempPath);
+    }
   });
 
   // Test with LinkedIn preamble lines (older exports)
@@ -167,16 +168,16 @@ Bob,Jones,https://linkedin.com/in/bjones,,Canva,Product Manager,03 Mar 2022
 Carol,Williams,https://linkedin.com/in/cwilliams,carol@acme.com,Acme Corp,CEO,22 Jun 2021
 David,Brown,,,Canva,Designer,01 Dec 2023`;
 
-  const preamblePath = "/tmp/test_preamble.csv";
-  writeFileSync(preamblePath, preambleCsv);
-
   test("handles LinkedIn preamble lines", () => {
-    const { connections } = parseLinkedInCsv(preamblePath);
-    assert(connections.length === 4, `Expected 4, got ${connections.length}`);
+    const preamblePath = "/tmp/test_preamble.csv";
+    writeFileSync(preamblePath, preambleCsv);
+    try {
+      const { connections } = parseLinkedInCsv(preamblePath);
+      assert(connections.length === 4, `Expected 4, got ${connections.length}`);
+    } finally {
+      unlinkSync(preamblePath);
+    }
   });
-
-  unlinkSync(tempPath);
-  unlinkSync(preamblePath);
 
   // -----------------------------------------------------------------------
   // 4. LinkedIn search logic (loads synthetic data then searches)
@@ -267,9 +268,10 @@ Eve,Taylor,,,Atlassian,Engineering Manager,10 Feb 2024`;
 
   console.log("\n-- Tool schema validation --");
 
-  const { webSearchToolDefinition } = await import("./tools/webSearch.js");
+  const { webSearchToolDefinition, handleWebSearch } = await import("./tools/webSearch.js");
   const { newsSearchToolDefinition } = await import("./tools/newsSearch.js");
   const { linkedinLoadToolDefinition, linkedinSearchToolDefinition } = await import("./tools/linkedin.js");
+  const { shouldRunLeadResearch } = await import("./tools/leadSearch.js");
 
   const toolsToValidate = [
     webSearchToolDefinition,
@@ -288,12 +290,259 @@ Eve,Taylor,,,Atlassian,Engineering Manager,10 Feb 2024`;
   }
 
   // -----------------------------------------------------------------------
+  // 6. Lead research behaviour
+  // -----------------------------------------------------------------------
+
+  console.log("\n-- Lead research behaviour --");
+
+  test("lead intent detection only triggers for prospecting queries", () => {
+    assert(shouldRunLeadResearch("find plumbers in Sydney with email and phone") === true, "Lead query should trigger enrichment");
+    assert(shouldRunLeadResearch("latest AI regulation updates in Australia") === false, "Standard research query should not trigger enrichment");
+    assert(shouldRunLeadResearch("find accountants in Melbourne", { lead_mode: "off" }) === false, "lead_mode off should disable enrichment");
+    assert(shouldRunLeadResearch("latest AI regulation updates in Australia", { lead_mode: "force" }) === true, "lead_mode force should enable enrichment");
+  });
+
+  test("handleWebSearch preserves standard search output when lead enrichment is not needed", async () => {
+    const originalFetch = global.fetch;
+    config.braveApiKey = "test-brave-key";
+
+    global.fetch = async (url) => {
+      const parsedUrl = new URL(url);
+      if (parsedUrl.hostname === "api.search.brave.com") {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: { get: (name) => (name.toLowerCase() === "content-type" ? "application/json" : null) },
+          json: async () => ({
+            web: {
+              results: [
+                {
+                  title: "AI policy roundup",
+                  url: "https://example.com/ai-policy",
+                  description: "Recent AI regulation updates.",
+                },
+              ],
+            },
+          }),
+          text: async () => JSON.stringify({}),
+          url,
+        };
+      }
+      throw new Error(`Unexpected fetch URL in standard test: ${url}`);
+    };
+
+    try {
+      const result = await handleWebSearch({ query: "latest AI regulation updates in Australia", num_results: 5 });
+      const text = result.content[0].text;
+      assert(text.includes("Web search results for \"latest AI regulation updates in Australia\""), "Should return standard web search header");
+      assert(!text.includes("Lead enrichment summary"), "Should not include lead enrichment section");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test("handleWebSearch runs lead enrichment alongside standard web search when requested", async () => {
+    const originalFetch = global.fetch;
+    config.braveApiKey = "test-brave-key";
+
+    const makeJsonResponse = (payload, responseUrl = "https://api.search.brave.com/mock") => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: { get: (name) => (name.toLowerCase() === "content-type" ? "application/json" : null) },
+      json: async () => payload,
+      text: async () => JSON.stringify(payload),
+      url: responseUrl,
+    });
+
+    const makeHtmlResponse = (html, responseUrl) => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: { get: (name) => (name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : null) },
+      text: async () => html,
+      url: responseUrl,
+    });
+
+    global.fetch = async (url) => {
+      const parsedUrl = new URL(url);
+
+      if (parsedUrl.hostname === "api.search.brave.com" && parsedUrl.pathname === "/res/v1/web/search") {
+        const query = parsedUrl.searchParams.get("q") || "";
+        if (query.startsWith("site:acmeplumbing.com")) {
+          return makeJsonResponse({
+            web: {
+              results: [
+                {
+                  title: "Contact Acme Plumbing Sydney",
+                  url: "https://acmeplumbing.com/contact",
+                  description: "Contact Acme Plumbing Sydney via hello@acmeplumbing.com or +61 2 9000 1234.",
+                },
+                {
+                  title: "Meet the Acme Plumbing Team",
+                  url: "https://acmeplumbing.com/team",
+                  description: "Jane Smith leads the Sydney team.",
+                },
+              ],
+            },
+          }, url);
+        }
+
+        return makeJsonResponse({
+          web: {
+            results: [
+              {
+                title: "Acme Plumbing Sydney",
+                url: "https://acmeplumbing.com",
+                description: "Official site for Acme Plumbing Sydney. Call +61 2 9000 1234 or email hello@acmeplumbing.com.",
+              },
+              {
+                title: "Jane Smith - Director - Acme Plumbing Sydney | LinkedIn",
+                url: "https://www.linkedin.com/in/jane-smith",
+                description: "Director at Acme Plumbing Sydney.",
+              },
+              {
+                title: "Harbour Flow Plumbing",
+                url: "https://harbourflow.com",
+                description: "Harbour Flow Plumbing. Phone +61 2 8111 2222.",
+              },
+            ],
+          },
+          locations: {
+            results: [
+              {
+                id: "poi-1",
+                title: "Acme Plumbing Sydney",
+              },
+            ],
+          },
+        }, url);
+      }
+
+      if (parsedUrl.hostname === "api.search.brave.com" && parsedUrl.pathname === "/res/v1/local/pois") {
+        return makeJsonResponse({
+          results: [
+            {
+              name: "Acme Plumbing Sydney",
+              website: "https://acmeplumbing.com",
+              phone: "+61 2 9000 1234",
+              formatted_address: "1 George Street, Sydney NSW 2000",
+            },
+          ],
+        }, url);
+      }
+
+      if (url === "https://acmeplumbing.com/") {
+        return makeHtmlResponse(`
+          <html>
+            <head>
+              <title>Acme Plumbing Sydney</title>
+              <meta name="description" content="Emergency and commercial plumbing in Sydney.">
+              <script type="application/ld+json">{
+                "@context": "https://schema.org",
+                "@type": "LocalBusiness",
+                "name": "Acme Plumbing Sydney",
+                "email": "hello@acmeplumbing.com",
+                "telephone": "+61 2 9000 1234",
+                "address": {
+                  "@type": "PostalAddress",
+                  "streetAddress": "1 George Street",
+                  "addressLocality": "Sydney",
+                  "addressRegion": "NSW",
+                  "postalCode": "2000",
+                  "addressCountry": "AU"
+                },
+                "contactPoint": [{
+                  "@type": "ContactPoint",
+                  "contactType": "sales",
+                  "email": "sales@acmeplumbing.com",
+                  "telephone": "+61 2 9000 1234"
+                }]
+              }</script>
+            </head>
+            <body>
+              <a href="/contact">Contact</a>
+              <a href="/team">Team</a>
+            </body>
+          </html>
+        `, url);
+      }
+
+      if (url === "https://acmeplumbing.com/contact") {
+        return makeHtmlResponse(`
+          <html>
+            <body>
+              <section>
+                <h2>Contact Jane Smith</h2>
+                <p>Jane Smith, Director</p>
+                <p>Email <a href="mailto:jane@acmeplumbing.com">jane@acmeplumbing.com</a></p>
+                <p>Phone <a href="tel:+61290001234">+61 2 9000 1234</a></p>
+              </section>
+            </body>
+          </html>
+        `, url);
+      }
+
+      if (url === "https://acmeplumbing.com/team") {
+        return makeHtmlResponse(`
+          <html>
+            <body>
+              <article>
+                <h3>Jane Smith</h3>
+                <p>Director</p>
+              </article>
+            </body>
+          </html>
+        `, url);
+      }
+
+      if (url === "https://acmeplumbing.com/sitemap.xml") {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: { get: (name) => (name.toLowerCase() === "content-type" ? "application/xml" : null) },
+          text: async () => `
+            <urlset>
+              <url><loc>https://acmeplumbing.com/contact</loc></url>
+              <url><loc>https://acmeplumbing.com/team</loc></url>
+            </urlset>
+          `,
+          url,
+        };
+      }
+
+      if (url.startsWith("https://harbourflow.com")) {
+        return makeHtmlResponse("<html><body><p>Harbour Flow Plumbing</p></body></html>", url);
+      }
+
+      throw new Error(`Unexpected fetch URL in lead enrichment test: ${url}`);
+    };
+
+    try {
+      const result = await handleWebSearch({
+        query: "find plumbers in Sydney with email and phone",
+        num_results: 5,
+        lead_mode: "force",
+      });
+      const text = result.content[0].text;
+      assert(text.includes("Lead enrichment summary for \"find plumbers in Sydney with email and phone\""), "Should include lead enrichment summary");
+      assert(text.includes("Acme Plumbing Sydney"), "Should include the enriched lead");
+      assert(text.includes("hello@acmeplumbing.com"), "Should include extracted email");
+      assert(text.includes("+61 2 9000 1234"), "Should include extracted phone");
+      assert(text.includes("Jane Smith"), "Should include named contact");
+      assert(text.includes("Standard web search results"), "Should still include the standard web search section");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  // -----------------------------------------------------------------------
   // Summary
   // -----------------------------------------------------------------------
-  // Give the async tests a moment to settle
-  setTimeout(() => {
-    console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
-    if (failed > 0) process.exit(1);
-  }, 200);
+  await testQueue;
+  console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
+  if (failed > 0) process.exit(1);
 
 }, 500);

@@ -5,17 +5,15 @@
 import { config, requireBraveKey, requireTavilyKey } from "../config.js";
 import { clamp, truncate } from "../utils/helpers.js";
 import { log } from "../utils/logger.js";
-
-// -----------------------------------------------------------------------
-// Tool definition (MCP schema)
-// -----------------------------------------------------------------------
+import { runLeadResearch, shouldRunLeadResearch } from "./leadSearch.js";
 
 export const webSearchToolDefinition = {
   name: "web_search",
   description:
     "Performs a real-time web search and returns relevant results including titles, URLs, and snippets. " +
     "Use this for current events, factual lookups, research, or any topic requiring up-to-date information. " +
-    "Supports freshness filtering to restrict results to a recent time window.",
+    "Supports freshness filtering to restrict results to a recent time window. " +
+    "When the query clearly requests business leads or contact discovery, the tool can automatically augment the search with lead research across official websites, contact pages, structured data, directory listings, and public profile snippets without changing standard web search behaviour.",
   inputSchema: {
     type: "object",
     properties: {
@@ -40,16 +38,23 @@ export const webSearchToolDefinition = {
         description:
           "Two-letter country code to localise results (e.g. 'AU', 'US', 'GB'). Optional.",
       },
+      lead_mode: {
+        type: "string",
+        description:
+          "Optional lead research mode. 'auto' keeps existing behaviour and only runs lead research when the query clearly asks for business leads or contact details. 'force' always runs lead research. 'off' disables it.",
+        enum: ["auto", "force", "off"],
+      },
+      include_contact_details: {
+        type: "boolean",
+        description:
+          "Optional hint to include business contact enrichment when relevant. Standard web search behaviour is unchanged when false or omitted.",
+      },
     },
     required: ["query"],
   },
 };
 
-// -----------------------------------------------------------------------
-// Brave Search implementation
-// -----------------------------------------------------------------------
-
-async function braveSearch(query, numResults, freshness, country) {
+async function braveSearchDetailed(query, numResults, freshness, country) {
   requireBraveKey();
 
   const url = new URL("https://api.search.brave.com/res/v1/web/search");
@@ -57,6 +62,7 @@ async function braveSearch(query, numResults, freshness, country) {
   url.searchParams.set("count", String(numResults));
   url.searchParams.set("text_decorations", "0");
   url.searchParams.set("spellcheck", "1");
+  url.searchParams.set("extra_snippets", "true");
   if (freshness) url.searchParams.set("freshness", freshness);
   if (country) url.searchParams.set("country", country.toUpperCase());
 
@@ -79,26 +85,31 @@ async function braveSearch(query, numResults, freshness, country) {
 
   const data = await resp.json();
   const webResults = data?.web?.results || [];
-
-  return webResults.map((r) => ({
-    title: r.title || "",
-    url: r.url || "",
-    description: truncate(r.description || r.extra_snippets?.[0] || "", 400),
-    age: r.age || "",
-    language: r.language || "",
+  const mappedResults = webResults.map((result) => ({
+    title: result.title || "",
+    url: result.url || "",
+    description: truncate(
+      [result.description || "", ...(result.extra_snippets || [])]
+        .filter(Boolean)
+        .join(" "),
+      500
+    ),
+    age: result.age || "",
+    language: result.language || "",
     source: "brave",
   }));
+
+  return {
+    provider: "brave",
+    results: mappedResults,
+    locations: data?.locations?.results || [],
+    raw: data,
+  };
 }
 
-// -----------------------------------------------------------------------
-// Tavily implementation
-// -----------------------------------------------------------------------
-
-async function tavilySearch(query, numResults, freshness) {
+async function tavilySearchDetailed(query, numResults, freshness) {
   requireTavilyKey();
 
-  // Tavily doesn't have a "freshness" param but we include it in the query
-  // context via the days_back approach when freshness is requested.
   let daysBack = null;
   if (freshness === "pd") daysBack = 1;
   else if (freshness === "pw") daysBack = 7;
@@ -108,7 +119,7 @@ async function tavilySearch(query, numResults, freshness) {
   const body = {
     api_key: config.tavilyApiKey,
     query,
-    search_depth: "basic",
+    search_depth: "advanced",
     include_answer: true,
     include_raw_content: false,
     max_results: numResults,
@@ -133,19 +144,17 @@ async function tavilySearch(query, numResults, freshness) {
 
   const data = await resp.json();
   const results = data?.results || [];
-
-  const mapped = results.map((r) => ({
-    title: r.title || "",
-    url: r.url || "",
-    description: truncate(r.content || "", 400),
-    score: r.score,
-    published_date: r.published_date || "",
+  const mappedResults = results.map((result) => ({
+    title: result.title || "",
+    url: result.url || "",
+    description: truncate(result.content || "", 500),
+    score: result.score,
+    published_date: result.published_date || "",
     source: "tavily",
   }));
 
-  // Prepend Tavily's auto-generated answer if present
   if (data?.answer) {
-    mapped.unshift({
+    mappedResults.unshift({
       title: "AI-generated answer (Tavily)",
       url: "",
       description: data.answer,
@@ -153,12 +162,41 @@ async function tavilySearch(query, numResults, freshness) {
     });
   }
 
-  return mapped;
+  return {
+    provider: "tavily",
+    results: mappedResults,
+    locations: [],
+    answer: data?.answer || "",
+    raw: data,
+  };
 }
 
-// -----------------------------------------------------------------------
-// Handler
-// -----------------------------------------------------------------------
+async function searchDetailed({ query, numResults, freshness, country }) {
+  if (config.searchProvider === "tavily") {
+    return tavilySearchDetailed(query, numResults, freshness);
+  }
+  return braveSearchDetailed(query, numResults, freshness, country);
+}
+
+function formatWebResults(query, results, elapsed) {
+  if (results.length === 0) {
+    return `No results found for query: "${query}"`;
+  }
+
+  const formatted = results
+    .map((result, index) => {
+      const lines = [`[${index + 1}] ${result.title}`];
+      if (result.url) lines.push(`URL: ${result.url}`);
+      if (result.published_date || result.age) {
+        lines.push(`Date: ${result.published_date || result.age}`);
+      }
+      lines.push(`${result.description}`);
+      return lines.join("\n");
+    })
+    .join("\n\n---\n\n");
+
+  return `Web search results for "${query}" (${results.length} results, provider: ${config.searchProvider}, elapsed: ${elapsed}ms)\n\n${formatted}`;
+}
 
 export async function handleWebSearch(args) {
   const query = (args?.query || "").trim();
@@ -173,40 +211,55 @@ export async function handleWebSearch(args) {
   const country = args?.country || "";
 
   const start = Date.now();
-  let results;
+  const primarySearchPromise = searchDetailed({
+    query,
+    numResults,
+    freshness,
+    country,
+  });
 
-  if (config.searchProvider === "tavily") {
-    results = await tavilySearch(query, numResults, freshness);
+  const leadResearchEnabled = shouldRunLeadResearch(query, args);
+
+  let primarySearch;
+  let leadResearchResult = null;
+
+  if (leadResearchEnabled) {
+    const [primaryResult, leadResult] = await Promise.all([
+      primarySearchPromise,
+      primarySearchPromise.then((resolvedPrimarySearch) =>
+        runLeadResearch({
+          query,
+          numResults,
+          freshness,
+          country,
+          primarySearch: resolvedPrimarySearch,
+          searchDetailed,
+        }).catch((error) => {
+          log("warn", `Lead research failed, returning standard web search only: ${error.message}`);
+          return null;
+        })
+      ),
+    ]);
+    primarySearch = primaryResult;
+    leadResearchResult = leadResult;
   } else {
-    results = await braveSearch(query, numResults, freshness, country);
+    primarySearch = await primarySearchPromise;
   }
 
+  const results = primarySearch?.results || [];
   const elapsed = Date.now() - start;
   log("info", `Web search completed in ${elapsed}ms, ${results.length} results`);
 
-  if (results.length === 0) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `No results found for query: "${query}"`,
-        },
-      ],
-    };
+  const standardWebText = formatWebResults(query, results, elapsed);
+
+  if (leadResearchResult?.formattedText) {
+    const combined = [
+      leadResearchResult.formattedText,
+      "Standard web search results",
+      standardWebText,
+    ].join("\n\n===\n\n");
+    return { content: [{ type: "text", text: combined }] };
   }
 
-  const formatted = results
-    .map((r, i) => {
-      const lines = [`[${i + 1}] ${r.title}`];
-      if (r.url) lines.push(`URL: ${r.url}`);
-      if (r.published_date || r.age)
-        lines.push(`Date: ${r.published_date || r.age}`);
-      lines.push(`${r.description}`);
-      return lines.join("\n");
-    })
-    .join("\n\n---\n\n");
-
-  const summary = `Web search results for "${query}" (${results.length} results, provider: ${config.searchProvider}, elapsed: ${elapsed}ms)\n\n${formatted}`;
-
-  return { content: [{ type: "text", text: summary }] };
+  return { content: [{ type: "text", text: standardWebText }] };
 }
