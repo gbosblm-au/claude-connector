@@ -243,3 +243,10 @@ The CSV export approach used here is the officially sanctioned alternative that 
 ## License
 
 MIT
+
+
+## WordPress taxonomy improvements
+
+- `wordpress_create_category` creates categories directly from the connector.
+- `wordpress_create_tag` creates tags directly from the connector.
+- `wordpress_create_post` now supports `category_names`, `tag_names`, and `create_missing_terms` so missing terms can be created automatically during publishing.

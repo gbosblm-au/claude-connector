@@ -20,6 +20,8 @@
 //   wordpress_list_pages      - lists all pages with their status
 //   wordpress_list_categories - lists all categories
 //   wordpress_list_tags       - lists all tags
+//   wordpress_create_category - creates a new category
+//   wordpress_create_tag      - creates a new tag
 //   wordpress_list_menus      - lists all registered navigation menus
 //   wordpress_list_menu_items - lists items in a specific menu
 //   wordpress_create_post     - creates a new blog post (draft or publish)
@@ -90,6 +92,99 @@ async function wpFetch(path, options = {}) {
   }
 
   return body;
+}
+
+function slugifyTermName(value = "") {
+  return String(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function normalizeStringArray(values) {
+  return Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => String(value ?? "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+async function resolveWordPressTerms({ taxonomy, ids = [], names = [], createMissing = false }) {
+  const resolvedIds = new Set(
+    (Array.isArray(ids) ? ids : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+  );
+
+  const matched = [];
+  const created = [];
+  const missing = [];
+
+  for (const name of normalizeStringArray(names)) {
+    const normalizedName = name.toLowerCase();
+    const slug = slugifyTermName(name);
+
+    const searchParams = new URLSearchParams({
+      search: name,
+      per_page: "100",
+      _fields: "id,name,slug,parent",
+    });
+
+    const matches = await wpFetch(`/${taxonomy}?${searchParams}`);
+    const exactMatch = (matches || []).find((term) =>
+      String(term?.name || "").trim().toLowerCase() === normalizedName ||
+      String(term?.slug || "").trim().toLowerCase() === slug
+    );
+
+    if (exactMatch) {
+      const id = Number(exactMatch.id);
+      if (id > 0) resolvedIds.add(id);
+      matched.push({ id, name: exactMatch.name || name, slug: exactMatch.slug || slug });
+      continue;
+    }
+
+    if (!createMissing) {
+      missing.push(name);
+      continue;
+    }
+
+    try {
+      const createdTerm = await wpFetch(`/${taxonomy}`, {
+        method: "POST",
+        body: JSON.stringify({ name }),
+      });
+      const id = Number(createdTerm.id);
+      if (id > 0) resolvedIds.add(id);
+      created.push({ id, name: createdTerm.name || name, slug: createdTerm.slug || slug });
+    } catch (err) {
+      const retryMatches = await wpFetch(`/${taxonomy}?${searchParams}`);
+      const retryExact = (retryMatches || []).find((term) =>
+        String(term?.name || "").trim().toLowerCase() === normalizedName ||
+        String(term?.slug || "").trim().toLowerCase() === slug
+      );
+      if (retryExact) {
+        const id = Number(retryExact.id);
+        if (id > 0) resolvedIds.add(id);
+        matched.push({ id, name: retryExact.name || name, slug: retryExact.slug || slug });
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  return {
+    ids: Array.from(resolvedIds),
+    matched,
+    created,
+    missing,
+  };
 }
 
 // -----------------------------------------------------------------------
@@ -165,6 +260,60 @@ export const wpListTagsToolDefinition = {
   inputSchema: { type: "object", properties: {}, required: [] },
 };
 
+export const wpCreateCategoryToolDefinition = {
+  name: "wordpress_create_category",
+  description:
+    "Creates a new WordPress category and returns its ID, slug, and post count. " +
+    "Use this when you need a category that does not already exist.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name: {
+        type: "string",
+        description: "The category name to create.",
+      },
+      slug: {
+        type: "string",
+        description: "Optional custom slug for the category.",
+      },
+      description: {
+        type: "string",
+        description: "Optional description for the category.",
+      },
+      parent_id: {
+        type: "number",
+        description: "Optional parent category ID for hierarchical categories.",
+      },
+    },
+    required: ["name"],
+  },
+};
+
+export const wpCreateTagToolDefinition = {
+  name: "wordpress_create_tag",
+  description:
+    "Creates a new WordPress tag and returns its ID, slug, and post count. " +
+    "Use this when you need a tag that does not already exist.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name: {
+        type: "string",
+        description: "The tag name to create.",
+      },
+      slug: {
+        type: "string",
+        description: "Optional custom slug for the tag.",
+      },
+      description: {
+        type: "string",
+        description: "Optional description for the tag.",
+      },
+    },
+    required: ["name"],
+  },
+};
+
 export const wpListMenusToolDefinition = {
   name: "wordpress_list_menus",
   description:
@@ -196,8 +345,9 @@ export const wpCreatePostToolDefinition = {
   description:
     "Creates a new blog post on the WordPress site. " +
     "Can publish immediately or save as a draft. " +
-    "Supports title, content (HTML allowed), excerpt, categories, tags, featured image URL, " +
-    "and sticky flag. Returns the new post ID and URL on success. " +
+    "Supports title, content (HTML allowed), excerpt, categories, tags, and sticky flag. " +
+    "Categories and tags can be passed as IDs or names, and missing terms can be auto-created. " +
+    "Returns the new post ID and URL on success. " +
     "ONLY call this when the user explicitly requests creating a WordPress post.",
   inputSchema: {
     type: "object",
@@ -230,6 +380,20 @@ export const wpCreatePostToolDefinition = {
         type: "array",
         items: { type: "number" },
         description: "Array of tag IDs to assign. Use wordpress_list_tags to find IDs.",
+      },
+      category_names: {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional category names to assign. If create_missing_terms is true, missing categories will be created automatically.",
+      },
+      tag_names: {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional tag names to assign. If create_missing_terms is true, missing tags will be created automatically.",
+      },
+      create_missing_terms: {
+        type: "boolean",
+        description: "When true, missing categories and tags provided via category_names or tag_names will be created automatically before publishing.",
       },
       slug: {
         type: "string",
@@ -367,6 +531,7 @@ export const wpUpdateContentToolDefinition = {
   description:
     "Updates an existing WordPress post or page by its ID. " +
     "Only the fields you provide will be updated - omitted fields are left unchanged. " +
+    "For posts, categories and tags can be updated by IDs or names, and missing terms can be auto-created. " +
     "Use wordpress_list_posts or wordpress_list_pages to find the content ID. " +
     "ONLY call this when the user explicitly requests updating existing WordPress content.",
   inputSchema: {
@@ -401,6 +566,30 @@ export const wpUpdateContentToolDefinition = {
       slug: {
         type: "string",
         description: "New URL slug.",
+      },
+      category_ids: {
+        type: "array",
+        items: { type: "number" },
+        description: "For posts only. Replaces assigned categories with these category IDs.",
+      },
+      tag_ids: {
+        type: "array",
+        items: { type: "number" },
+        description: "For posts only. Replaces assigned tags with these tag IDs.",
+      },
+      category_names: {
+        type: "array",
+        items: { type: "string" },
+        description: "For posts only. Category names to resolve and assign. If create_missing_terms is true, missing categories will be created automatically.",
+      },
+      tag_names: {
+        type: "array",
+        items: { type: "string" },
+        description: "For posts only. Tag names to resolve and assign. If create_missing_terms is true, missing tags will be created automatically.",
+      },
+      create_missing_terms: {
+        type: "boolean",
+        description: "For posts only. When true, missing categories and tags provided by name will be created automatically before updating.",
       },
     },
     required: ["id", "content_type"],
@@ -580,6 +769,68 @@ export async function handleWpListTags(_args) {
 
 // -----------------------------------------------------------------------
 
+export async function handleWpCreateCategory(args) {
+  const name = String(args?.name || "").trim();
+  if (!name) throw new Error("'name' is required.");
+
+  const payload = { name };
+  if (args?.slug) payload.slug = args.slug;
+  if (args?.description) payload.description = args.description;
+  if (args?.parent_id) payload.parent = Number(args.parent_id);
+
+  log("info", `Creating WordPress category: "${name}"`);
+
+  const category = await wpFetch("/categories", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  const lines = [
+    `WordPress Category Created`,
+    "==========================",
+    `Name:        ${category.name || name}`,
+    `ID:          ${category.id}`,
+    `Slug:        ${category.slug || ""}`,
+    `Parent ID:   ${category.parent || 0}`,
+    `Description: ${category.description || args?.description || ""}`,
+    `Post Count:  ${category.count ?? 0}`,
+  ].join("\n");
+
+  return { content: [{ type: "text", text: lines }] };
+}
+
+// -----------------------------------------------------------------------
+
+export async function handleWpCreateTag(args) {
+  const name = String(args?.name || "").trim();
+  if (!name) throw new Error("'name' is required.");
+
+  const payload = { name };
+  if (args?.slug) payload.slug = args.slug;
+  if (args?.description) payload.description = args.description;
+
+  log("info", `Creating WordPress tag: "${name}"`);
+
+  const tag = await wpFetch("/tags", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  const lines = [
+    `WordPress Tag Created`,
+    "======================",
+    `Name:        ${tag.name || name}`,
+    `ID:          ${tag.id}`,
+    `Slug:        ${tag.slug || ""}`,
+    `Description: ${tag.description || args?.description || ""}`,
+    `Post Count:  ${tag.count ?? 0}`,
+  ].join("\n");
+
+  return { content: [{ type: "text", text: lines }] };
+}
+
+// -----------------------------------------------------------------------
+
 export async function handleWpListMenus(_args) {
   let menus;
   try {
@@ -701,6 +952,29 @@ export async function handleWpCreatePost(args) {
   if (!args?.title) throw new Error("'title' is required.");
   if (!args?.content) throw new Error("'content' is required.");
 
+  const createMissingTerms = Boolean(args?.create_missing_terms);
+  const categoryResolution = await resolveWordPressTerms({
+    taxonomy: "categories",
+    ids: args?.category_ids,
+    names: args?.category_names,
+    createMissing: createMissingTerms,
+  });
+  const tagResolution = await resolveWordPressTerms({
+    taxonomy: "tags",
+    ids: args?.tag_ids,
+    names: args?.tag_names,
+    createMissing: createMissingTerms,
+  });
+
+  if (categoryResolution.missing.length || tagResolution.missing.length) {
+    const parts = [];
+    if (categoryResolution.missing.length) parts.push(`missing categories: ${categoryResolution.missing.join(", ")}`);
+    if (tagResolution.missing.length) parts.push(`missing tags: ${tagResolution.missing.join(", ")}`);
+    throw new Error(
+      `${parts.join("; ")}. Create them first with wordpress_create_category / wordpress_create_tag, or set create_missing_terms to true.`
+    );
+  }
+
   const payload = {
     title: args.title,
     content: args.content,
@@ -709,8 +983,8 @@ export async function handleWpCreatePost(args) {
 
   if (args.excerpt) payload.excerpt = args.excerpt;
   if (args.slug) payload.slug = args.slug;
-  if (args.category_ids?.length) payload.categories = args.category_ids;
-  if (args.tag_ids?.length) payload.tags = args.tag_ids;
+  if (categoryResolution.ids.length) payload.categories = categoryResolution.ids;
+  if (tagResolution.ids.length) payload.tags = tagResolution.ids;
   if (typeof args.sticky === "boolean") payload.sticky = args.sticky;
   if (args.comment_status) payload.comment_status = args.comment_status;
 
@@ -731,12 +1005,22 @@ export async function handleWpCreatePost(args) {
     `Slug:    ${post.slug}`,
     `URL:     ${post.link}`,
     `Date:    ${post.date?.slice(0, 10) || ""}`,
+    `Categories: ${categoryResolution.ids.length ? categoryResolution.ids.join(", ") : "(none)"}`,
+    `Tags:       ${tagResolution.ids.length ? tagResolution.ids.join(", ") : "(none)"}`,
     ``,
     `Edit URL: ${post.guid?.rendered?.replace(/\?p=\d+/, `?p=${post.id}`).replace(post.slug, `wp-admin/post.php?post=${post.id}&action=edit`) || "Log into WordPress Admin to edit"}`,
-  ].join("\n");
+  ];
 
-  return { content: [{ type: "text", text: lines }] };
+  if (categoryResolution.created.length) {
+    lines.push(`Created categories: ${categoryResolution.created.map((term) => `${term.name} (#${term.id})`).join(", ")}`);
+  }
+  if (tagResolution.created.length) {
+    lines.push(`Created tags: ${tagResolution.created.map((term) => `${term.name} (#${term.id})`).join(", ")}`);
+  }
+
+  return { content: [{ type: "text", text: lines.join("\n") }] };
 }
+
 
 // -----------------------------------------------------------------------
 
@@ -899,12 +1183,50 @@ export async function handleWpUpdateContent(args) {
   if (args.excerpt) payload.excerpt = args.excerpt;
   if (args.slug)    payload.slug    = args.slug;
 
+  let categoryResolution = { ids: [], created: [], missing: [] };
+  let tagResolution = { ids: [], created: [], missing: [] };
+
+  if (args.content_type === "post") {
+    const hasCategoryIntent = Array.isArray(args?.category_ids) || Array.isArray(args?.category_names);
+    const hasTagIntent = Array.isArray(args?.tag_ids) || Array.isArray(args?.tag_names);
+
+    if (hasCategoryIntent) {
+      categoryResolution = await resolveWordPressTerms({
+        taxonomy: "categories",
+        ids: args?.category_ids,
+        names: args?.category_names,
+        createMissing: Boolean(args?.create_missing_terms),
+      });
+      if (categoryResolution.missing.length) {
+        throw new Error(
+          `missing categories: ${categoryResolution.missing.join(", ")}. Create them first with wordpress_create_category or set create_missing_terms to true.`
+        );
+      }
+      payload.categories = categoryResolution.ids;
+    }
+
+    if (hasTagIntent) {
+      tagResolution = await resolveWordPressTerms({
+        taxonomy: "tags",
+        ids: args?.tag_ids,
+        names: args?.tag_names,
+        createMissing: Boolean(args?.create_missing_terms),
+      });
+      if (tagResolution.missing.length) {
+        throw new Error(
+          `missing tags: ${tagResolution.missing.join(", ")}. Create them first with wordpress_create_tag or set create_missing_terms to true.`
+        );
+      }
+      payload.tags = tagResolution.ids;
+    }
+  }
+
   if (Object.keys(payload).length === 0) {
     return {
       content: [
         {
           type: "text",
-          text: "No fields to update were provided. Include at least one of: title, content, status, excerpt, slug.",
+          text: "No fields to update were provided. Include at least one of: title, content, status, excerpt, slug, category_ids, tag_ids, category_names, tag_names.",
         },
       ],
     };
@@ -926,7 +1248,19 @@ export async function handleWpUpdateContent(args) {
     `Slug:    ${updated.slug}`,
     `URL:     ${updated.link}`,
     `Modified: ${updated.modified?.slice(0, 16) || ""}`,
-  ].join("\n");
+  ];
 
-  return { content: [{ type: "text", text: lines }] };
+  if (args.content_type === "post") {
+    if (Array.isArray(payload.categories)) lines.push(`Categories: ${payload.categories.length ? payload.categories.join(", ") : "(cleared)"}`);
+    if (Array.isArray(payload.tags)) lines.push(`Tags:       ${payload.tags.length ? payload.tags.join(", ") : "(cleared)"}`);
+    if (categoryResolution.created.length) {
+      lines.push(`Created categories: ${categoryResolution.created.map((term) => `${term.name} (#${term.id})`).join(", ")}`);
+    }
+    if (tagResolution.created.length) {
+      lines.push(`Created tags: ${tagResolution.created.map((term) => `${term.name} (#${term.id})`).join(", ")}`);
+    }
+  }
+
+  return { content: [{ type: "text", text: lines.join("\n") }] };
 }
+

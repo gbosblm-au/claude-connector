@@ -42,6 +42,8 @@ import {
   wpListPagesToolDefinition,
   wpListCategoriesToolDefinition,
   wpListTagsToolDefinition,
+  wpCreateCategoryToolDefinition,
+  wpCreateTagToolDefinition,
   wpListMenusToolDefinition,
   wpListMenuItemsToolDefinition,
   wpCreatePostToolDefinition,
@@ -53,6 +55,8 @@ import {
   handleWpListPages,
   handleWpListCategories,
   handleWpListTags,
+  handleWpCreateCategory,
+  handleWpCreateTag,
   handleWpListMenus,
   handleWpListMenuItems,
   handleWpCreatePost,
@@ -140,6 +144,8 @@ const TOOLS = [
   wpListPagesToolDefinition,
   wpListCategoriesToolDefinition,
   wpListTagsToolDefinition,
+  wpCreateCategoryToolDefinition,
+  wpCreateTagToolDefinition,
   wpListMenusToolDefinition,
   wpListMenuItemsToolDefinition,
   wpCreatePostToolDefinition,
@@ -202,6 +208,8 @@ function createMcpServer() {
         case "wordpress_list_pages":        return await handleWpListPages(args);
         case "wordpress_list_categories":   return await handleWpListCategories(args);
         case "wordpress_list_tags":         return await handleWpListTags(args);
+        case "wordpress_create_category":   return await handleWpCreateCategory(args);
+        case "wordpress_create_tag":        return await handleWpCreateTag(args);
         case "wordpress_list_menus":        return await handleWpListMenus(args);
         case "wordpress_list_menu_items":   return await handleWpListMenuItems(args);
         case "wordpress_create_post":       return await handleWpCreatePost(args);
