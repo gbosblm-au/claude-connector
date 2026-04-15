@@ -83,6 +83,25 @@ import {
   handleWpCreateServicePage,
 } from "./tools/marketPublisher.js";
 
+import {
+  imageDownloadToolDefinition,
+  imageSearchDownloadToolDefinition,
+  handleImageDownload,
+  handleImageSearchDownload,
+} from "./tools/imageDownloader.js";
+import {
+  wpUploadMediaToolDefinition,
+  wpSetFeaturedImageToolDefinition,
+  handleWpUploadMedia,
+  handleWpSetFeaturedImage,
+} from "./tools/wordpressMedia.js";
+import {
+  googleDriveUploadToolDefinition,
+  googleDriveListToolDefinition,
+  handleGoogleDriveUpload,
+  handleGoogleDriveList,
+} from "./tools/googleDrive.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
@@ -129,6 +148,13 @@ const TOOLS = [
   wpUpdateContentToolDefinition,
   wpSetSeoMetaToolDefinition,
   wpCreateServicePageToolDefinition,
+  // Image download & upload tools
+  imageDownloadToolDefinition,
+  imageSearchDownloadToolDefinition,
+  wpUploadMediaToolDefinition,
+  wpSetFeaturedImageToolDefinition,
+  googleDriveUploadToolDefinition,
+  googleDriveListToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -184,6 +210,13 @@ function createMcpServer() {
         case "wordpress_update_content":    return await handleWpUpdateContent(args);
         case "wordpress_set_seo_meta":      return await handleWpSetSeoMeta(args);
         case "wordpress_create_service_page": return await handleWpCreateServicePage(args);
+        // Image download & upload
+        case "image_download":                return await handleImageDownload(args);
+        case "image_search_download":         return await handleImageSearchDownload(args);
+        case "wordpress_upload_media":        return await handleWpUploadMedia(args);
+        case "wordpress_set_featured_image":  return await handleWpSetFeaturedImage(args);
+        case "google_drive_upload":           return await handleGoogleDriveUpload(args);
+        case "google_drive_list":             return await handleGoogleDriveList(args);
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
         default:

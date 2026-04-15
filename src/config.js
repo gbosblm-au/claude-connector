@@ -50,6 +50,19 @@ export const config = {
   wpUsername: process.env.WP_USERNAME || "",
   wpAppPassword: process.env.WP_APP_PASSWORD || "",
 
+  // Image download directory
+  imageDownloadDir: process.env.IMAGE_DOWNLOAD_DIR || "",
+
+  // Google Drive API (optional - for uploading images to Google Drive)
+  // Option A: Service Account (recommended)
+  googleServiceAccountKeyFile: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || "",
+  // Option B: OAuth2 Refresh Token
+  googleClientId: process.env.GOOGLE_CLIENT_ID || "",
+  googleClientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
+  googleRefreshToken: process.env.GOOGLE_REFRESH_TOKEN || "",
+  // Default folder ID for uploads (optional)
+  googleDriveFolderId: process.env.GOOGLE_DRIVE_FOLDER_ID || "",
+
   // Default result limits
   defaultWebResults: parseInt(process.env.DEFAULT_WEB_RESULTS || "10", 10),
   defaultNewsResults: parseInt(process.env.DEFAULT_NEWS_RESULTS || "10", 10),
