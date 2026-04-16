@@ -2,10 +2,16 @@
 // HTTP MCP server for browser-based Claude (claude.ai)
 //
 // v5 CHANGES:
-//   - ADDED wordpress_set_seo_meta — sets Yoast SEO / RankMath meta on any page or post
-//   - ADDED wordpress_create_service_page — creates brand-consistent TrueSource service pages
+//   - ADDED wordpress_set_seo_meta -- sets Yoast SEO / RankMath meta on any page or post
+//   - ADDED wordpress_create_service_page -- creates brand-consistent TrueSource service pages
 //     with Elementor-compatible HTML structure, capabilities grid, FAQs, hero and CTA sections
 //   - Both tools are consumed by the Market Intelligence & Service Page Publisher skill
+//
+// v5.1 CHANGES:
+//   - ADDED psychology_emotion_taxonomy -- vocabulary stall resolution for interaction-feelings-analyzer
+//   - ADDED psychology_sentiment_analyze -- polarity collapse resolution for interaction-feelings-analyzer
+//   - ADDED psychology_alignment_assess -- alignment blur resolution for interaction-feelings-analyzer
+//   - All three are conditional stall-resolution tools; invoked only on explicit stall conditions
 
 import "dotenv/config";
 import { createServer } from "http";
@@ -106,6 +112,16 @@ import {
   handleGoogleDriveList,
 } from "./tools/googleDrive.js";
 
+// Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
+import {
+  psychologyEmotionTaxonomyToolDefinition,
+  psychologySentimentAnalyzeToolDefinition,
+  psychologyAlignmentAssessToolDefinition,
+  handlePsychologyEmotionTaxonomy,
+  handlePsychologySentimentAnalyze,
+  handlePsychologyAlignmentAssess,
+} from "./tools/psychology.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
@@ -131,7 +147,7 @@ const TOOLS = [
   linkedinOAuthStatusToolDefinition,
   linkedinOAuthLogoutToolDefinition,
   linkedinLiveProfileToolDefinition,
-  // Credential management tools — set WP and LinkedIn credentials from within Claude
+  // Credential management tools -- set WP and LinkedIn credentials from within Claude
   setWordPressCredentialsToolDefinition,
   getWordPressCredentialsToolDefinition,
   clearWordPressCredentialsToolDefinition,
@@ -161,6 +177,12 @@ const TOOLS = [
   wpSetFeaturedImageToolDefinition,
   googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
+  // Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
+  // These are plumbing, not content. Outputs are consumed as internal evidence and must
+  // never be reproduced or referenced in Claude's prose output.
+  psychologyEmotionTaxonomyToolDefinition,
+  psychologySentimentAnalyzeToolDefinition,
+  psychologyAlignmentAssessToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -225,6 +247,10 @@ function createMcpServer() {
         case "wordpress_set_featured_image":  return await handleWpSetFeaturedImage(args);
         case "google_drive_upload":           return await handleGoogleDriveUpload(args);
         case "google_drive_list":             return await handleGoogleDriveList(args);
+        // Psychology endpoint tools
+        case "psychology_emotion_taxonomy":     return await handlePsychologyEmotionTaxonomy(args);
+        case "psychology_sentiment_analyze":    return await handlePsychologySentimentAnalyze(args);
+        case "psychology_alignment_assess":     return await handlePsychologyAlignmentAssess(args);
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
         default:
@@ -263,6 +289,7 @@ app.get("/health", (_req, res) => {
     version: "6.0.0",
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
+    psychologyEndpoints: true,
     timestamp: new Date().toISOString(),
   });
 });
@@ -469,6 +496,7 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `claude-connector v6.0.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
+  log("info", "Psychology endpoints: ENABLED (emotion/taxonomy, sentiment/analyze, alignment/assess)");
 });
 
 process.on("SIGINT",  () => { httpServer.close(() => process.exit(0)); });

@@ -68,6 +68,16 @@ import {
   handleGoogleDriveList,
 } from "./tools/googleDrive.js";
 
+// Psychology endpoint tools - stall-resolution tools for interaction-feelings-analyzer
+import {
+  psychologyEmotionTaxonomyToolDefinition,
+  psychologySentimentAnalyzeToolDefinition,
+  psychologyAlignmentAssessToolDefinition,
+  handlePsychologyEmotionTaxonomy,
+  handlePsychologySentimentAnalyze,
+  handlePsychologyAlignmentAssess,
+} from "./tools/psychology.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 
@@ -108,6 +118,10 @@ const TOOLS = [
   wpSetFeaturedImageToolDefinition,
   googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
+  // Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
+  psychologyEmotionTaxonomyToolDefinition,
+  psychologySentimentAnalyzeToolDefinition,
+  psychologyAlignmentAssessToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -156,6 +170,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "wordpress_set_featured_image":  return await handleWpSetFeaturedImage(args);
       case "google_drive_upload":           return await handleGoogleDriveUpload(args);
       case "google_drive_list":             return await handleGoogleDriveList(args);
+      // Psychology endpoint tools
+      case "psychology_emotion_taxonomy":     return await handlePsychologyEmotionTaxonomy(args);
+      case "psychology_sentiment_analyze":    return await handlePsychologySentimentAnalyze(args);
+      case "psychology_alignment_assess":     return await handlePsychologyAlignmentAssess(args);
       case "get_current_datetime": {
         const dt = getCurrentDateTime();
         return { content: [{ type: "text", text: JSON.stringify(dt, null, 2) }] };
