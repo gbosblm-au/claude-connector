@@ -1,5 +1,59 @@
 # Changelog
 
+## v6.1.0 - Full Google Drive CRUD Toolkit
+
+### Added
+
+- **Eight new Google Drive MCP tools** covering the full read / download /
+  upload / write / overwrite / metadata / permissions surface:
+  - `google_drive_check_connection` -- diagnostic for credentials + quota
+  - `google_drive_search_files` -- search by name, full-text, mimeType,
+    parent folder, owner, modified-time window, or raw Drive query
+  - `google_drive_read_file_content` -- read text of a file, with automatic
+    export of Google Docs / Sheets / Slides / Drawings
+  - `google_drive_download_file_content` -- base64 binary download with
+    optional local save path
+  - `google_drive_create_file` -- create a new file OR overwrite an
+    existing one (by id, or by filename-in-folder)
+  - `google_drive_get_file_metadata` -- rich metadata including owners,
+    MIME type, parents, links and capabilities
+  - `google_drive_list_recent_files` -- recently-modified files
+  - `google_drive_get_file_permissions` -- who can read/edit the file
+
+- **Default OAuth scope widened** to `https://www.googleapis.com/auth/drive`
+  so the new tools can discover and modify pre-existing files. Override via
+  `GOOGLE_DRIVE_SCOPES` to tighten (e.g. `drive.readonly`, `drive.file`).
+
+- **Workspace domain-wide delegation support** via
+  `GOOGLE_IMPERSONATE_SUBJECT` (service-account `sub` JWT claim).
+
+- **Shared Drive support** -- every Drive API call now passes
+  `supportsAllDrives=true` and `includeItemsFromAllDrives=true`.
+
+- **`GOOGLE-DRIVE-SETUP.md`** -- step-by-step guide for Service Account and
+  OAuth2 refresh-token auth, scope cheatsheet, typical flows, troubleshooting.
+
+### Changed
+
+- `src/tools/googleDrive.js` rewritten to add the new tools while preserving
+  the exact request/response shapes of the existing `google_drive_upload`
+  and `google_drive_list` tools.
+- Both `src/index.js` (stdio) and `src/server-http.js` (HTTP) now register
+  and route all 10 Drive tools.
+- `src/config.js` now resolves bundled project data paths correctly, fixing the
+  default LinkedIn CSV and profile locations so existing functionality keeps
+  working when environment overrides are not supplied.
+- `src/config.js` now auto-loads `./data/google-service-account.json` when it
+  exists, while still allowing `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` to override it.
+- `.env.example` documents `GOOGLE_DRIVE_SCOPES`,
+  `GOOGLE_IMPERSONATE_SUBJECT`, and bundled key auto-loading.
+
+### Backwards compatibility
+
+- The existing `google_drive_upload` and `google_drive_list` handlers keep
+  their original input schemas and output text. Existing Claude skills and
+  automations continue to work unchanged.
+
 ## v6.0.1 - Fix: Restore WP Publishing + Security Cleanup
 
 ### Fixed

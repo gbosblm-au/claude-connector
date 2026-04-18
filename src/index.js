@@ -1,4 +1,4 @@
-// src/index.js  v3.0.0
+// src/index.js  v6.1.0
 // Stdio MCP server - for Claude Desktop usage
 import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -66,6 +66,22 @@ import {
   googleDriveListToolDefinition,
   handleGoogleDriveUpload,
   handleGoogleDriveList,
+  googleDriveCheckConnectionToolDefinition,
+  googleDriveSearchFilesToolDefinition,
+  googleDriveReadFileContentToolDefinition,
+  googleDriveDownloadFileContentToolDefinition,
+  googleDriveCreateFileToolDefinition,
+  googleDriveGetFileMetadataToolDefinition,
+  googleDriveListRecentFilesToolDefinition,
+  googleDriveGetFilePermissionsToolDefinition,
+  handleGoogleDriveCheckConnection,
+  handleGoogleDriveSearchFiles,
+  handleGoogleDriveReadFileContent,
+  handleGoogleDriveDownloadFileContent,
+  handleGoogleDriveCreateFile,
+  handleGoogleDriveGetFileMetadata,
+  handleGoogleDriveListRecentFiles,
+  handleGoogleDriveGetFilePermissions,
 } from "./tools/googleDrive.js";
 
 // Psychology endpoint tools - stall-resolution tools for interaction-feelings-analyzer
@@ -82,7 +98,7 @@ import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 
 const server = new Server(
-  { name: "claude-connector", version: "6.0.0" },
+  { name: "claude-connector", version: "6.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -118,6 +134,15 @@ const TOOLS = [
   wpSetFeaturedImageToolDefinition,
   googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
+  // Google Drive full CRUD suite
+  googleDriveCheckConnectionToolDefinition,
+  googleDriveSearchFilesToolDefinition,
+  googleDriveReadFileContentToolDefinition,
+  googleDriveDownloadFileContentToolDefinition,
+  googleDriveCreateFileToolDefinition,
+  googleDriveGetFileMetadataToolDefinition,
+  googleDriveListRecentFilesToolDefinition,
+  googleDriveGetFilePermissionsToolDefinition,
   // Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
   psychologyEmotionTaxonomyToolDefinition,
   psychologySentimentAnalyzeToolDefinition,
@@ -170,6 +195,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "wordpress_set_featured_image":  return await handleWpSetFeaturedImage(args);
       case "google_drive_upload":           return await handleGoogleDriveUpload(args);
       case "google_drive_list":             return await handleGoogleDriveList(args);
+      case "google_drive_check_connection":       return await handleGoogleDriveCheckConnection(args);
+      case "google_drive_search_files":           return await handleGoogleDriveSearchFiles(args);
+      case "google_drive_read_file_content":      return await handleGoogleDriveReadFileContent(args);
+      case "google_drive_download_file_content":  return await handleGoogleDriveDownloadFileContent(args);
+      case "google_drive_create_file":            return await handleGoogleDriveCreateFile(args);
+      case "google_drive_get_file_metadata":      return await handleGoogleDriveGetFileMetadata(args);
+      case "google_drive_list_recent_files":      return await handleGoogleDriveListRecentFiles(args);
+      case "google_drive_get_file_permissions":   return await handleGoogleDriveGetFilePermissions(args);
       // Psychology endpoint tools
       case "psychology_emotion_taxonomy":     return await handlePsychologyEmotionTaxonomy(args);
       case "psychology_sentiment_analyze":    return await handlePsychologySentimentAnalyze(args);
@@ -190,7 +223,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log("info", "claude-connector v6.0.0 running via stdio");
+  log("info", "claude-connector v6.1.0 running via stdio");
 }
 
 main().catch((err) => {

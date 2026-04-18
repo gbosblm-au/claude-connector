@@ -10,10 +10,29 @@ A fully functional **MCP (Model Context Protocol) server** that gives Claude rea
 | `linkedin_search_connections` | Searches connections by name, company, position, date, etc. |
 | `linkedin_connection_count` | Summary statistics of your loaded connections |
 | `linkedin_get_profile` | Returns your own LinkedIn profile data |
+| `google_drive_check_connection` | Verifies Google Drive credentials, scopes, quota, and reachability |
+| `google_drive_search_files` | Searches Drive by name, content, or metadata |
+| `google_drive_read_file_content` | Reads text content from Drive files and Google Docs exports |
+| `google_drive_download_file_content` | Downloads binary content from Drive files |
+| `google_drive_create_file` | Creates new files or overwrites existing files in Drive |
+| `google_drive_get_file_metadata` | Returns rich file metadata |
+| `google_drive_list_recent_files` | Lists recently modified Drive files |
+| `google_drive_get_file_permissions` | Returns Drive sharing and permission details |
+| `google_drive_upload` | Uploads local files to Google Drive |
+| `google_drive_list` | Lists files in a Drive folder |
 | `get_current_datetime` | Returns the current UTC date/time |
 
 ---
 
+
+## What's New in v6.1.0
+
+- **Full Google Drive toolkit** with search, read, binary download, create, overwrite, metadata, recent files, permissions, upload, and list support.
+- **Bundled Google service account support**. If `./data/google-service-account.json` exists, the connector auto-loads it without needing an environment variable.
+- **Config path fix** for default LinkedIn data files, preventing broken relative paths when `LINKEDIN_CSV_PATH` or `LINKEDIN_PROFILE_PATH` are not set.
+- **Backward compatible**. Existing Google Drive upload/list, WordPress, LinkedIn, search, and publishing functionality remain intact.
+
+See `GOOGLE-DRIVE-SETUP.md` for the Drive setup and usage guide.
 
 ## What's New in v5.0.0
 

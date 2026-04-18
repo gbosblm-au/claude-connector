@@ -1,6 +1,15 @@
 // config.js
 // Reads and validates environment configuration at startup.
 
+import { existsSync } from "node:fs";
+
+const DEFAULT_LINKEDIN_CSV_PATH = new URL("../data/connections.csv", import.meta.url).pathname;
+const DEFAULT_LINKEDIN_PROFILE_PATH = new URL("../data/profile.json", import.meta.url).pathname;
+const BUNDLED_GOOGLE_SERVICE_ACCOUNT_KEY_FILE = new URL(
+  "../data/google-service-account.json",
+  import.meta.url
+).pathname;
+
 export const config = {
   // Search provider: "brave" | "tavily"
   searchProvider: (process.env.SEARCH_PROVIDER || "brave").toLowerCase(),
@@ -23,15 +32,12 @@ export const config = {
   // Unsplash: https://unsplash.com/developers
   unsplashAccessKey: process.env.UNSPLASH_ACCESS_KEY || "",
 
-  // LinkedIn CSV path (defaults to ./data/connections.csv relative to cwd)
-  linkedinCsvPath:
-    process.env.LINKEDIN_CSV_PATH ||
-    new URL("../../data/connections.csv", import.meta.url).pathname,
+  // LinkedIn CSV path (defaults to ./data/connections.csv inside this project)
+  linkedinCsvPath: process.env.LINKEDIN_CSV_PATH || DEFAULT_LINKEDIN_CSV_PATH,
 
   // LinkedIn profile JSON path (optional manual profile data)
   linkedinProfilePath:
-    process.env.LINKEDIN_PROFILE_PATH ||
-    new URL("../../data/profile.json", import.meta.url).pathname,
+    process.env.LINKEDIN_PROFILE_PATH || DEFAULT_LINKEDIN_PROFILE_PATH,
 
   // LinkedIn OAuth 2.0 (optional - for live profile fetching)
   linkedinClientId: process.env.LINKEDIN_CLIENT_ID || "",
@@ -53,15 +59,30 @@ export const config = {
   // Image download directory
   imageDownloadDir: process.env.IMAGE_DOWNLOAD_DIR || "",
 
-  // Google Drive API (optional - for uploading images to Google Drive)
+  // Google Drive API (optional)
   // Option A: Service Account (recommended)
-  googleServiceAccountKeyFile: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || "",
+  // If GOOGLE_SERVICE_ACCOUNT_KEY_FILE is not set, the connector will also
+  // auto-load ./data/google-service-account.json when that file exists.
+  googleServiceAccountKeyFile:
+    process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE ||
+    (existsSync(BUNDLED_GOOGLE_SERVICE_ACCOUNT_KEY_FILE)
+      ? BUNDLED_GOOGLE_SERVICE_ACCOUNT_KEY_FILE
+      : ""),
   // Option B: OAuth2 Refresh Token
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
   googleClientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
   googleRefreshToken: process.env.GOOGLE_REFRESH_TOKEN || "",
   // Default folder ID for uploads (optional)
   googleDriveFolderId: process.env.GOOGLE_DRIVE_FOLDER_ID || "",
+  // OAuth scopes used when requesting an access token. Default grants full
+  // Drive access which is required for search / read / write across files
+  // that were not created by this app. Override with a space or comma
+  // separated list (e.g. "https://www.googleapis.com/auth/drive.readonly").
+  googleDriveScopes:
+    process.env.GOOGLE_DRIVE_SCOPES || "https://www.googleapis.com/auth/drive",
+  // Optional: impersonate a Workspace user via domain-wide delegation when
+  // using a service account (leave blank otherwise).
+  googleImpersonateSubject: process.env.GOOGLE_IMPERSONATE_SUBJECT || "",
 
   // Default result limits
   defaultWebResults: parseInt(process.env.DEFAULT_WEB_RESULTS || "10", 10),

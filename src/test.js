@@ -38,13 +38,15 @@ console.log("\n=== claude-connector test suite ===\n");
 // -----------------------------------------------------------------------
 console.log("-- Module imports --");
 
-let config, log, helpers, csvParser, webSearch, newsSearch, linkedin, leadSearch;
+let config, log, helpers, csvParser, webSearch, newsSearch, linkedin, leadSearch, googleDrive;
 
 test("config module loads", async () => {
   const mod = await import("./config.js");
   config = mod.config;
   assert(config.searchProvider, "searchProvider should be set");
   assert(typeof config.defaultWebResults === "number", "defaultWebResults should be a number");
+  assert(config.linkedinCsvPath.endsWith("/data/connections.csv"), "Default LinkedIn CSV path should point to project data directory");
+  assert(config.linkedinProfilePath.endsWith("/data/profile.json"), "Default LinkedIn profile path should point to project data directory");
 });
 
 test("logger module loads", async () => {
@@ -97,6 +99,18 @@ test("linkedin module loads", async () => {
   assert(linkedin.linkedinCountToolDefinition.name === "linkedin_connection_count");
   assert(typeof linkedin.handleLinkedinLoad === "function");
   assert(typeof linkedin.handleLinkedinSearch === "function");
+});
+
+test("googleDrive module loads", async () => {
+  const mod = await import("./tools/googleDrive.js");
+  googleDrive = mod;
+  assert(googleDrive.googleDriveSearchFilesToolDefinition.name === "google_drive_search_files");
+  assert(googleDrive.googleDriveReadFileContentToolDefinition.name === "google_drive_read_file_content");
+  assert(googleDrive.googleDriveDownloadFileContentToolDefinition.name === "google_drive_download_file_content");
+  assert(googleDrive.googleDriveCreateFileToolDefinition.name === "google_drive_create_file");
+  assert(typeof googleDrive.handleGoogleDriveSearchFiles === "function");
+  assert(typeof googleDrive.handleGoogleDriveReadFileContent === "function");
+  assert(typeof googleDrive.handleGoogleDriveCreateFile === "function");
 });
 
 // -----------------------------------------------------------------------
@@ -535,6 +549,141 @@ Eve,Taylor,,,Atlassian,Engineering Manager,10 Feb 2024`;
       assert(text.includes("Standard web search results"), "Should still include the standard web search section");
     } finally {
       global.fetch = originalFetch;
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // 7. Google Drive behaviour
+  // -----------------------------------------------------------------------
+
+  console.log("\n-- Google Drive behaviour --");
+
+  test("googleDrive search, read and overwrite flows work with mocked Drive API", async () => {
+    const originalFetch = global.fetch;
+    const originalGoogleClientId = config.googleClientId;
+    const originalGoogleClientSecret = config.googleClientSecret;
+    const originalGoogleRefreshToken = config.googleRefreshToken;
+    const originalGoogleServiceAccountKeyFile = config.googleServiceAccountKeyFile;
+    const originalGoogleDriveFolderId = config.googleDriveFolderId;
+
+    config.googleClientId = "test-google-client-id";
+    config.googleClientSecret = "test-google-client-secret";
+    config.googleRefreshToken = "test-google-refresh-token";
+    config.googleServiceAccountKeyFile = "";
+    config.googleDriveFolderId = "folder-123";
+
+    const jsonResponse = (payload, url) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (name) => (name.toLowerCase() === "content-type" ? "application/json" : null) },
+      json: async () => payload,
+      text: async () => JSON.stringify(payload),
+      arrayBuffer: async () => Buffer.from(JSON.stringify(payload)),
+      url,
+    });
+
+    const textResponse = (text, url, contentType = "text/plain; charset=utf-8") => ({
+      ok: true,
+      status: 200,
+      headers: { get: (name) => (name.toLowerCase() === "content-type" ? contentType : null) },
+      json: async () => ({ text }),
+      text: async () => text,
+      arrayBuffer: async () => Buffer.from(text, "utf-8"),
+      url,
+    });
+
+    global.fetch = async (url, init = {}) => {
+      const asString = String(url);
+      if (asString === "https://oauth2.googleapis.com/token") {
+        return jsonResponse({ access_token: "test-access-token", scope: "https://www.googleapis.com/auth/drive" }, asString);
+      }
+
+      const parsedUrl = new URL(asString);
+
+      if (parsedUrl.hostname === "www.googleapis.com" && parsedUrl.pathname === "/drive/v3/files" && (!init.method || init.method === "GET")) {
+        const q = parsedUrl.searchParams.get("q") || "";
+        if (q.includes("name contains 'report'")) {
+          return jsonResponse({
+            files: [{
+              id: "file-123",
+              name: "Quarterly report.txt",
+              mimeType: "text/plain",
+              size: "24",
+              modifiedTime: "2026-04-18T00:00:00Z",
+              owners: [{ emailAddress: "owner@example.com", displayName: "Owner" }],
+              webViewLink: "https://drive.google.com/file/d/file-123/view",
+              capabilities: { canEdit: true, canDownload: true, canDelete: true, canShare: true },
+            }],
+          }, asString);
+        }
+
+        if (q.includes("name = 'Quarterly report.txt'")) {
+          return jsonResponse({
+            files: [{ id: "file-123", name: "Quarterly report.txt", mimeType: "text/plain", parents: ["folder-123"] }],
+          }, asString);
+        }
+      }
+
+      if (parsedUrl.hostname === "www.googleapis.com" && parsedUrl.pathname === "/drive/v3/files/file-123" && parsedUrl.searchParams.get("alt") === "media") {
+        return textResponse("Quarterly report contents", asString);
+      }
+
+      if (parsedUrl.hostname === "www.googleapis.com" && parsedUrl.pathname === "/drive/v3/files/file-123") {
+        return jsonResponse({
+          id: "file-123",
+          name: "Quarterly report.txt",
+          mimeType: "text/plain",
+          size: "24",
+          modifiedTime: "2026-04-18T00:00:00Z",
+          createdTime: "2026-04-17T00:00:00Z",
+          owners: [{ emailAddress: "owner@example.com", displayName: "Owner" }],
+          parents: ["folder-123"],
+          webViewLink: "https://drive.google.com/file/d/file-123/view",
+          capabilities: { canEdit: true, canDownload: true, canDelete: true, canShare: true },
+        }, asString);
+      }
+
+      if (parsedUrl.hostname === "www.googleapis.com" && parsedUrl.pathname === "/upload/drive/v3/files/file-123" && init.method === "PATCH") {
+        return jsonResponse({
+          id: "file-123",
+          name: "Quarterly report.txt",
+          mimeType: "text/plain",
+          size: "31",
+          modifiedTime: "2026-04-18T01:00:00Z",
+          webViewLink: "https://drive.google.com/file/d/file-123/view",
+          webContentLink: "https://drive.google.com/uc?id=file-123&export=download",
+        }, asString);
+      }
+
+      throw new Error(`Unexpected fetch URL in Google Drive test: ${asString}`);
+    };
+
+    try {
+      const searchResult = await googleDrive.handleGoogleDriveSearchFiles({ name_contains: "report" });
+      const searchText = searchResult.content[0].text;
+      assert(searchText.includes("Quarterly report.txt"), "Drive search should include the mocked file name");
+      assert(searchText.includes("file-123"), "Drive search should include the mocked file ID");
+
+      const readResult = await googleDrive.handleGoogleDriveReadFileContent({ file_id: "file-123" });
+      const readText = readResult.content[0].text;
+      assert(readText.includes("Quarterly report contents"), "Drive read should include mocked file content");
+
+      const overwriteResult = await googleDrive.handleGoogleDriveCreateFile({
+        filename: "Quarterly report.txt",
+        folder_id: "folder-123",
+        overwrite_by_name: true,
+        text_content: "Updated quarterly report contents",
+      });
+      const overwriteText = overwriteResult.content[0].text;
+      assert(overwriteText.includes("Google Drive File Overwritten"), "Drive overwrite should confirm overwrite path");
+      assert(overwriteText.includes("file-123"), "Drive overwrite should report the existing file ID");
+    } finally {
+      global.fetch = originalFetch;
+      config.googleClientId = originalGoogleClientId;
+      config.googleClientSecret = originalGoogleClientSecret;
+      config.googleRefreshToken = originalGoogleRefreshToken;
+      config.googleServiceAccountKeyFile = originalGoogleServiceAccountKeyFile;
+      config.googleDriveFolderId = originalGoogleDriveFolderId;
     }
   });
 

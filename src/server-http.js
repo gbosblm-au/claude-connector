@@ -1,4 +1,4 @@
-// src/server-http.js  v5.0.0
+// src/server-http.js  v6.1.0
 // HTTP MCP server for browser-based Claude (claude.ai)
 //
 // v5 CHANGES:
@@ -110,6 +110,22 @@ import {
   googleDriveListToolDefinition,
   handleGoogleDriveUpload,
   handleGoogleDriveList,
+  googleDriveCheckConnectionToolDefinition,
+  googleDriveSearchFilesToolDefinition,
+  googleDriveReadFileContentToolDefinition,
+  googleDriveDownloadFileContentToolDefinition,
+  googleDriveCreateFileToolDefinition,
+  googleDriveGetFileMetadataToolDefinition,
+  googleDriveListRecentFilesToolDefinition,
+  googleDriveGetFilePermissionsToolDefinition,
+  handleGoogleDriveCheckConnection,
+  handleGoogleDriveSearchFiles,
+  handleGoogleDriveReadFileContent,
+  handleGoogleDriveDownloadFileContent,
+  handleGoogleDriveCreateFile,
+  handleGoogleDriveGetFileMetadata,
+  handleGoogleDriveListRecentFiles,
+  handleGoogleDriveGetFilePermissions,
 } from "./tools/googleDrive.js";
 
 // Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
@@ -177,6 +193,15 @@ const TOOLS = [
   wpSetFeaturedImageToolDefinition,
   googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
+  // Google Drive full CRUD suite
+  googleDriveCheckConnectionToolDefinition,
+  googleDriveSearchFilesToolDefinition,
+  googleDriveReadFileContentToolDefinition,
+  googleDriveDownloadFileContentToolDefinition,
+  googleDriveCreateFileToolDefinition,
+  googleDriveGetFileMetadataToolDefinition,
+  googleDriveListRecentFilesToolDefinition,
+  googleDriveGetFilePermissionsToolDefinition,
   // Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
   // These are plumbing, not content. Outputs are consumed as internal evidence and must
   // never be reproduced or referenced in Claude's prose output.
@@ -195,7 +220,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "6.0.0" },
+    { name: "claude-connector", version: "6.1.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -247,6 +272,14 @@ function createMcpServer() {
         case "wordpress_set_featured_image":  return await handleWpSetFeaturedImage(args);
         case "google_drive_upload":           return await handleGoogleDriveUpload(args);
         case "google_drive_list":             return await handleGoogleDriveList(args);
+        case "google_drive_check_connection":       return await handleGoogleDriveCheckConnection(args);
+        case "google_drive_search_files":           return await handleGoogleDriveSearchFiles(args);
+        case "google_drive_read_file_content":      return await handleGoogleDriveReadFileContent(args);
+        case "google_drive_download_file_content":  return await handleGoogleDriveDownloadFileContent(args);
+        case "google_drive_create_file":            return await handleGoogleDriveCreateFile(args);
+        case "google_drive_get_file_metadata":      return await handleGoogleDriveGetFileMetadata(args);
+        case "google_drive_list_recent_files":      return await handleGoogleDriveListRecentFiles(args);
+        case "google_drive_get_file_permissions":   return await handleGoogleDriveGetFilePermissions(args);
         // Psychology endpoint tools
         case "psychology_emotion_taxonomy":     return await handlePsychologyEmotionTaxonomy(args);
         case "psychology_sentiment_analyze":    return await handlePsychologySentimentAnalyze(args);
@@ -286,7 +319,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "6.0.0",
+    version: "6.1.0",
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
     psychologyEndpoints: true,
@@ -493,7 +526,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v6.0.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v6.1.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", "Psychology endpoints: ENABLED (emotion/taxonomy, sentiment/analyze, alignment/assess)");
