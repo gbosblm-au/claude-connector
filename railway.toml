@@ -4,7 +4,7 @@
 [build]
 builder = "nixpacks"
 [deploy]
-startCommand = "sh -c 'echo \"$GOOGLE_SERVICE_ACCOUNT_KEY_B64\" | base64 -d > /tmp/gcp-key.json && chmod 600 /tmp/gcp-key.json && node src/server-http.js'"
+startCommand = "node src/server-http.js"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
