@@ -1,16 +1,13 @@
 # railway.toml
 # Railway deployment configuration for claude-connector.
 # https://railway.app
-
 [build]
 builder = "nixpacks"
-
 [deploy]
-startCommand = "node src/server-http.js"
+startCommand = "sh -c 'printf \"%s\" \"$GOOGLE_SERVICE_ACCOUNT_KEY_JSON\" > /tmp/gcp-key.json && chmod 600 /tmp/gcp-key.json && node src/server-http.js'"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
-
 [[services]]
 name = "claude-connector"
