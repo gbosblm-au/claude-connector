@@ -1,6 +1,10 @@
 // config.js
 // Reads and validates environment configuration at startup.
 
+
+// User-Agent string sent with all outbound HTTP requests.
+// Identifies the connector to remote servers and security systems.
+export const CONNECTOR_USER_AGENT = 'claude-connector/7.0.0 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)';
 import { existsSync } from "node:fs";
 
 const DEFAULT_LINKEDIN_CSV_PATH = new URL("../data/connections.csv", import.meta.url).pathname;

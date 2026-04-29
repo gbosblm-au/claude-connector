@@ -1,5 +1,26 @@
 # Changelog
 
+## v7.0.1 - User-Agent Hardening
+
+### Changed
+- Added `CONNECTOR_USER_AGENT` constant to `src/config.js` - a single source of
+  truth for the User-Agent string sent on all outbound HTTP requests.
+  Value: `claude-connector/7.0.1 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)`
+- `src/tools/wordpress.js`: `wpFetch()` now sends `User-Agent: CONNECTOR_USER_AGENT`
+  on every WordPress REST API call (GET and POST).
+- `src/tools/wordpressMedia.js`: All four `fetch()` calls (image download,
+  media upload, metadata update, featured image set) now send the correct UA.
+- `src/tools/leadSearch.js`: Replaced hardcoded `claude-connector/6.1 lead-research`
+  UA string with `CONNECTOR_USER_AGENT`.
+
+### Why
+SiteGround's Antibot AI was blocking requests due to an outdated or
+unrecognised User-Agent string (HeadlessChrome/Chrome 120). A descriptive,
+honest UA that clearly identifies the connector resolves the block without
+requiring IP whitelisting.
+
+---
+
 ## v7.0.0 - TrueSource Outreach Email Pipeline (SCOPE-01 / 03 / 04 / 05)
 
 ### Added
