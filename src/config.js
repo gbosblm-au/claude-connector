@@ -1,6 +1,10 @@
 // config.js
 // Reads and validates environment configuration at startup.
 
+
+// User-Agent string sent with all outbound HTTP requests.
+// Identifies the connector to remote servers and security systems.
+export const CONNECTOR_USER_AGENT = 'claude-connector/7.0.0 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)';
 import { existsSync } from "node:fs";
 
 const DEFAULT_LINKEDIN_CSV_PATH = new URL("../data/connections.csv", import.meta.url).pathname;
@@ -93,7 +97,111 @@ export const config = {
   maxWebResults: parseInt(process.env.MAX_WEB_RESULTS || "20", 10),
   maxNewsResults: parseInt(process.env.MAX_NEWS_RESULTS || "20", 10),
   maxImageResults: parseInt(process.env.MAX_IMAGE_RESULTS || "20", 10),
+
+  // -------------------------------------------------------------------
+  // SCOPE-01 / SCOPE-03 / SCOPE-04 / SCOPE-05 -- TrueSource email send
+  // -------------------------------------------------------------------
+
+  // Shared SMTP credentials (team@truesourceconsulting.com.au)
+  smtpHost: process.env.SMTP_HOST || "",
+  smtpPort: parseInt(process.env.SMTP_PORT || "587", 10),
+  smtpUser: process.env.SMTP_USER || "",
+  smtpPass: process.env.SMTP_PASS || "",
+  smtpFromEmail: process.env.SMTP_FROM_EMAIL || "team@truesourceconsulting.com.au",
+  smtpFromName: process.env.SMTP_FROM_NAME || "TrueSource Consulting",
+
+  // Master kill-switch for outbound sends
+  emailSendEnabled: (process.env.EMAIL_SEND_ENABLED || "true").toLowerCase() === "true",
+
+  // Rate limit: 20 sends per 60-minute rolling window across all senders.
+  emailRateLimitPerHour: parseInt(process.env.EMAIL_RATE_LIMIT_PER_HOUR || "20", 10),
+
+  // SCOPE-03 -- HTML templating
+  emailHtmlEnabled: (process.env.EMAIL_HTML_ENABLED || "true").toLowerCase() === "true",
+  emailLogoUrl: process.env.EMAIL_LOGO_URL || "",
+  emailConfidentialityFooter:
+    process.env.EMAIL_CONFIDENTIALITY_FOOTER ||
+    "This email and any attachments are confidential and intended solely for the named addressee. " +
+    "If you have received this email in error, please notify the sender immediately and delete it " +
+    "from your system. TrueSource Consulting Pty Ltd.",
+
+  // SCOPE-04 -- tracking
+  emailTrackingEnabled: (process.env.EMAIL_TRACKING_ENABLED || "true").toLowerCase() === "true",
+  trackingBaseUrl:
+    process.env.TRACKING_BASE_URL ||
+    (process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+      : "https://claude-connector-production.up.railway.app"),
+  trackingGdriveFileId: process.env.TRACKING_GDRIVE_FILE_ID || "",
+  trackingGdriveFolderId: process.env.TRACKING_GDRIVE_FOLDER_ID || process.env.GOOGLE_DRIVE_FOLDER_ID || "",
+  trackingFilename: process.env.TRACKING_FILENAME || "TrueSource_Email_Tracking.csv",
+  trackingIpHashSalt: process.env.TRACKING_IP_HASH_SALT || "truesource-tracking-salt",
+
+  // SCOPE-05 -- scheduling
+  scheduleEnabled: (process.env.SCHEDULE_ENABLED || "true").toLowerCase() === "true",
+  scheduleStorePath: process.env.SCHEDULE_STORE_PATH || "/data/schedule_store.json",
+  scheduleMaxPending: parseInt(process.env.SCHEDULE_MAX_PENDING || "50", 10),
 };
+
+// -----------------------------------------------------------------------
+// Sender profile helper - reads SENDER_BRIAN_*, SENDER_MICHAEL_*, SENDER_ROBBIE_*
+// env vars and returns a normalised profile object.
+//
+// senderId must be one of: "brian", "michael", "robbie".
+// Returns null for unknown sender_id values.
+// -----------------------------------------------------------------------
+const SENDER_DEFAULTS = {
+  brian:   { name: "Brian Le Mon",   title: "Director", reply: "brian@truesourceconsulting.com.au" },
+  michael: { name: "Michael Phan",   title: "Director", reply: "michael@truesourceconsulting.com.au" },
+  robbie:  { name: "Robbie Singh",   title: "Director", reply: "robbie@truesourceconsulting.com.au" },
+};
+
+function signatureFor(name, replyTo) {
+  return [
+    name,
+    "Director | TrueSource Consulting",
+    `E: ${replyTo}`,
+    "W: truesourceconsulting.com.au",
+    "",
+    "This email and any attachments are confidential and intended solely for the",
+    "addressee. If you have received this email in error please notify the sender.",
+  ].join("\n");
+}
+
+export function getSenderProfile(senderId) {
+  const id = (senderId || "brian").toLowerCase();
+  const def = SENDER_DEFAULTS[id];
+  if (!def) return null;
+
+  const KEY = id.toUpperCase();
+  const name = process.env[`SENDER_${KEY}_NAME`] || def.name;
+  const title = process.env[`SENDER_${KEY}_TITLE`] || def.title;
+  const replyTo = process.env[`SENDER_${KEY}_REPLY_TO`] || def.reply;
+  const phone = process.env[`SENDER_${KEY}_PHONE`] || "";
+  const linkedin = process.env[`SENDER_${KEY}_LINKEDIN`] || "";
+  const signature =
+    process.env[`SENDER_${KEY}_SIGNATURE`] || signatureFor(name, replyTo);
+
+  return {
+    sender_id: id,
+    sender_name: name,
+    sender_title: title,
+    reply_to: replyTo,
+    phone,
+    linkedin,
+    signature_preview: signature,
+  };
+}
+
+export function listSenderProfiles() {
+  return ["brian", "michael", "robbie"]
+    .map((id) => getSenderProfile(id))
+    .filter(Boolean);
+}
+
+export function smtpConfigured() {
+  return Boolean(config.smtpHost && config.smtpUser && config.smtpPass);
+}
 
 // -----------------------------------------------------------------------
 // Validation helpers (called lazily per tool)

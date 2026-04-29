@@ -1,4 +1,4 @@
-// src/index.js  v6.1.0
+// src/index.js  v7.0.0
 // Stdio MCP server - for Claude Desktop usage
 import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -84,7 +84,6 @@ import {
   handleGoogleDriveGetFilePermissions,
 } from "./tools/googleDrive.js";
 
-// Psychology endpoint tools - stall-resolution tools for interaction-feelings-analyzer
 import {
   psychologyEmotionTaxonomyToolDefinition,
   psychologySentimentAnalyzeToolDefinition,
@@ -94,11 +93,38 @@ import {
   handlePsychologyAlignmentAssess,
 } from "./tools/psychology.js";
 
+// SCOPE-01 / SCOPE-03 / SCOPE-04 / SCOPE-05 -- TrueSource outreach email
+import {
+  emailSendToolDefinition,
+  emailGetConfigToolDefinition,
+  emailGetSenderProfilesToolDefinition,
+  emailValidateAddressToolDefinition,
+  handleEmailSend,
+  handleEmailGetConfig,
+  handleEmailGetSenderProfiles,
+  handleEmailValidateAddress,
+} from "./tools/email.js";
+import {
+  emailGetTrackingToolDefinition,
+  emailTrackingSummaryToolDefinition,
+  handleEmailGetTracking,
+  handleEmailTrackingSummary,
+} from "./tools/emailTracking.js";
+import {
+  emailScheduleToolDefinition,
+  emailScheduleCancelToolDefinition,
+  emailScheduleListToolDefinition,
+  handleEmailSchedule,
+  handleEmailScheduleCancel,
+  handleEmailScheduleList,
+} from "./tools/emailSchedule.js";
+import { startScheduler } from "./utils/scheduler.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 
 const server = new Server(
-  { name: "claude-connector", version: "6.1.0" },
+  { name: "claude-connector", version: "7.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -127,14 +153,12 @@ const TOOLS = [
   wpCreatePageToolDefinition,
   wpAddMenuItemToolDefinition,
   wpUpdateContentToolDefinition,
-  // Image download & upload tools
   imageDownloadToolDefinition,
   imageSearchDownloadToolDefinition,
   wpUploadMediaToolDefinition,
   wpSetFeaturedImageToolDefinition,
   googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
-  // Google Drive full CRUD suite
   googleDriveCheckConnectionToolDefinition,
   googleDriveSearchFilesToolDefinition,
   googleDriveReadFileContentToolDefinition,
@@ -143,10 +167,19 @@ const TOOLS = [
   googleDriveGetFileMetadataToolDefinition,
   googleDriveListRecentFilesToolDefinition,
   googleDriveGetFilePermissionsToolDefinition,
-  // Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
   psychologyEmotionTaxonomyToolDefinition,
   psychologySentimentAnalyzeToolDefinition,
   psychologyAlignmentAssessToolDefinition,
+  // TrueSource outreach email
+  emailSendToolDefinition,
+  emailGetConfigToolDefinition,
+  emailGetSenderProfilesToolDefinition,
+  emailValidateAddressToolDefinition,
+  emailGetTrackingToolDefinition,
+  emailTrackingSummaryToolDefinition,
+  emailScheduleToolDefinition,
+  emailScheduleCancelToolDefinition,
+  emailScheduleListToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -166,7 +199,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "web_search":                  return await handleWebSearch(args);
       case "news_search":                 return await handleNewsSearch(args);
-      case "image_search":               return await handleImageSearch(args);
+      case "image_search":                return await handleImageSearch(args);
       case "linkedin_load_connections":   return await handleLinkedinLoad(args);
       case "linkedin_search_connections": return await handleLinkedinSearch(args);
       case "linkedin_connection_count":   return await handleLinkedinCount(args);
@@ -188,25 +221,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "wordpress_create_page":       return await handleWpCreatePage(args);
       case "wordpress_add_menu_item":     return await handleWpAddMenuItem(args);
       case "wordpress_update_content":    return await handleWpUpdateContent(args);
-      // Image download & upload
-      case "image_download":                return await handleImageDownload(args);
-      case "image_search_download":         return await handleImageSearchDownload(args);
-      case "wordpress_upload_media":        return await handleWpUploadMedia(args);
-      case "wordpress_set_featured_image":  return await handleWpSetFeaturedImage(args);
-      case "google_drive_upload":           return await handleGoogleDriveUpload(args);
-      case "google_drive_list":             return await handleGoogleDriveList(args);
-      case "google_drive_check_connection":       return await handleGoogleDriveCheckConnection(args);
-      case "google_drive_search_files":           return await handleGoogleDriveSearchFiles(args);
-      case "google_drive_read_file_content":      return await handleGoogleDriveReadFileContent(args);
-      case "google_drive_download_file_content":  return await handleGoogleDriveDownloadFileContent(args);
-      case "google_drive_create_file":            return await handleGoogleDriveCreateFile(args);
-      case "google_drive_get_file_metadata":      return await handleGoogleDriveGetFileMetadata(args);
-      case "google_drive_list_recent_files":      return await handleGoogleDriveListRecentFiles(args);
-      case "google_drive_get_file_permissions":   return await handleGoogleDriveGetFilePermissions(args);
-      // Psychology endpoint tools
-      case "psychology_emotion_taxonomy":     return await handlePsychologyEmotionTaxonomy(args);
-      case "psychology_sentiment_analyze":    return await handlePsychologySentimentAnalyze(args);
-      case "psychology_alignment_assess":     return await handlePsychologyAlignmentAssess(args);
+      case "image_download":               return await handleImageDownload(args);
+      case "image_search_download":        return await handleImageSearchDownload(args);
+      case "wordpress_upload_media":       return await handleWpUploadMedia(args);
+      case "wordpress_set_featured_image": return await handleWpSetFeaturedImage(args);
+      case "google_drive_upload":                return await handleGoogleDriveUpload(args);
+      case "google_drive_list":                  return await handleGoogleDriveList(args);
+      case "google_drive_check_connection":      return await handleGoogleDriveCheckConnection(args);
+      case "google_drive_search_files":          return await handleGoogleDriveSearchFiles(args);
+      case "google_drive_read_file_content":     return await handleGoogleDriveReadFileContent(args);
+      case "google_drive_download_file_content": return await handleGoogleDriveDownloadFileContent(args);
+      case "google_drive_create_file":           return await handleGoogleDriveCreateFile(args);
+      case "google_drive_get_file_metadata":     return await handleGoogleDriveGetFileMetadata(args);
+      case "google_drive_list_recent_files":     return await handleGoogleDriveListRecentFiles(args);
+      case "google_drive_get_file_permissions":  return await handleGoogleDriveGetFilePermissions(args);
+      case "psychology_emotion_taxonomy":  return await handlePsychologyEmotionTaxonomy(args);
+      case "psychology_sentiment_analyze": return await handlePsychologySentimentAnalyze(args);
+      case "psychology_alignment_assess":  return await handlePsychologyAlignmentAssess(args);
+      // SCOPE-01 / SCOPE-03 email
+      case "email_send":                   return await handleEmailSend(args);
+      case "email_get_config":             return await handleEmailGetConfig(args);
+      case "email_get_sender_profiles":    return await handleEmailGetSenderProfiles(args);
+      case "email_validate_address":       return await handleEmailValidateAddress(args);
+      // SCOPE-04 tracking
+      case "email_get_tracking":           return await handleEmailGetTracking(args);
+      case "email_tracking_summary":       return await handleEmailTrackingSummary(args);
+      // SCOPE-05 scheduling
+      case "email_schedule":               return await handleEmailSchedule(args);
+      case "email_schedule_cancel":        return await handleEmailScheduleCancel(args);
+      case "email_schedule_list":          return await handleEmailScheduleList(args);
       case "get_current_datetime": {
         const dt = getCurrentDateTime();
         return { content: [{ type: "text", text: JSON.stringify(dt, null, 2) }] };
@@ -223,7 +266,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log("info", "claude-connector v6.1.0 running via stdio");
+  // Start the in-process scheduler so deferred sends fire even in stdio mode.
+  try {
+    startScheduler();
+  } catch (err) {
+    log("error", `Scheduler bootstrap error: ${err.message}`);
+  }
+  log("info", "claude-connector v7.0.0 running via stdio");
 }
 
 main().catch((err) => {

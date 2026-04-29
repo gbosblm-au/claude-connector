@@ -1,7 +1,7 @@
 {
   "name": "claude-connector",
-  "version": "6.1.0",
-  "description": "MCP server for Claude with real-time web search, news search, and LinkedIn connections lookup",
+  "version": "7.0.1",
+  "description": "MCP server for Claude with real-time web search, news search, LinkedIn connections lookup, and TrueSource outreach email send/tracking/scheduling",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -16,7 +16,10 @@
     "cheerio": "^1.2.0",
     "csv-parse": "^5.5.6",
     "dotenv": "^16.4.5",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "luxon": "^3.7.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.10.1"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -28,7 +31,11 @@
     "linkedin",
     "web-search",
     "news",
-    "ai-agent"
+    "ai-agent",
+    "smtp",
+    "email",
+    "tracking",
+    "scheduler"
   ],
   "license": "MIT"
 }

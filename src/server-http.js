@@ -1,17 +1,13 @@
-// src/server-http.js  v6.1.0
-// HTTP MCP server for browser-based Claude (claude.ai)
+// src/server-http.js  v7.0.0
+// HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
-// v5 CHANGES:
-//   - ADDED wordpress_set_seo_meta -- sets Yoast SEO / RankMath meta on any page or post
-//   - ADDED wordpress_create_service_page -- creates brand-consistent TrueSource service pages
-//     with Elementor-compatible HTML structure, capabilities grid, FAQs, hero and CTA sections
-//   - Both tools are consumed by the Market Intelligence & Service Page Publisher skill
-//
-// v5.1 CHANGES:
-//   - ADDED psychology_emotion_taxonomy -- vocabulary stall resolution for interaction-feelings-analyzer
-//   - ADDED psychology_sentiment_analyze -- polarity collapse resolution for interaction-feelings-analyzer
-//   - ADDED psychology_alignment_assess -- alignment blur resolution for interaction-feelings-analyzer
-//   - All three are conditional stall-resolution tools; invoked only on explicit stall conditions
+// v7.0 CHANGES (TrueSource Outreach Direct Send):
+//   - SCOPE-01 Tools: email_send, email_get_config, email_get_sender_profiles, email_validate_address
+//   - SCOPE-03 HTML email templating integrated into email_send
+//   - SCOPE-04 Tracking endpoints: GET /track/open, GET /track/click
+//              + tools: email_get_tracking, email_tracking_summary
+//   - SCOPE-05 Scheduling: cron-driven in-process scheduler started at boot
+//              + tools: email_schedule, email_schedule_cancel, email_schedule_list
 
 import "dotenv/config";
 import { createServer } from "http";
@@ -19,7 +15,6 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { writeFileSync, existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
-import { fileURLToPath } from "url";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -128,7 +123,6 @@ import {
   handleGoogleDriveGetFilePermissions,
 } from "./tools/googleDrive.js";
 
-// Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
 import {
   psychologyEmotionTaxonomyToolDefinition,
   psychologySentimentAnalyzeToolDefinition,
@@ -137,6 +131,41 @@ import {
   handlePsychologySentimentAnalyze,
   handlePsychologyAlignmentAssess,
 } from "./tools/psychology.js";
+
+// ---------- TrueSource outreach direct send (SCOPE-01/03/04/05) ----------
+import {
+  emailSendToolDefinition,
+  emailGetConfigToolDefinition,
+  emailGetSenderProfilesToolDefinition,
+  emailValidateAddressToolDefinition,
+  handleEmailSend,
+  handleEmailGetConfig,
+  handleEmailGetSenderProfiles,
+  handleEmailValidateAddress,
+} from "./tools/email.js";
+import {
+  emailGetTrackingToolDefinition,
+  emailTrackingSummaryToolDefinition,
+  handleEmailGetTracking,
+  handleEmailTrackingSummary,
+} from "./tools/emailTracking.js";
+import {
+  emailScheduleToolDefinition,
+  emailScheduleCancelToolDefinition,
+  emailScheduleListToolDefinition,
+  handleEmailSchedule,
+  handleEmailScheduleCancel,
+  handleEmailScheduleList,
+} from "./tools/emailSchedule.js";
+import {
+  PIXEL_PNG,
+  appendTrackingEvent,
+  classifyUserAgent,
+  hashIp,
+  getSendMetadata,
+  incrementOpen,
+} from "./utils/tracking.js";
+import { startScheduler } from "./utils/scheduler.js";
 
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
@@ -163,14 +192,12 @@ const TOOLS = [
   linkedinOAuthStatusToolDefinition,
   linkedinOAuthLogoutToolDefinition,
   linkedinLiveProfileToolDefinition,
-  // Credential management tools -- set WP and LinkedIn credentials from within Claude
   setWordPressCredentialsToolDefinition,
   getWordPressCredentialsToolDefinition,
   clearWordPressCredentialsToolDefinition,
   setLinkedInCredentialsToolDefinition,
   getLinkedInCredentialsToolDefinition,
   clearLinkedInCredentialsToolDefinition,
-  // WordPress publishing tools - only invoked when explicitly called by Claude
   wpSiteInfoToolDefinition,
   wpListPostsToolDefinition,
   wpListPagesToolDefinition,
@@ -186,14 +213,12 @@ const TOOLS = [
   wpUpdateContentToolDefinition,
   wpSetSeoMetaToolDefinition,
   wpCreateServicePageToolDefinition,
-  // Image download & upload tools
   imageDownloadToolDefinition,
   imageSearchDownloadToolDefinition,
   wpUploadMediaToolDefinition,
   wpSetFeaturedImageToolDefinition,
   googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
-  // Google Drive full CRUD suite
   googleDriveCheckConnectionToolDefinition,
   googleDriveSearchFilesToolDefinition,
   googleDriveReadFileContentToolDefinition,
@@ -202,12 +227,21 @@ const TOOLS = [
   googleDriveGetFileMetadataToolDefinition,
   googleDriveListRecentFilesToolDefinition,
   googleDriveGetFilePermissionsToolDefinition,
-  // Psychology endpoint tools - conditional stall-resolution tools for interaction-feelings-analyzer
-  // These are plumbing, not content. Outputs are consumed as internal evidence and must
-  // never be reproduced or referenced in Claude's prose output.
   psychologyEmotionTaxonomyToolDefinition,
   psychologySentimentAnalyzeToolDefinition,
   psychologyAlignmentAssessToolDefinition,
+
+  // ---------- TrueSource outreach direct send ----------
+  emailSendToolDefinition,
+  emailGetConfigToolDefinition,
+  emailGetSenderProfilesToolDefinition,
+  emailValidateAddressToolDefinition,
+  emailGetTrackingToolDefinition,
+  emailTrackingSummaryToolDefinition,
+  emailScheduleToolDefinition,
+  emailScheduleCancelToolDefinition,
+  emailScheduleListToolDefinition,
+
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -220,7 +254,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "6.1.0" },
+    { name: "claude-connector", version: "7.0.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -233,7 +267,7 @@ function createMcpServer() {
       switch (name) {
         case "web_search":                  return await handleWebSearch(args);
         case "news_search":                 return await handleNewsSearch(args);
-        case "image_search":               return await handleImageSearch(args);
+        case "image_search":                return await handleImageSearch(args);
         case "linkedin_load_connections":   return await handleLinkedinLoad(args);
         case "linkedin_search_connections": return await handleLinkedinSearch(args);
         case "linkedin_connection_count":   return await handleLinkedinCount(args);
@@ -242,14 +276,12 @@ function createMcpServer() {
         case "linkedin_oauth_status":       return await handleLinkedinOAuthStatus(args);
         case "linkedin_oauth_logout":       return await handleLinkedinOAuthLogout(args);
         case "linkedin_get_live_profile":   return await handleLinkedinLiveProfile(args);
-        // Credential management
-        case "set_wordpress_credentials":      return await handleSetWordPressCredentials(args);
-        case "get_wordpress_credentials":      return await handleGetWordPressCredentials(args);
-        case "clear_wordpress_credentials":    return await handleClearWordPressCredentials(args);
-        case "set_linkedin_credentials":       return await handleSetLinkedInCredentials(args);
-        case "get_linkedin_credentials":       return await handleGetLinkedInCredentials(args);
-        case "clear_linkedin_credentials":     return await handleClearLinkedInCredentials(args);
-        // WordPress tools
+        case "set_wordpress_credentials":   return await handleSetWordPressCredentials(args);
+        case "get_wordpress_credentials":   return await handleGetWordPressCredentials(args);
+        case "clear_wordpress_credentials": return await handleClearWordPressCredentials(args);
+        case "set_linkedin_credentials":    return await handleSetLinkedInCredentials(args);
+        case "get_linkedin_credentials":    return await handleGetLinkedInCredentials(args);
+        case "clear_linkedin_credentials":  return await handleClearLinkedInCredentials(args);
         case "wordpress_site_info":         return await handleWpSiteInfo(args);
         case "wordpress_list_posts":        return await handleWpListPosts(args);
         case "wordpress_list_pages":        return await handleWpListPages(args);
@@ -265,25 +297,35 @@ function createMcpServer() {
         case "wordpress_update_content":    return await handleWpUpdateContent(args);
         case "wordpress_set_seo_meta":      return await handleWpSetSeoMeta(args);
         case "wordpress_create_service_page": return await handleWpCreateServicePage(args);
-        // Image download & upload
-        case "image_download":                return await handleImageDownload(args);
-        case "image_search_download":         return await handleImageSearchDownload(args);
-        case "wordpress_upload_media":        return await handleWpUploadMedia(args);
-        case "wordpress_set_featured_image":  return await handleWpSetFeaturedImage(args);
-        case "google_drive_upload":           return await handleGoogleDriveUpload(args);
-        case "google_drive_list":             return await handleGoogleDriveList(args);
-        case "google_drive_check_connection":       return await handleGoogleDriveCheckConnection(args);
-        case "google_drive_search_files":           return await handleGoogleDriveSearchFiles(args);
-        case "google_drive_read_file_content":      return await handleGoogleDriveReadFileContent(args);
-        case "google_drive_download_file_content":  return await handleGoogleDriveDownloadFileContent(args);
-        case "google_drive_create_file":            return await handleGoogleDriveCreateFile(args);
-        case "google_drive_get_file_metadata":      return await handleGoogleDriveGetFileMetadata(args);
-        case "google_drive_list_recent_files":      return await handleGoogleDriveListRecentFiles(args);
-        case "google_drive_get_file_permissions":   return await handleGoogleDriveGetFilePermissions(args);
-        // Psychology endpoint tools
-        case "psychology_emotion_taxonomy":     return await handlePsychologyEmotionTaxonomy(args);
-        case "psychology_sentiment_analyze":    return await handlePsychologySentimentAnalyze(args);
-        case "psychology_alignment_assess":     return await handlePsychologyAlignmentAssess(args);
+        case "image_download":              return await handleImageDownload(args);
+        case "image_search_download":       return await handleImageSearchDownload(args);
+        case "wordpress_upload_media":      return await handleWpUploadMedia(args);
+        case "wordpress_set_featured_image":return await handleWpSetFeaturedImage(args);
+        case "google_drive_upload":         return await handleGoogleDriveUpload(args);
+        case "google_drive_list":           return await handleGoogleDriveList(args);
+        case "google_drive_check_connection":      return await handleGoogleDriveCheckConnection(args);
+        case "google_drive_search_files":          return await handleGoogleDriveSearchFiles(args);
+        case "google_drive_read_file_content":     return await handleGoogleDriveReadFileContent(args);
+        case "google_drive_download_file_content": return await handleGoogleDriveDownloadFileContent(args);
+        case "google_drive_create_file":           return await handleGoogleDriveCreateFile(args);
+        case "google_drive_get_file_metadata":     return await handleGoogleDriveGetFileMetadata(args);
+        case "google_drive_list_recent_files":     return await handleGoogleDriveListRecentFiles(args);
+        case "google_drive_get_file_permissions":  return await handleGoogleDriveGetFilePermissions(args);
+        case "psychology_emotion_taxonomy":  return await handlePsychologyEmotionTaxonomy(args);
+        case "psychology_sentiment_analyze": return await handlePsychologySentimentAnalyze(args);
+        case "psychology_alignment_assess":  return await handlePsychologyAlignmentAssess(args);
+
+        // ---------- TrueSource outreach direct send ----------
+        case "email_send":                   return await handleEmailSend(args);
+        case "email_get_config":             return await handleEmailGetConfig(args);
+        case "email_get_sender_profiles":    return await handleEmailGetSenderProfiles(args);
+        case "email_validate_address":       return await handleEmailValidateAddress(args);
+        case "email_get_tracking":           return await handleEmailGetTracking(args);
+        case "email_tracking_summary":       return await handleEmailTrackingSummary(args);
+        case "email_schedule":               return await handleEmailSchedule(args);
+        case "email_schedule_cancel":        return await handleEmailScheduleCancel(args);
+        case "email_schedule_list":          return await handleEmailScheduleList(args);
+
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
         default:
@@ -319,12 +361,115 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "6.1.0",
+    version: "7.0.0",
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
     psychologyEndpoints: true,
+    emailSendEnabled: config.emailSendEnabled,
+    emailHtmlEnabled: config.emailHtmlEnabled,
+    emailTrackingEnabled: config.emailTrackingEnabled,
+    scheduleEnabled: config.scheduleEnabled,
     timestamp: new Date().toISOString(),
   });
+});
+
+// -----------------------------------------------------------------------
+// SCOPE-04 -- Tracking endpoints
+// -----------------------------------------------------------------------
+
+function clientIp(req) {
+  const fwd = (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim();
+  return fwd || req.ip || req.connection?.remoteAddress || "";
+}
+
+app.get("/track/open", async (req, res) => {
+  // Always return the pixel - never expose validation errors to the recipient
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.status(200).end(PIXEL_PNG);
+
+  if (!config.emailTrackingEnabled) return;
+
+  try {
+    const id = String(req.query.id || "");
+    if (!id) return;
+    const ua = req.headers["user-agent"] || "";
+    const ref = req.headers["referer"] || req.headers["referrer"] || "";
+    const uaType = classifyUserAgent(ua, ref);
+    const ipHash = hashIp(clientIp(req));
+
+    const meta = getSendMetadata(id) || {};
+    const open_count = incrementOpen(id);
+
+    appendTrackingEvent({
+      tracking_id: id,
+      event_type: "open",
+      to_address: meta.to_address || "",
+      to_name: meta.to_name || "",
+      subject: meta.subject || "",
+      sender_id: meta.sender_id || "",
+      company: meta.company || "",
+      send_timestamp: meta.send_timestamp || "",
+      click_url: "",
+      user_agent_type: uaType,
+      open_count,
+      schedule_id: meta.schedule_id || "",
+      user_agent_raw: ua,
+      ip_hash: ipHash,
+    }).catch((e) => log("warn", `track/open append failed: ${e.message}`));
+  } catch (err) {
+    log("warn", `track/open handler error: ${err.message}`);
+  }
+});
+
+app.get("/track/click", async (req, res) => {
+  const SAFE_FALLBACK = "https://truesourceconsulting.com.au";
+  let target = SAFE_FALLBACK;
+
+  try {
+    const id = String(req.query.id || "");
+    const rawUrl = String(req.query.url || "");
+    let isValid = false;
+    try {
+      const u = new URL(rawUrl);
+      if (u.protocol === "https:") {
+        target = u.toString();
+        isValid = true;
+      }
+    } catch (_) {
+      isValid = false;
+    }
+
+    if (config.emailTrackingEnabled && id) {
+      const ua = req.headers["user-agent"] || "";
+      const ref = req.headers["referer"] || req.headers["referrer"] || "";
+      const uaType = classifyUserAgent(ua, ref);
+      const ipHash = hashIp(clientIp(req));
+      const meta = getSendMetadata(id) || {};
+
+      appendTrackingEvent({
+        tracking_id: id,
+        event_type: "click",
+        to_address: meta.to_address || "",
+        to_name: meta.to_name || "",
+        subject: meta.subject || "",
+        sender_id: meta.sender_id || "",
+        company: meta.company || "",
+        send_timestamp: meta.send_timestamp || "",
+        click_url: isValid ? target : "",
+        user_agent_type: uaType,
+        schedule_id: meta.schedule_id || "",
+        user_agent_raw: ua,
+        ip_hash: ipHash,
+      }).catch((e) => log("warn", `track/click append failed: ${e.message}`));
+    }
+  } catch (err) {
+    log("warn", `track/click handler error: ${err.message}`);
+  }
+
+  res.redirect(302, target);
 });
 
 // -----------------------------------------------------------------------
@@ -389,8 +534,6 @@ app.get("/auth/linkedin/callback", async (req, res) => {
         <h2 style="color:#2e7d32;margin-top:0">LinkedIn Connected!</h2>
         <p style="font-size:16px">Your LinkedIn account is now authorized.</p>
         <p>Close this tab and return to Claude.</p>
-        <p>Call <strong>linkedin_get_live_profile</strong> to fetch your profile,
-        or <strong>linkedin_oauth_status</strong> to confirm the connection.</p>
       </div>
       <p style="color:#888;font-size:12px;margin-top:20px">Token expires in approx. ${expiresHours} hours</p>
     </body></html>`);
@@ -405,8 +548,6 @@ app.get("/auth/linkedin/callback", async (req, res) => {
 
 // -----------------------------------------------------------------------
 // Streamable HTTP - PRIMARY MCP TRANSPORT FOR CLAUDE.AI
-// NO authentication on this endpoint - claude.ai does not support
-// custom Bearer token auth when connecting to custom connectors.
 // -----------------------------------------------------------------------
 const streamableSessions = {};
 
@@ -516,6 +657,8 @@ app.use((_req, res) => {
       mcp: "POST /mcp",
       health: "GET /health",
       linkedinCallback: "GET /auth/linkedin/callback",
+      trackOpen: "GET /track/open?id=...",
+      trackClick: "GET /track/click?id=...&url=...",
       upload: "POST /upload/connections",
     },
   });
@@ -526,10 +669,22 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v6.1.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v7.0.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
+  log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
+    `HTML: ${config.emailHtmlEnabled ? "ENABLED" : "disabled"} | ` +
+    `Tracking: ${config.emailTrackingEnabled ? "ENABLED" : "disabled"} | ` +
+    `Scheduling: ${config.scheduleEnabled ? "ENABLED" : "disabled"}`);
+  log("info", `Tracking endpoints: GET /track/open, GET /track/click`);
   log("info", "Psychology endpoints: ENABLED (emotion/taxonomy, sentiment/analyze, alignment/assess)");
+
+  // Boot the in-process scheduler (loads schedule_store.json + starts cron)
+  try {
+    startScheduler();
+  } catch (err) {
+    log("error", `Scheduler boot failed: ${err.message}`);
+  }
 });
 
 process.on("SIGINT",  () => { httpServer.close(() => process.exit(0)); });

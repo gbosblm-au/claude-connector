@@ -1,5 +1,104 @@
 # Changelog
 
+## v7.0.1 - User-Agent Hardening
+
+### Changed
+- Added `CONNECTOR_USER_AGENT` constant to `src/config.js` - a single source of
+  truth for the User-Agent string sent on all outbound HTTP requests.
+  Value: `claude-connector/7.0.1 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)`
+- `src/tools/wordpress.js`: `wpFetch()` now sends `User-Agent: CONNECTOR_USER_AGENT`
+  on every WordPress REST API call (GET and POST).
+- `src/tools/wordpressMedia.js`: All four `fetch()` calls (image download,
+  media upload, metadata update, featured image set) now send the correct UA.
+- `src/tools/leadSearch.js`: Replaced hardcoded `claude-connector/6.1 lead-research`
+  UA string with `CONNECTOR_USER_AGENT`.
+
+### Why
+SiteGround's Antibot AI was blocking requests due to an outdated or
+unrecognised User-Agent string (HeadlessChrome/Chrome 120). A descriptive,
+honest UA that clearly identifies the connector resolves the block without
+requiring IP whitelisting.
+
+---
+
+## v7.0.0 - TrueSource Outreach Email Pipeline (SCOPE-01 / 03 / 04 / 05)
+
+### Added
+
+- **SCOPE-01 - SMTP send** with three named senders sharing one SMTP account
+  (`team@truesourceconsulting.com.au`). Per-sender Reply-To and signature.
+  Four new MCP tools:
+  - `email_send` -- send a single outreach email (HTML + plain-text alt).
+  - `email_get_config` -- non-secret config for a single sender (signature
+    preview, smtp_configured flag, html_enabled, tracking_enabled,
+    schedule_enabled).
+  - `email_get_sender_profiles` -- list all configured senders for the
+    skill UI to build a sender selector.
+  - `email_validate_address` -- format-only validation, no SMTP handshake.
+
+  Server-side rate limit: 20 sends per rolling hour across all senders.
+  Master kill-switch: `EMAIL_SEND_ENABLED=false`.
+
+- **SCOPE-03 - HTML email templating**. Branded TrueSource template
+  (teal #123F4B header, gold #D4AF37 links). All inline CSS, table-based
+  layout for Outlook compatibility. Plain-text alternative is always
+  generated. Logo URL via `EMAIL_LOGO_URL`; falls back to text wordmark
+  when not set. New per-sender env vars:
+  `SENDER_[NAME]_TITLE`, `SENDER_[NAME]_PHONE`, `SENDER_[NAME]_LINKEDIN`.
+
+- **SCOPE-04 - Open + click tracking** persisted to a Google Drive CSV
+  (`TrueSource_Email_Tracking.csv`). New HTTP endpoints (NOT MCP tools):
+  - `GET /track/open?id=...` -- returns 1x1 PNG, logs an open event.
+  - `GET /track/click?id=...&url=...` -- 302 redirect to the original
+    `https://` URL, logs a click event.
+
+  Two new MCP tools for querying:
+  - `email_get_tracking` -- filter events by tracking_id / to_address /
+    company.
+  - `email_tracking_summary` -- aggregate stats with documented caveats.
+
+  User-Agent classification: `bot`, `mobile_email`, `webmail`,
+  `desktop_email`, `unknown`. Bot opens are excluded from rate calculations.
+  IPs are SHA-256 hashed (never stored raw). `EMAIL_TRACKING_ENABLED=false`
+  disables pixel injection and link rewriting cleanly.
+
+- **SCOPE-05 - Deferred & drip scheduling**. In-process node-cron loop runs
+  every 60 seconds; schedule store persisted to `/data/schedule_store.json`
+  on the Railway volume. Three new MCP tools:
+  - `email_schedule` -- queue a deferred send OR a drip sequence.
+  - `email_schedule_cancel` -- cancel by `schedule_id` or `sequence_id`.
+  - `email_schedule_list` -- list pending and recent schedules.
+
+  Drip sequences (max 10 steps) auto-stop on the first open or click.
+  All times in AEST/AEDT (Australia/Melbourne) via luxon. UTC offsets
+  rejected with a clear error message.
+
+- **New runtime dependencies:** `nodemailer`, `node-cron`, `luxon`.
+
+- **Health endpoint** now reports email-pipeline state
+  (`emailSend`, `emailHtml`, `emailTracking`, `emailScheduler`,
+  `smtpConfigured`).
+
+### Changed
+
+- Server version bumped to `7.0.0` in both stdio and HTTP transports.
+- HTTP server now boots the in-process scheduler at startup
+  (loads `schedule_store.json`, registers the cron tick).
+
+### Notes
+
+- Per SCOPE-04 the tracking CSV is auto-created on first run if
+  `TRACKING_GDRIVE_FILE_ID` is unset; the operator must then pin the
+  returned id via env var so it survives restarts. A warning is logged
+  with the exact env var value to set.
+- Per SCOPE-05 the Railway service requires a persistent volume mounted
+  at `/data` so the schedule store survives redeployments.
+- The signature block placeholder (`[Signature: Your name | ...]`) must
+  NOT be present in `body_text` -- the signature is appended server-side
+  from per-sender env vars.
+
+---
+
 ## v6.1.0 - Full Google Drive CRUD Toolkit
 
 ### Added
