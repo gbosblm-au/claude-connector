@@ -1,6 +1,6 @@
 {
   "name": "claude-connector",
-  "version": "7.0.1",
+  "version": "7.0.0",
   "description": "MCP server for Claude with real-time web search, news search, LinkedIn connections lookup, and TrueSource outreach email send/tracking/scheduling",
   "type": "module",
   "main": "src/index.js",

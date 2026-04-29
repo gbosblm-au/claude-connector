@@ -30,7 +30,6 @@
 import { log } from "../utils/logger.js";
 import { truncate } from "../utils/helpers.js";
 import { getWordPressCredentials } from "../utils/credentialStore.js";
-import { CONNECTOR_USER_AGENT } from "../config.js";
 
 // -----------------------------------------------------------------------
 // Config helpers
@@ -76,7 +75,6 @@ async function wpFetch(path, options = {}) {
     headers: {
       "Content-Type": "application/json",
       Authorization: authHeader,
-      "User-Agent": CONNECTOR_USER_AGENT,
       ...(options.headers || {}),
     },
   });

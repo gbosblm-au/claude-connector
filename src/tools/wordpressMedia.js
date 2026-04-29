@@ -18,7 +18,6 @@ import { basename, extname } from "node:path";
 import { log } from "../utils/logger.js";
 import { truncate } from "../utils/helpers.js";
 import { getWordPressCredentials } from "../utils/credentialStore.js";
-import { CONNECTOR_USER_AGENT } from "../config.js";
 
 // -----------------------------------------------------------------------
 // Config helpers
@@ -160,9 +159,7 @@ export const wpSetFeaturedImageToolDefinition = {
  */
 async function downloadImageBuffer(imageUrl) {
   log("info", `Downloading image from URL for WP upload: ${imageUrl}`);
-  const resp = await fetch(imageUrl, {
-    headers: { "User-Agent": CONNECTOR_USER_AGENT },
-  });
+  const resp = await fetch(imageUrl);
   if (!resp.ok) {
     throw new Error(`Failed to download image from ${imageUrl}: ${resp.status} ${resp.statusText}`);
   }
@@ -205,7 +202,6 @@ async function uploadToWordPress(buffer, filename, contentType, meta = {}) {
       Authorization: authHeader,
       "Content-Type": contentType,
       "Content-Disposition": `attachment; filename="${encodeURIComponent(filename)}"`,
-      "User-Agent": CONNECTOR_USER_AGENT,
     },
     body: buffer,
   });
@@ -231,7 +227,6 @@ async function uploadToWordPress(buffer, filename, contentType, meta = {}) {
         headers: {
           Authorization: authHeader,
           "Content-Type": "application/json",
-          "User-Agent": CONNECTOR_USER_AGENT,
         },
         body: JSON.stringify(updatePayload),
       });
@@ -256,7 +251,6 @@ async function setFeaturedImage(postId, mediaId, contentType = "post") {
     headers: {
       Authorization: authHeader,
       "Content-Type": "application/json",
-      "User-Agent": CONNECTOR_USER_AGENT,
     },
     body: JSON.stringify({ featured_media: mediaId }),
   });

@@ -1,7 +1,6 @@
 import * as cheerio from "cheerio";
 
 import { config } from "../config.js";
-import { CONNECTOR_USER_AGENT } from "../config.js";
 import { clamp, truncate } from "../utils/helpers.js";
 import { log } from "../utils/logger.js";
 
@@ -985,7 +984,7 @@ async function fetchWithTimeout(url, timeoutMs) {
   try {
     return await fetch(url, {
       headers: {
-        "User-Agent": CONNECTOR_USER_AGENT,
+        "User-Agent": "claude-connector/6.1 lead-research",
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
       },
       redirect: "follow",

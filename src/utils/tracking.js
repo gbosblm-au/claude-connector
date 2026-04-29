@@ -13,25 +13,6 @@
 //   - Hash IP addresses (SHA-256 + salt, never raw)
 //   - Provide query helpers used by the email_get_tracking and
 //     email_tracking_summary tools
-//
-// --- FIXES APPLIED ---
-//
-// BUG-01 (Critical): handleGoogleDriveCreateFile requires 'filename' (not 'name'),
-//   'text_content' (not 'content'), and 'folder_id' (not 'parent_id').
-//   The stray 'overwrite: true' key has also been removed; when file_id is
-//   supplied the overwrite is implicit and the key is not a recognised parameter.
-//
-// BUG-02 (High): driveAppendRow and loadAllEvents no longer rely on a '---\n'
-//   sentinel to strip a metadata wrapper from the Drive tool response. Content
-//   is read directly from content[0].text and validated by checking whether the
-//   first non-empty line starts with the known CSV header column name ('event_id').
-//   parseCsv also applies the same sentinel guard so it never treats a non-CSV
-//   first line as the header.
-//
-// BUG-03 (Medium): File ID extraction from search results now uses two independent
-//   regexes (extractDriveFileId / extractDriveFileName) so the match is not
-//   sensitive to JSON property ordering in the tool response. The original single
-//   combined regex required "id" to precede "name" in the same JSON object.
 
 import { randomUUID, createHash } from "node:crypto";
 import { DateTime } from "luxon";
@@ -148,10 +129,6 @@ const CSV_HEADER = [
   "ip_hash",
 ];
 
-// The first column name is used to validate that a string is a real CSV
-// header row. This replaces the fragile '---\n' sentinel approach (BUG-02).
-const CSV_HEADER_SENTINEL = CSV_HEADER[0]; // "event_id"
-
 function csvEscape(v) {
   if (v === null || v === undefined) return "";
   const s = String(v);
@@ -212,21 +189,6 @@ async function processPendingAppends() {
 let _trackingFileId = null;
 let _ensurePromise = null;
 
-// -----------------------------------------------------------------------
-// BUG-03 FIX: two independent regexes for file ID and file name extraction.
-// The original combined regex required "id" to appear before "name" in the
-// JSON object, which is not guaranteed by the googleDrive tool response.
-// -----------------------------------------------------------------------
-function extractDriveFileId(text) {
-  const m = text.match(/"id":\s*"([A-Za-z0-9_\-]+)"/);
-  return m ? m[1] : null;
-}
-
-function extractDriveFileName(text) {
-  const m = text.match(/"name":\s*"([^"]+)"/);
-  return m ? m[1] : null;
-}
-
 async function ensureTrackingCsv() {
   if (_trackingFileId) return _trackingFileId;
   if (config.trackingGdriveFileId) {
@@ -246,12 +208,9 @@ async function ensureTrackingCsv() {
         max_results: 5,
       });
       const text = search?.content?.[0]?.text || "";
-
-      // BUG-03 FIX: use two independent regexes instead of one order-dependent regex
-      const foundId = extractDriveFileId(text);
-      const foundName = extractDriveFileName(text);
-      if (foundId && foundName === config.trackingFilename) {
-        _trackingFileId = foundId;
+      const match = text.match(/"id":\s*"([A-Za-z0-9_\-]+)"[^}]*"name":\s*"([^"]+)"/);
+      if (match && match[2] === config.trackingFilename) {
+        _trackingFileId = match[1];
         log("info", `Tracking CSV located on Drive: ${_trackingFileId}`);
         return _trackingFileId;
       }
@@ -259,22 +218,19 @@ async function ensureTrackingCsv() {
       log("warn", `Tracking CSV search failed (will attempt create): ${err.message}`);
     }
 
-    // BUG-01 FIX: correct parameter names for handleGoogleDriveCreateFile.
-    //   'filename'     (was: 'name')
-    //   'text_content' (was: 'content')
-    //   'folder_id'    (was: 'parent_id')
+    // Create with header row
     const createArgs = {
-      filename: config.trackingFilename,
+      name: config.trackingFilename,
       mime_type: "text/csv",
-      text_content: CSV_HEADER.join(",") + "\n",
+      content: CSV_HEADER.join(",") + "\n",
     };
-    if (config.trackingGdriveFolderId) createArgs.folder_id = config.trackingGdriveFolderId;
+    if (config.trackingGdriveFolderId) createArgs.parent_id = config.trackingGdriveFolderId;
 
     const created = await handleGoogleDriveCreateFile(createArgs);
     const cText = created?.content?.[0]?.text || "";
-    const newId = extractDriveFileId(cText);
-    if (!newId) throw new Error("Could not parse new tracking CSV file ID from Drive response");
-    _trackingFileId = newId;
+    const idMatch = cText.match(/"id":\s*"([A-Za-z0-9_\-]+)"/);
+    if (!idMatch) throw new Error("Could not parse new tracking CSV file ID");
+    _trackingFileId = idMatch[1];
     log("warn",
       `Tracking CSV created on Drive: id=${_trackingFileId}. ` +
       `Set TRACKING_GDRIVE_FILE_ID=${_trackingFileId} to persist this across restarts.`
@@ -300,40 +256,29 @@ async function driveAppendRow(row) {
   let existing = "";
   try {
     const r = await handleGoogleDriveReadFileContent({ file_id: fileId });
-    // BUG-02 FIX: do not rely on a '---\n' sentinel. Read content[0].text
-    // directly. Validate it is a proper CSV by checking the first non-empty
-    // line against the known header sentinel (CSV_HEADER_SENTINEL = "event_id").
-    existing = r?.content?.[0]?.text || "";
+    const text = r?.content?.[0]?.text || "";
+    // Tool wraps content with metadata header. Extract content section.
+    const idx = text.indexOf("---\n");
+    existing = idx >= 0 ? text.slice(idx + 4) : text;
   } catch (err) {
-    // If read fails, start fresh with the header so this event is not dropped
+    // If read fails we still attempt overwrite with header + new row to avoid dropping events
     existing = CSV_HEADER.join(",") + "\n";
     log("warn", `Tracking CSV read failed; overwriting from header: ${err.message}`);
   }
 
-  // Normalise line endings
-  existing = existing.replace(/\r\n/g, "\n");
-
-  // Ensure the first non-empty line is the expected CSV header.
-  // If it is not (e.g. tool wrapper emitted a preamble), prepend the header.
-  const firstNonEmpty = existing.split("\n").find((l) => l.trim().length > 0) || "";
-  if (!firstNonEmpty.startsWith(CSV_HEADER_SENTINEL)) {
+  if (!existing.startsWith(CSV_HEADER[0])) {
     existing = CSV_HEADER.join(",") + "\n" + existing;
   }
-
   if (!existing.endsWith("\n")) existing += "\n";
 
   const updated = existing + rowToCsvLine(row) + "\n";
 
-  // BUG-01 FIX: correct parameter names.
-  //   'filename'     (was: 'name')
-  //   'text_content' (was: 'content')
-  //   Removed: 'overwrite: true' -- not a recognised parameter; overwrite is
-  //   implicit when file_id is supplied.
   await handleGoogleDriveCreateFile({
     file_id: fileId,
-    filename: config.trackingFilename,
+    name: config.trackingFilename,
     mime_type: "text/csv",
-    text_content: updated,
+    content: updated,
+    overwrite: true,
   });
 }
 
@@ -393,9 +338,10 @@ async function loadAllEvents({ force = false } = {}) {
     const fileId = await ensureTrackingCsv();
     const { handleGoogleDriveReadFileContent } = await driveHelpers();
     const r = await handleGoogleDriveReadFileContent({ file_id: fileId });
-    // BUG-02 FIX: read content[0].text directly; no sentinel stripping.
     const text = r?.content?.[0]?.text || "";
-    _csvCache = parseCsv(text);
+    const idx = text.indexOf("---\n");
+    const csvBody = idx >= 0 ? text.slice(idx + 4) : text;
+    _csvCache = parseCsv(csvBody);
     _csvLastFetched = now;
     return _csvCache;
   } catch (err) {
@@ -406,7 +352,7 @@ async function loadAllEvents({ force = false } = {}) {
 
 function parseCsv(text) {
   const rows = [];
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const lines = text.split(/\r?\n/);
   if (lines.length === 0) return rows;
   let header = null;
   for (let i = 0; i < lines.length; i++) {
@@ -414,13 +360,7 @@ function parseCsv(text) {
     if (!line.trim()) continue;
     const fields = parseCsvLine(line);
     if (!header) {
-      // BUG-02 FIX: only accept this line as the header if it begins with
-      // the expected sentinel column name. This guards against any leading
-      // preamble lines that a tool wrapper may have prepended to the content.
-      if (fields[0] === CSV_HEADER_SENTINEL) {
-        header = fields;
-      }
-      // If not the expected header, skip the line entirely
+      header = fields;
       continue;
     }
     const row = {};
@@ -486,7 +426,7 @@ export async function detectSequenceEngagement(trackingIds) {
 }
 
 // -----------------------------------------------------------------------
-// 1x1 transparent PNG (hardcoded constant per SCOPE-04 spec, 67 bytes)
+// 1x1 transparent PNG (hardcoded constant per scope)
 // -----------------------------------------------------------------------
 export const PIXEL_PNG = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
