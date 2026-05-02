@@ -300,10 +300,12 @@ async function getAccessInfo() {
 }
 
 /**
- * Backward-compatible helper used by the existing upload + list handlers.
+ * Backward-compatible helper used by the existing upload + list handlers,
+ * and exported so googleCalendar.js and googleSheets.js can reuse the same
+ * auth infrastructure without duplicating credential logic.
  * Returns just the access token string.
  */
-async function getAccessToken() {
+export async function getAccessToken() {
   const info = await getAccessInfo();
   return info.accessToken;
 }
@@ -1582,6 +1584,219 @@ export async function handleGoogleDriveGetFilePermissions(args) {
       ? "This file is shared with 'anyone with the link'."
       : "This file is NOT publicly shared via link."
   );
+
+  return { content: [{ type: "text", text: lines.join("\n") }] };
+}
+
+// =======================================================================
+// NEW: Overwrite file by name (name -> ID lookup then PATCH)
+// =======================================================================
+//
+// This replaces the old overwrite_by_name flag approach with a dedicated
+// tool that:
+//   1. Searches the target folder for a file matching `filename` exactly.
+//   2. Resolves the file ID from the search result.
+//   3. Streams the new content to that file ID via PATCH (multipart upload).
+//   4. If no match is found in the folder, creates a new file.
+//
+// This avoids the character-limit and reliability issues that came with
+// embedding a search + conditional create inside google_drive_create_file
+// and allows Claude to call this tool unambiguously when the intent is
+// "update the existing file, not create a duplicate".
+
+export const googleDriveOverwriteFileToolDefinition = {
+  name: "google_drive_overwrite_file",
+  description:
+    "Overwrite an existing Google Drive file by filename and folder. " +
+    "Searches the target folder for a file matching 'filename' exactly, " +
+    "resolves its file ID, and PATCHes the content as a new revision. " +
+    "If no match is found, a new file is created in the folder. " +
+    "Provide content as 'text_content' (UTF-8 string) or 'base64_content' (binary). " +
+    "MIME type is inferred from the filename unless 'mime_type' is given. " +
+    "Use this tool whenever the intent is to update an existing named file, " +
+    "NOT to create a duplicate alongside it.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      filename: {
+        type: "string",
+        description: "Exact filename to find and overwrite (case-sensitive).",
+      },
+      folder_id: {
+        type: "string",
+        description:
+          "Google Drive folder ID to search in. Defaults to GOOGLE_DRIVE_FOLDER_ID env var, " +
+          "or My Drive root if unset.",
+      },
+      text_content: {
+        type: "string",
+        description: "UTF-8 text content to write. Mutually exclusive with base64_content.",
+      },
+      base64_content: {
+        type: "string",
+        description: "Binary content encoded as base64. Mutually exclusive with text_content.",
+      },
+      mime_type: {
+        type: "string",
+        description:
+          "Explicit MIME type. If omitted, inferred from filename extension.",
+      },
+      description: {
+        type: "string",
+        description: "Optional description to store on the file.",
+      },
+      make_public: {
+        type: "boolean",
+        description:
+          "If true, grant 'anyone with the link' reader access to the resulting file.",
+      },
+    },
+    required: ["filename"],
+  },
+};
+
+export async function handleGoogleDriveOverwriteFile(args) {
+  const filename = (args?.filename || "").trim();
+  if (!filename) throw new Error("'filename' is required.");
+
+  const hasText = typeof args?.text_content === "string";
+  const hasB64 =
+    typeof args?.base64_content === "string" && args.base64_content.length > 0;
+
+  if (hasText && hasB64) {
+    throw new Error("Provide either text_content OR base64_content, not both.");
+  }
+  if (!hasText && !hasB64) {
+    throw new Error("Provide either text_content or base64_content.");
+  }
+
+  const contentBuffer = hasText
+    ? Buffer.from(args.text_content, "utf-8")
+    : Buffer.from(args.base64_content, "base64");
+
+  const folderId = (args?.folder_id || config.googleDriveFolderId || "").trim();
+  const mimeType =
+    (args?.mime_type || "").trim() || getMimeType(filename);
+  const makePublic = args?.make_public === true;
+
+  const accessToken = await getAccessToken();
+
+  // Step 1: Search for existing file by exact name in the target folder.
+  const existingFile = await findFileByNameInFolder(
+    accessToken,
+    filename,
+    folderId
+  );
+
+  // Step 2a: Overwrite existing file via PATCH.
+  if (existingFile) {
+    log(
+      "info",
+      `google_drive_overwrite_file: found existing file ID ${existingFile.id}, PATCHing content`
+    );
+
+    const boundary = `---boundary_${Date.now()}`;
+    const metadata = {};
+    if (typeof args?.description === "string") {
+      metadata.description = args.description;
+    }
+
+    const hasMetadata = Object.keys(metadata).length > 0;
+    let body;
+    let contentType;
+    let url;
+
+    if (hasMetadata) {
+      const metadataStr = JSON.stringify(metadata);
+      body = Buffer.concat([
+        Buffer.from(
+          `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadataStr}\r\n` +
+            `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`
+        ),
+        contentBuffer,
+        Buffer.from(`\r\n--${boundary}--`),
+      ]);
+      contentType = `multipart/related; boundary=${boundary}`;
+      url = `${DRIVE_UPLOAD_API}/files/${encodeURIComponent(existingFile.id)}?uploadType=multipart&fields=id,name,mimeType,size,webViewLink,modifiedTime&supportsAllDrives=true`;
+    } else {
+      body = contentBuffer;
+      contentType = mimeType;
+      url = `${DRIVE_UPLOAD_API}/files/${encodeURIComponent(existingFile.id)}?uploadType=media&fields=id,name,mimeType,size,webViewLink,modifiedTime&supportsAllDrives=true`;
+    }
+
+    const resp = await driveFetch(accessToken, url, {
+      method: "PATCH",
+      headers: { "Content-Type": contentType },
+      body,
+    });
+    const file = await resp.json();
+
+    let publicUrl = null;
+    if (makePublic) publicUrl = await setAnyoneReader(accessToken, file.id);
+
+    const lines = [
+      "Google Drive File Overwritten",
+      "=============================",
+      `File ID:      ${file.id}`,
+      `Filename:     ${file.name}`,
+      `Type:         ${file.mimeType}`,
+      `Size:         ${humanSize(file.size || contentBuffer.length)}`,
+      `Modified:     ${file.modifiedTime || ""}`,
+      `View Link:    ${file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`}`,
+      publicUrl ? `Public URL:   ${publicUrl}` : null,
+      ``,
+      `Action: Overwrote existing file (ID ${existingFile.id}) - no duplicate created.`,
+    ].filter(Boolean);
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // Step 2b: No existing file found - create new file.
+  log(
+    "info",
+    `google_drive_overwrite_file: no existing file named "${filename}" in folder "${folderId}", creating new file`
+  );
+
+  const metadata = { name: filename, mimeType };
+  if (folderId) metadata.parents = [folderId];
+  if (typeof args?.description === "string") metadata.description = args.description;
+
+  const boundary = `---boundary_${Date.now()}`;
+  const metadataStr = JSON.stringify(metadata);
+  const multipartBody = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadataStr}\r\n` +
+        `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`
+    ),
+    contentBuffer,
+    Buffer.from(`\r\n--${boundary}--`),
+  ]);
+
+  const resp = await driveFetch(
+    accessToken,
+    `${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id,name,mimeType,size,webViewLink,modifiedTime&supportsAllDrives=true`,
+    {
+      method: "POST",
+      headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
+      body: multipartBody,
+    }
+  );
+  const file = await resp.json();
+
+  let publicUrl = null;
+  if (makePublic) publicUrl = await setAnyoneReader(accessToken, file.id);
+
+  const lines = [
+    "Google Drive File Created (no existing file found to overwrite)",
+    "===============================================================",
+    `File ID:      ${file.id}`,
+    `Filename:     ${file.name}`,
+    `Type:         ${file.mimeType}`,
+    `Size:         ${humanSize(file.size || contentBuffer.length)}`,
+    folderId ? `Folder ID:    ${folderId}` : `Location:     My Drive (root)`,
+    `View Link:    ${file.webViewLink || `https://drive.google.com/file/d/${file.id}/view`}`,
+    publicUrl ? `Public URL:   ${publicUrl}` : null,
+  ].filter(Boolean);
 
   return { content: [{ type: "text", text: lines.join("\n") }] };
 }

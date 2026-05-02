@@ -189,3 +189,174 @@ export async function handleEmailTrackingSummary(args) {
   };
   return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
 }
+
+// =======================================================================
+// NEW: email_reply_check
+// =======================================================================
+// Determines whether a tracked send appears to have received a reply.
+//
+// How replies are detected:
+//   The tracking CSV records "sent", "open", and "click" events. Replies
+//   are NOT currently captured by pixel / redirect tracking (that would
+//   require IMAP polling, which is out of scope for this server). Instead
+//   this tool surfaces a structured "engagement summary" per recipient that
+//   lets Claude infer reply likelihood from open and click behaviour, and
+//   flags senders where a reply is the expected next step.
+//
+// When IMAP polling is added in a future version, a "reply" event_type
+//   will be emitted into the CSV and this tool will surface it directly.
+
+export const emailReplyCheckToolDefinition = {
+  name: "email_reply_check",
+  description:
+    "Check whether a tracked outreach email appears to have had a reply or significant engagement. " +
+    "Because reply events require IMAP polling (not yet implemented), this tool instead returns " +
+    "a per-recipient engagement summary: open count, click count, last activity timestamp, and " +
+    "an engagement signal (none / low / medium / high) that can be used to prioritise follow-up. " +
+    "Supply at least one of tracking_id, to_address, or company.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      tracking_id: {
+        type: "string",
+        description: "Tracking ID of the specific send to check.",
+      },
+      to_address: {
+        type: "string",
+        description: "Recipient email address to check across all sends.",
+      },
+      company: {
+        type: "string",
+        description: "Company name to check across all sends to that company.",
+      },
+      since_days: {
+        type: "integer",
+        description: "Lookback window in days. Default 30.",
+      },
+    },
+  },
+};
+
+export async function handleEmailReplyCheck(args) {
+  args = args || {};
+  if (!args.tracking_id && !args.to_address && !args.company) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { error: "Provide at least one of tracking_id, to_address, or company." },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  const events = await queryEvents({
+    tracking_id: args.tracking_id,
+    to_address: args.to_address,
+    company: args.company,
+    since_days: args.since_days != null ? args.since_days : 30,
+    event_type: "all",
+  });
+
+  // Group events by tracking_id (one send per group)
+  const byTrackingId = new Map();
+  for (const ev of events) {
+    if (!byTrackingId.has(ev.tracking_id)) {
+      byTrackingId.set(ev.tracking_id, {
+        tracking_id: ev.tracking_id,
+        to_address: ev.to_address || "",
+        subject: ev.subject || "",
+        sender_id: ev.sender_id || "",
+        company: ev.company || "",
+        send_timestamp: ev.send_timestamp || ev.event_timestamp || "",
+        opens: 0,
+        clicks: 0,
+        last_activity: "",
+        has_reply_event: false,
+      });
+    }
+    const rec = byTrackingId.get(ev.tracking_id);
+    if (ev.event_type === "open" && ev.user_agent_type !== "bot") {
+      rec.opens += 1;
+      if (!rec.last_activity || ev.event_timestamp > rec.last_activity) {
+        rec.last_activity = ev.event_timestamp;
+      }
+    }
+    if (ev.event_type === "click" && ev.user_agent_type !== "bot") {
+      rec.clicks += 1;
+      if (!rec.last_activity || ev.event_timestamp > rec.last_activity) {
+        rec.last_activity = ev.event_timestamp;
+      }
+    }
+    // Future: ev.event_type === "reply" will set has_reply_event = true
+    if (ev.event_type === "reply") {
+      rec.has_reply_event = true;
+    }
+  }
+
+  const results = Array.from(byTrackingId.values()).map((rec) => {
+    let engagement;
+    if (rec.has_reply_event) {
+      engagement = "replied";
+    } else if (rec.clicks >= 2 || (rec.clicks >= 1 && rec.opens >= 3)) {
+      engagement = "high";
+    } else if (rec.clicks >= 1 || rec.opens >= 2) {
+      engagement = "medium";
+    } else if (rec.opens >= 1) {
+      engagement = "low";
+    } else {
+      engagement = "none";
+    }
+
+    return {
+      tracking_id: rec.tracking_id,
+      to_address: rec.to_address,
+      subject: rec.subject,
+      sender_id: rec.sender_id,
+      company: rec.company,
+      send_timestamp: rec.send_timestamp,
+      opens: rec.opens,
+      clicks: rec.clicks,
+      last_activity: rec.last_activity || null,
+      engagement,
+      reply_detected: rec.has_reply_event,
+      follow_up_recommended: !rec.has_reply_event && (engagement === "medium" || engagement === "high"),
+    };
+  });
+
+  // Sort: replied first, then high, medium, low, none
+  const engagementOrder = { replied: 0, high: 1, medium: 2, low: 3, none: 4 };
+  results.sort(
+    (a, b) =>
+      (engagementOrder[a.engagement] ?? 5) - (engagementOrder[b.engagement] ?? 5)
+  );
+
+  const out = {
+    query: {
+      tracking_id: args.tracking_id || null,
+      to_address: args.to_address || null,
+      company: args.company || null,
+      since_days: args.since_days != null ? args.since_days : 30,
+    },
+    total_sends_checked: results.length,
+    replied_count: results.filter((r) => r.reply_detected).length,
+    high_engagement_count: results.filter((r) => r.engagement === "high").length,
+    follow_up_recommended_count: results.filter((r) => r.follow_up_recommended).length,
+    results,
+    note:
+      "Reply detection requires IMAP polling (not yet configured). " +
+      "Engagement level is inferred from open and click tracking. " +
+      "reply_detected will be true once IMAP polling is enabled and a reply event is recorded.",
+    caveats: [
+      "Open rates are understated for Outlook/M365 (images blocked by default).",
+      "Apple Mail Privacy Protection may inflate open counts.",
+    ],
+  };
+
+  return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+}

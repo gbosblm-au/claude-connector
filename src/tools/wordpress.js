@@ -1292,3 +1292,72 @@ export async function handleWpUpdateContent(args) {
 
   return { content: [{ type: "text", text: lines }] };
 }
+
+// =======================================================================
+// NEW: wordpress_get_content  (fetch post or page by ID)
+// =======================================================================
+
+export const wpGetContentToolDefinition = {
+  name: "wordpress_get_content",
+  description:
+    "Fetch the full content of a single WordPress post or page by its numeric ID. " +
+    "Returns title, slug, status, HTML content (rendered), excerpt, categories, tags, " +
+    "featured media ID, modified date, and the edit link. " +
+    "Use this before calling wordpress_update_content to inspect existing content.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: {
+        type: "number",
+        description: "WordPress post or page numeric ID.",
+      },
+      content_type: {
+        type: "string",
+        enum: ["post", "page"],
+        description: "Whether the ID refers to a post or a page. Default 'post'.",
+      },
+    },
+    required: ["id"],
+  },
+};
+
+export async function handleWpGetContent(args) {
+  const id = Number(args?.id);
+  if (!id) throw new Error("'id' is required and must be a non-zero number.");
+
+  const contentType = (args?.content_type || "post").toLowerCase();
+  if (contentType !== "post" && contentType !== "page") {
+    throw new Error("'content_type' must be 'post' or 'page'.");
+  }
+
+  const endpoint = contentType === "page" ? "/pages" : "/posts";
+
+  log("info", `wordpress_get_content: fetching ${contentType} ID ${id}`);
+
+  const item = await wpFetch(`${endpoint}/${id}?context=edit`);
+
+  const categories = Array.isArray(item.categories)
+    ? item.categories.join(", ")
+    : "";
+  const tags = Array.isArray(item.tags) ? item.tags.join(", ") : "";
+
+  const lines = [
+    `WordPress ${contentType === "page" ? "Page" : "Post"} - ID ${item.id}`,
+    "=".repeat(40),
+    `Title:          ${item.title?.raw || item.title?.rendered || ""}`,
+    `Slug:           ${item.slug}`,
+    `Status:         ${item.status}`,
+    `Date:           ${item.date?.slice(0, 16) || ""}`,
+    `Modified:       ${item.modified?.slice(0, 16) || ""}`,
+    `URL:            ${item.link || ""}`,
+    categories ? `Categories:     ${categories}` : null,
+    tags ? `Tags:           ${tags}` : null,
+    item.featured_media ? `Featured Media: ${item.featured_media}` : null,
+    item.excerpt?.raw ? `Excerpt:        ${item.excerpt.raw.slice(0, 200)}` : null,
+    ``,
+    `--- CONTENT (raw) ---`,
+    item.content?.raw || item.content?.rendered || "(empty)",
+  ].filter((l) => l !== null);
+
+  return { content: [{ type: "text", text: lines.join("\n") }] };
+}

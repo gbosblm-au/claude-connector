@@ -62,15 +62,14 @@ import {
   handleWpSetFeaturedImage,
 } from "./tools/wordpressMedia.js";
 import {
-  googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
-  handleGoogleDriveUpload,
   handleGoogleDriveList,
   googleDriveCheckConnectionToolDefinition,
   googleDriveSearchFilesToolDefinition,
   googleDriveReadFileContentToolDefinition,
   googleDriveDownloadFileContentToolDefinition,
   googleDriveCreateFileToolDefinition,
+  googleDriveOverwriteFileToolDefinition,
   googleDriveGetFileMetadataToolDefinition,
   googleDriveListRecentFilesToolDefinition,
   googleDriveGetFilePermissionsToolDefinition,
@@ -79,6 +78,7 @@ import {
   handleGoogleDriveReadFileContent,
   handleGoogleDriveDownloadFileContent,
   handleGoogleDriveCreateFile,
+  handleGoogleDriveOverwriteFile,
   handleGoogleDriveGetFileMetadata,
   handleGoogleDriveListRecentFiles,
   handleGoogleDriveGetFilePermissions,
@@ -120,11 +120,59 @@ import {
 } from "./tools/emailSchedule.js";
 import { startScheduler } from "./utils/scheduler.js";
 
+// v8.0.0 additions
+import {
+  calendarListEventsToolDefinition,
+  calendarCreateEventToolDefinition,
+  calendarUpdateEventToolDefinition,
+  calendarDeleteEventToolDefinition,
+  handleCalendarListEvents,
+  handleCalendarCreateEvent,
+  handleCalendarUpdateEvent,
+  handleCalendarDeleteEvent,
+} from "./tools/googleCalendar.js";
+import {
+  sheetsGetMetadataToolDefinition,
+  sheetsReadRangeToolDefinition,
+  sheetsWriteRangeToolDefinition,
+  sheetsAppendRowsToolDefinition,
+  handleSheetsGetMetadata,
+  handleSheetsReadRange,
+  handleSheetsWriteRange,
+  handleSheetsAppendRows,
+} from "./tools/googleSheets.js";
+import {
+  webhookPollEventsToolDefinition,
+  webhookClearEventsToolDefinition,
+  webhookQueueStatusToolDefinition,
+  handleWebhookPollEvents,
+  handleWebhookClearEvents,
+  handleWebhookQueueStatus,
+} from "./tools/webhook.js";
+import {
+  slackSendMessageToolDefinition,
+  teamsSendMessageToolDefinition,
+  handleSlackSendMessage,
+  handleTeamsSendMessage,
+} from "./tools/messaging.js";
+import {
+  webFetchPageToolDefinition,
+  handleWebFetchPage,
+} from "./tools/webFetch.js";
+import {
+  wpGetContentToolDefinition,
+  handleWpGetContent,
+} from "./tools/wordpress.js";
+import {
+  emailReplyCheckToolDefinition,
+  handleEmailReplyCheck,
+} from "./tools/emailTracking.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 
 const server = new Server(
-  { name: "claude-connector", version: "7.0.0" },
+  { name: "claude-connector", version: "8.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -157,13 +205,14 @@ const TOOLS = [
   imageSearchDownloadToolDefinition,
   wpUploadMediaToolDefinition,
   wpSetFeaturedImageToolDefinition,
-  googleDriveUploadToolDefinition,
+  wpGetContentToolDefinition,
   googleDriveListToolDefinition,
   googleDriveCheckConnectionToolDefinition,
   googleDriveSearchFilesToolDefinition,
   googleDriveReadFileContentToolDefinition,
   googleDriveDownloadFileContentToolDefinition,
   googleDriveCreateFileToolDefinition,
+  googleDriveOverwriteFileToolDefinition,
   googleDriveGetFileMetadataToolDefinition,
   googleDriveListRecentFilesToolDefinition,
   googleDriveGetFilePermissionsToolDefinition,
@@ -177,9 +226,29 @@ const TOOLS = [
   emailValidateAddressToolDefinition,
   emailGetTrackingToolDefinition,
   emailTrackingSummaryToolDefinition,
+  emailReplyCheckToolDefinition,
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
   emailScheduleListToolDefinition,
+  // Calendar
+  calendarListEventsToolDefinition,
+  calendarCreateEventToolDefinition,
+  calendarUpdateEventToolDefinition,
+  calendarDeleteEventToolDefinition,
+  // Sheets
+  sheetsGetMetadataToolDefinition,
+  sheetsReadRangeToolDefinition,
+  sheetsWriteRangeToolDefinition,
+  sheetsAppendRowsToolDefinition,
+  // Webhook
+  webhookPollEventsToolDefinition,
+  webhookClearEventsToolDefinition,
+  webhookQueueStatusToolDefinition,
+  // Messaging
+  slackSendMessageToolDefinition,
+  teamsSendMessageToolDefinition,
+  // Web fetch
+  webFetchPageToolDefinition,
   {
     name: "get_current_datetime",
     description: "Returns the current UTC date and time.",
@@ -225,13 +294,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "image_search_download":        return await handleImageSearchDownload(args);
       case "wordpress_upload_media":       return await handleWpUploadMedia(args);
       case "wordpress_set_featured_image": return await handleWpSetFeaturedImage(args);
-      case "google_drive_upload":                return await handleGoogleDriveUpload(args);
+      case "wordpress_get_content":        return await handleWpGetContent(args);
       case "google_drive_list":                  return await handleGoogleDriveList(args);
       case "google_drive_check_connection":      return await handleGoogleDriveCheckConnection(args);
       case "google_drive_search_files":          return await handleGoogleDriveSearchFiles(args);
       case "google_drive_read_file_content":     return await handleGoogleDriveReadFileContent(args);
       case "google_drive_download_file_content": return await handleGoogleDriveDownloadFileContent(args);
       case "google_drive_create_file":           return await handleGoogleDriveCreateFile(args);
+      case "google_drive_overwrite_file":        return await handleGoogleDriveOverwriteFile(args);
       case "google_drive_get_file_metadata":     return await handleGoogleDriveGetFileMetadata(args);
       case "google_drive_list_recent_files":     return await handleGoogleDriveListRecentFiles(args);
       case "google_drive_get_file_permissions":  return await handleGoogleDriveGetFilePermissions(args);
@@ -246,10 +316,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // SCOPE-04 tracking
       case "email_get_tracking":           return await handleEmailGetTracking(args);
       case "email_tracking_summary":       return await handleEmailTrackingSummary(args);
+      case "email_reply_check":            return await handleEmailReplyCheck(args);
       // SCOPE-05 scheduling
       case "email_schedule":               return await handleEmailSchedule(args);
       case "email_schedule_cancel":        return await handleEmailScheduleCancel(args);
       case "email_schedule_list":          return await handleEmailScheduleList(args);
+      // Calendar
+      case "calendar_list_events":   return await handleCalendarListEvents(args);
+      case "calendar_create_event":  return await handleCalendarCreateEvent(args);
+      case "calendar_update_event":  return await handleCalendarUpdateEvent(args);
+      case "calendar_delete_event":  return await handleCalendarDeleteEvent(args);
+      // Sheets
+      case "sheets_get_metadata":    return await handleSheetsGetMetadata(args);
+      case "sheets_read_range":      return await handleSheetsReadRange(args);
+      case "sheets_write_range":     return await handleSheetsWriteRange(args);
+      case "sheets_append_rows":     return await handleSheetsAppendRows(args);
+      // Webhook (stdio mode - polling only, no HTTP receiver)
+      case "webhook_poll_events":    return await handleWebhookPollEvents(args);
+      case "webhook_clear_events":   return await handleWebhookClearEvents(args);
+      case "webhook_queue_status":   return await handleWebhookQueueStatus(args);
+      // Messaging
+      case "slack_send_message":     return await handleSlackSendMessage(args);
+      case "teams_send_message":     return await handleTeamsSendMessage(args);
+      // Web fetch
+      case "web_fetch_page":         return await handleWebFetchPage(args);
       case "get_current_datetime": {
         const dt = getCurrentDateTime();
         return { content: [{ type: "text", text: JSON.stringify(dt, null, 2) }] };
@@ -272,7 +362,7 @@ async function main() {
   } catch (err) {
     log("error", `Scheduler bootstrap error: ${err.message}`);
   }
-  log("info", "claude-connector v7.0.0 running via stdio");
+  log("info", "claude-connector v8.0.0 running via stdio");
 }
 
 main().catch((err) => {

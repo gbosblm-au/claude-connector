@@ -101,9 +101,7 @@ import {
   handleWpSetFeaturedImage,
 } from "./tools/wordpressMedia.js";
 import {
-  googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
-  handleGoogleDriveUpload,
   handleGoogleDriveList,
   googleDriveCheckConnectionToolDefinition,
   googleDriveSearchFilesToolDefinition,
@@ -157,6 +155,67 @@ import {
   handleEmailScheduleCancel,
   handleEmailScheduleList,
 } from "./tools/emailSchedule.js";
+
+// v8.0.0 additions
+import {
+  calendarListEventsToolDefinition,
+  calendarCreateEventToolDefinition,
+  calendarUpdateEventToolDefinition,
+  calendarDeleteEventToolDefinition,
+  handleCalendarListEvents,
+  handleCalendarCreateEvent,
+  handleCalendarUpdateEvent,
+  handleCalendarDeleteEvent,
+} from "./tools/googleCalendar.js";
+
+import {
+  sheetsGetMetadataToolDefinition,
+  sheetsReadRangeToolDefinition,
+  sheetsWriteRangeToolDefinition,
+  sheetsAppendRowsToolDefinition,
+  handleSheetsGetMetadata,
+  handleSheetsReadRange,
+  handleSheetsWriteRange,
+  handleSheetsAppendRows,
+} from "./tools/googleSheets.js";
+
+import {
+  webhookPollEventsToolDefinition,
+  webhookClearEventsToolDefinition,
+  webhookQueueStatusToolDefinition,
+  enqueueWebhookEvent,
+  validateWebhookSecret,
+  handleWebhookPollEvents,
+  handleWebhookClearEvents,
+  handleWebhookQueueStatus,
+} from "./tools/webhook.js";
+
+import {
+  slackSendMessageToolDefinition,
+  teamsSendMessageToolDefinition,
+  handleSlackSendMessage,
+  handleTeamsSendMessage,
+} from "./tools/messaging.js";
+
+import {
+  webFetchPageToolDefinition,
+  handleWebFetchPage,
+} from "./tools/webFetch.js";
+
+import {
+  googleDriveOverwriteFileToolDefinition,
+  handleGoogleDriveOverwriteFile,
+} from "./tools/googleDrive.js";
+
+import {
+  wpGetContentToolDefinition,
+  handleWpGetContent,
+} from "./tools/wordpress.js";
+
+import {
+  emailReplyCheckToolDefinition,
+  handleEmailReplyCheck,
+} from "./tools/emailTracking.js";
 import {
   PIXEL_PNG,
   appendTrackingEvent,
@@ -217,13 +276,13 @@ const TOOLS = [
   imageSearchDownloadToolDefinition,
   wpUploadMediaToolDefinition,
   wpSetFeaturedImageToolDefinition,
-  googleDriveUploadToolDefinition,
   googleDriveListToolDefinition,
   googleDriveCheckConnectionToolDefinition,
   googleDriveSearchFilesToolDefinition,
   googleDriveReadFileContentToolDefinition,
   googleDriveDownloadFileContentToolDefinition,
   googleDriveCreateFileToolDefinition,
+  googleDriveOverwriteFileToolDefinition,
   googleDriveGetFileMetadataToolDefinition,
   googleDriveListRecentFilesToolDefinition,
   googleDriveGetFilePermissionsToolDefinition,
@@ -238,9 +297,37 @@ const TOOLS = [
   emailValidateAddressToolDefinition,
   emailGetTrackingToolDefinition,
   emailTrackingSummaryToolDefinition,
+  emailReplyCheckToolDefinition,
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
   emailScheduleListToolDefinition,
+
+  // ---------- WordPress get content ----------
+  wpGetContentToolDefinition,
+
+  // ---------- Google Calendar (v8.0.0) ----------
+  calendarListEventsToolDefinition,
+  calendarCreateEventToolDefinition,
+  calendarUpdateEventToolDefinition,
+  calendarDeleteEventToolDefinition,
+
+  // ---------- Google Sheets (v8.0.0) ----------
+  sheetsGetMetadataToolDefinition,
+  sheetsReadRangeToolDefinition,
+  sheetsWriteRangeToolDefinition,
+  sheetsAppendRowsToolDefinition,
+
+  // ---------- Inbound Webhook (v8.0.0) ----------
+  webhookPollEventsToolDefinition,
+  webhookClearEventsToolDefinition,
+  webhookQueueStatusToolDefinition,
+
+  // ---------- Slack / Teams messaging (v8.0.0) ----------
+  slackSendMessageToolDefinition,
+  teamsSendMessageToolDefinition,
+
+  // ---------- Full page web fetch (v8.0.0) ----------
+  webFetchPageToolDefinition,
 
   {
     name: "get_current_datetime",
@@ -254,7 +341,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "7.0.0" },
+    { name: "claude-connector", version: "8.0.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -301,13 +388,14 @@ function createMcpServer() {
         case "image_search_download":       return await handleImageSearchDownload(args);
         case "wordpress_upload_media":      return await handleWpUploadMedia(args);
         case "wordpress_set_featured_image":return await handleWpSetFeaturedImage(args);
-        case "google_drive_upload":         return await handleGoogleDriveUpload(args);
+        case "wordpress_get_content":       return await handleWpGetContent(args);
         case "google_drive_list":           return await handleGoogleDriveList(args);
         case "google_drive_check_connection":      return await handleGoogleDriveCheckConnection(args);
         case "google_drive_search_files":          return await handleGoogleDriveSearchFiles(args);
         case "google_drive_read_file_content":     return await handleGoogleDriveReadFileContent(args);
         case "google_drive_download_file_content": return await handleGoogleDriveDownloadFileContent(args);
         case "google_drive_create_file":           return await handleGoogleDriveCreateFile(args);
+        case "google_drive_overwrite_file":        return await handleGoogleDriveOverwriteFile(args);
         case "google_drive_get_file_metadata":     return await handleGoogleDriveGetFileMetadata(args);
         case "google_drive_list_recent_files":     return await handleGoogleDriveListRecentFiles(args);
         case "google_drive_get_file_permissions":  return await handleGoogleDriveGetFilePermissions(args);
@@ -322,9 +410,34 @@ function createMcpServer() {
         case "email_validate_address":       return await handleEmailValidateAddress(args);
         case "email_get_tracking":           return await handleEmailGetTracking(args);
         case "email_tracking_summary":       return await handleEmailTrackingSummary(args);
+        case "email_reply_check":            return await handleEmailReplyCheck(args);
         case "email_schedule":               return await handleEmailSchedule(args);
         case "email_schedule_cancel":        return await handleEmailScheduleCancel(args);
         case "email_schedule_list":          return await handleEmailScheduleList(args);
+
+        // ---------- Google Calendar (v8.0.0) ----------
+        case "calendar_list_events":   return await handleCalendarListEvents(args);
+        case "calendar_create_event":  return await handleCalendarCreateEvent(args);
+        case "calendar_update_event":  return await handleCalendarUpdateEvent(args);
+        case "calendar_delete_event":  return await handleCalendarDeleteEvent(args);
+
+        // ---------- Google Sheets (v8.0.0) ----------
+        case "sheets_get_metadata":    return await handleSheetsGetMetadata(args);
+        case "sheets_read_range":      return await handleSheetsReadRange(args);
+        case "sheets_write_range":     return await handleSheetsWriteRange(args);
+        case "sheets_append_rows":     return await handleSheetsAppendRows(args);
+
+        // ---------- Inbound Webhook (v8.0.0) ----------
+        case "webhook_poll_events":    return await handleWebhookPollEvents(args);
+        case "webhook_clear_events":   return await handleWebhookClearEvents(args);
+        case "webhook_queue_status":   return await handleWebhookQueueStatus(args);
+
+        // ---------- Slack / Teams messaging (v8.0.0) ----------
+        case "slack_send_message":     return await handleSlackSendMessage(args);
+        case "teams_send_message":     return await handleTeamsSendMessage(args);
+
+        // ---------- Full page web fetch (v8.0.0) ----------
+        case "web_fetch_page":         return await handleWebFetchPage(args);
 
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
@@ -361,7 +474,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "7.0.0",
+    version: "8.0.0",
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
     psychologyEndpoints: true,
@@ -369,6 +482,11 @@ app.get("/health", (_req, res) => {
     emailHtmlEnabled: config.emailHtmlEnabled,
     emailTrackingEnabled: config.emailTrackingEnabled,
     scheduleEnabled: config.scheduleEnabled,
+    calendarEnabled: !!(config.googleCalendarId),
+    sheetsEnabled: !!(config.googleSheetsId),
+    slackEnabled: !!(config.slackBotToken),
+    teamsEnabled: !!(config.teamsWebhookUrl),
+    webhookEnabled: true,
     timestamp: new Date().toISOString(),
   });
 });
@@ -602,6 +720,35 @@ app.post("/messages", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------
+// Inbound Webhook receiver (v8.0.0)
+// -----------------------------------------------------------------------
+app.post("/webhook", async (req, res) => {
+  if (!validateWebhookSecret(req.headers)) {
+    res.status(401).json({ error: "Invalid or missing X-Webhook-Secret header." });
+    return;
+  }
+
+  let payload = req.body;
+  if (!payload || (typeof payload === "object" && Object.keys(payload).length === 0)) {
+    // Body may be raw text if content-type is not json
+    payload = { raw: String(req.body || "") };
+  }
+
+  const sourceIp =
+    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
+    req.ip ||
+    "";
+
+  try {
+    const eventId = enqueueWebhookEvent(payload, sourceIp, req.headers);
+    res.status(200).json({ ok: true, event_id: eventId });
+  } catch (err) {
+    log("error", `webhook enqueue error: ${err.message}`);
+    res.status(500).json({ error: "Failed to enqueue event." });
+  }
+});
+
+// -----------------------------------------------------------------------
 // CSV upload endpoint (protected by UPLOAD_API_KEY)
 // -----------------------------------------------------------------------
 app.post("/upload/connections", async (req, res) => {
@@ -660,6 +807,7 @@ app.use((_req, res) => {
       trackOpen: "GET /track/open?id=...",
       trackClick: "GET /track/click?id=...&url=...",
       upload: "POST /upload/connections",
+      webhook: "POST /webhook",
     },
   });
 });
@@ -669,7 +817,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v7.0.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v8.0.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -678,6 +826,11 @@ httpServer.listen(PORT, HOST, () => {
     `Scheduling: ${config.scheduleEnabled ? "ENABLED" : "disabled"}`);
   log("info", `Tracking endpoints: GET /track/open, GET /track/click`);
   log("info", "Psychology endpoints: ENABLED (emotion/taxonomy, sentiment/analyze, alignment/assess)");
+  log("info", `Calendar: ${config.googleCalendarId || "primary"} | Sheets: ${config.googleSheetsId || "not configured"}`);
+  log("info", `Slack: ${config.slackBotToken ? "CONFIGURED" : "not configured"} | Teams: ${config.teamsWebhookUrl ? "CONFIGURED" : "not configured"}`);
+  log("info", `Webhook receiver: POST /webhook | Secret: ${config.webhookSecret ? "CONFIGURED" : "OPEN (set WEBHOOK_SECRET)"}`);
+  log("info", `Web page fetch: ENABLED (web_fetch_page)`);
+  log("info", `Drive overwrite: google_drive_overwrite_file | Legacy google_drive_upload: REMOVED`);
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
   try {

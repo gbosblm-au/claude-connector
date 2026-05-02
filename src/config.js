@@ -141,6 +141,44 @@ export const config = {
   scheduleEnabled: (process.env.SCHEDULE_ENABLED || "true").toLowerCase() === "true",
   scheduleStorePath: process.env.SCHEDULE_STORE_PATH || "/data/schedule_store.json",
   scheduleMaxPending: parseInt(process.env.SCHEDULE_MAX_PENDING || "50", 10),
+
+  // ---------------------------------------------------------------------------
+  // Google Calendar (v8.0.0)
+  // Requires scope: https://www.googleapis.com/auth/calendar
+  // Add to GOOGLE_DRIVE_SCOPES (space-separated) alongside the Drive scope.
+  // ---------------------------------------------------------------------------
+  googleCalendarId: process.env.GOOGLE_CALENDAR_ID || "primary",
+
+  // ---------------------------------------------------------------------------
+  // Google Sheets (v8.0.0)
+  // Requires scope: https://www.googleapis.com/auth/spreadsheets
+  // Add to GOOGLE_DRIVE_SCOPES (space-separated) alongside the Drive scope.
+  // ---------------------------------------------------------------------------
+  googleSheetsId: process.env.GOOGLE_SHEETS_ID || "",
+
+  // ---------------------------------------------------------------------------
+  // Slack (v8.0.0)
+  // Bot OAuth Token from https://api.slack.com/apps
+  // Required scopes: chat:write, chat:write.public
+  // ---------------------------------------------------------------------------
+  slackBotToken: process.env.SLACK_BOT_TOKEN || "",
+  slackDefaultChannel: process.env.SLACK_DEFAULT_CHANNEL || "",
+
+  // ---------------------------------------------------------------------------
+  // Microsoft Teams (v8.0.0)
+  // Incoming Webhook URL from Teams channel Connectors settings
+  // ---------------------------------------------------------------------------
+  teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL || "",
+
+  // ---------------------------------------------------------------------------
+  // Inbound Webhook receiver (v8.0.0)
+  // WEBHOOK_SECRET: shared secret validated via X-Webhook-Secret header
+  // WEBHOOK_QUEUE_SIZE: max events held in memory (default 200)
+  // WEBHOOK_PERSIST_PATH: optional file path to persist queue across restarts
+  // ---------------------------------------------------------------------------
+  webhookSecret: process.env.WEBHOOK_SECRET || "",
+  webhookQueueSize: parseInt(process.env.WEBHOOK_QUEUE_SIZE || "200", 10),
+  webhookPersistPath: process.env.WEBHOOK_PERSIST_PATH || "",
 };
 
 // -----------------------------------------------------------------------

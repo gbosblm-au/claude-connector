@@ -1,3 +1,70 @@
+# CHANGELOG
+
+## v8.0.0 (2026-05-02)
+
+### New Tools
+
+**Google Calendar** (`src/tools/googleCalendar.js`)
+- `calendar_list_events` - List events in a time window with attendees, location, and links
+- `calendar_create_event` - Create timed or all-day events with optional attendee invites
+- `calendar_update_event` - Patch any field on an existing event by event ID
+- `calendar_delete_event` - Delete/cancel an event with optional attendee notification
+- Requires `https://www.googleapis.com/auth/calendar` added to `GOOGLE_DRIVE_SCOPES`
+
+**Google Sheets** (`src/tools/googleSheets.js`)
+- `sheets_get_metadata` - Return spreadsheet title, all sheet names, and grid sizes
+- `sheets_read_range` - Read cells by A1 notation with formatted, raw, or formula values
+- `sheets_write_range` - Overwrite a range with a 2D array of values (PUT semantics)
+- `sheets_append_rows` - Append rows after the last data row without overwriting
+- Requires `https://www.googleapis.com/auth/spreadsheets` added to `GOOGLE_DRIVE_SCOPES`
+- Set `GOOGLE_SHEETS_ID` as the default spreadsheet
+
+**Inbound Webhook Receiver** (`src/tools/webhook.js`)
+- `webhook_poll_events` - Retrieve pending events from the inbound queue
+- `webhook_clear_events` - Acknowledge and remove events by event_id or clear all
+- `webhook_queue_status` - Summary of queue depth and server configuration
+- `POST /webhook` HTTP endpoint registered in `server-http.js`
+- Configurable via `WEBHOOK_SECRET`, `WEBHOOK_QUEUE_SIZE`, `WEBHOOK_PERSIST_PATH`
+
+**Slack / Teams Messaging** (`src/tools/messaging.js`)
+- `slack_send_message` - Send plain text or mrkdwn to a Slack channel or DM, supports threading
+- `teams_send_message` - Send an Adaptive Card to a Teams channel via Incoming Webhook
+- Configure via `SLACK_BOT_TOKEN`, `SLACK_DEFAULT_CHANNEL`, `TEAMS_WEBHOOK_URL`
+
+**Full Page Web Fetch** (`src/tools/webFetch.js`)
+- `web_fetch_page` - Fetch a URL and return full extracted plain text, heading structure, and links
+- Strips scripts, styles, navigation, and ads using cheerio (already a project dependency)
+- Configurable `max_chars` (default 50,000, max 200,000) and `timeout_ms`
+
+**WordPress Get Content** (appended to `src/tools/wordpress.js`)
+- `wordpress_get_content` - Fetch full post or page content by numeric ID
+- Returns raw content, title, slug, status, categories, tags, excerpt, and featured media ID
+
+**Email Reply Check** (appended to `src/tools/emailTracking.js`)
+- `email_reply_check` - Per-recipient engagement summary with open/click counts and engagement signal
+- Returns `engagement` level: none / low / medium / high / replied
+- `reply_detected` will activate when IMAP polling is configured
+
+**Google Drive Overwrite by Name** (appended to `src/tools/googleDrive.js`)
+- `google_drive_overwrite_file` - Search folder for existing file by exact name, resolve its ID, PATCH content
+- If no match found, creates new file in the target folder
+- `getAccessToken` exported from `googleDrive.js` for Calendar and Sheets reuse
+
+### Removed Tools
+
+- `google_drive_upload` - Removed from tool registry (POST-only, always created new files)
+  - Replaced by `google_drive_create_file` and `google_drive_overwrite_file`
+
+### Configuration Changes (new env vars)
+
+- `GOOGLE_CALENDAR_ID`, `GOOGLE_SHEETS_ID`, `SLACK_BOT_TOKEN`, `SLACK_DEFAULT_CHANNEL`
+- `TEAMS_WEBHOOK_URL`, `WEBHOOK_SECRET`, `WEBHOOK_QUEUE_SIZE`, `WEBHOOK_PERSIST_PATH`
+
+Updated `GOOGLE_DRIVE_SCOPES` example for all features:
+`https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/spreadsheets`
+
+---
+
 # Changelog
 
 ## v7.0.1 - User-Agent Hardening
