@@ -1,5 +1,88 @@
 # CHANGELOG
 
+## v9.0.0 (2026-05-06) — MAJOR RELEASE
+
+### Consolidation: stats-connector merged into claude-connector
+
+This major release folds the entire former `stats-connector` (data-analysis MCP)
+codebase into `claude-connector` with **zero loss of functionality** from either
+side. All v8.0.0 tools, endpoints, transports, and behaviours are preserved
+verbatim. Total tool count rises from 67 to **99**.
+
+### New Tools (32 statistical + ML tools, plus `stats_help`)
+
+**Data Management** (`src/tools-stats/dataManagement.js`)
+- `data_load` — Load CSV / TSV / JSON / Excel files or inline pasted data
+- `data_info` — Column types, missing-value counts, unique counts, preview
+- `data_preview` — First/last N rows as a formatted table
+- `data_list` — List all loaded datasets with sizes and load times
+- `data_drop` — Remove a dataset from memory
+- `data_filter` — Filter dataset by `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `not_null`, `is_null`
+- `data_select` — Keep / rename specific columns
+- `data_sample` — Random sample by `n` or `fraction` with optional seed
+
+**Descriptive Statistics** (`src/tools-stats/descriptiveStats.js`)
+- `stats_describe` — Mean, median, SD, IQR, skewness, kurtosis, CV, SE
+- `stats_frequency` — Frequency table with cumulative %
+- `stats_histogram` — Binned distribution with text bar visualisation
+- `stats_crosstab` — Cross-tabulation of two categorical columns + chi-square
+- `stats_normality` — Jarque-Bera, D'Agostino-Pearson, Q-Q comparison
+
+**Inferential Statistics / Hypothesis Tests** (`src/tools-stats/inferentialStats.js`)
+- `stats_ttest` — One-sample, two-sample (Welch), or paired t-test
+- `stats_anova` — One-way ANOVA + Tukey HSD post-hoc
+- `stats_chi_square` — Goodness-of-fit or independence test
+- `stats_confidence_interval` — Mean CI at 90 / 95 / 99 %
+- `stats_mann_whitney` — Non-parametric two-group comparison (U test)
+- `stats_proportion_test` — One- or two-sample z-test for proportions
+
+**Regression & Correlation** (`src/tools-stats/regressionCorrelation.js`)
+- `stats_correlation` — Pearson / Spearman / Kendall correlation matrix
+- `stats_regression` — Simple linear, multiple linear, polynomial, logistic
+- `stats_partial_correlation` — Correlation controlling for covariates
+
+**Time Series** (`src/tools-stats/timeSeries.js`)
+- `ts_analyze` — Trend, ADF stationarity, ACF, PACF, seasonality
+- `ts_moving_average` — SMA / EMA / WMA with configurable window
+- `ts_forecast` — Holt-Winters, simple exponential smoothing, linear trend
+
+**Machine Learning** (`src/tools-stats/machineLearning.js`)
+- `ml_kmeans` — K-Means clustering with elbow method + silhouette score
+- `ml_pca` — Principal Component Analysis with loadings + scores
+- `ml_knn` — K-Nearest Neighbours classifier with cross-validation
+- `ml_naive_bayes` — Gaussian Naive Bayes classifier with cross-validation
+- `ml_anomaly_detection` — Z-score, IQR, Isolation Forest, Mahalanobis
+- `ml_feature_importance` — Rank predictors by correlation / MI / ANOVA F-ratio
+
+**Help**
+- `stats_help` — Returns a categorised list of every statistical / ML tool
+
+### New Dependencies (additive, no version conflicts)
+- `simple-statistics ^7.8.7`, `jstat ^1.9.6`, `exceljs ^4.4.0`
+- `ml-matrix ^6.12.0`, `ml-pca ^4.1.1`, `ml-kmeans ^6.0.0`
+- `ml-regression-simple-linear ^2.0.4`, `ml-regression-multivariate-linear ^2.0.4`, `ml-regression-polynomial ^3.0.0`
+
+### Internal Changes
+- New directory `src/tools-stats/` for the 6 stats tool modules (kept separate from `src/tools/` to avoid any name collision with existing claude-connector files)
+- New directory `src/store/` containing the in-memory dataset registry (`dataStore.js`, max 20 datasets, 2 M rows each)
+- New utility `src/utils/format.js` for stats output formatting (significance stars, table builder, CI / Cohen's d / r² interpretation)
+- Logger unified — every module now logs under the `[claude-connector]` tag
+- HTTP body limit raised from 10 MB to 50 MB on `server-http.js` to support inline-data dataset loading
+- `stats_help` text exposed by both stdio (`src/index.js`) and HTTP (`src/server-http.js`) entry points
+
+### Backward Compatibility
+- Server name remains `claude-connector`; only the version field bumps to `9.0.0`
+- All 67 v8.0.0 tools keep their exact names, schemas, and handler behaviour
+- All v8.0.0 HTTP endpoints (`/mcp`, `/sse`, `/messages`, `/health`, `/track/open`, `/track/click`, `/auth/linkedin/callback`, `/webhook`, `/upload/connections`) keep their exact paths and contracts
+- The TrueSource email scheduler still boots automatically on both stdio and HTTP servers
+
+### Verification
+A full end-to-end smoke test (`test-merge.js`) exercises 37 tool calls covering every stats / ML category plus key v8.0.0 utility tools. Result: **37 / 37 pass, 99 / 99 tools registered, 0 v8.0.0 tools missing, 0 stats tools missing.** HTTP transport handshake plus `tools/list` over `/mcp` also verified.
+
+---
+
+# CHANGELOG
+
 ## v8.0.0 (2026-05-02)
 
 ### New Tools

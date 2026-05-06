@@ -1,26 +1,43 @@
 # claude-connector
 
-A fully functional **MCP (Model Context Protocol) server** that gives Claude real-time capabilities, similar to TinyFish:
+**Version 9.0.0** — A fully functional **MCP (Model Context Protocol) server** that gives Claude real-time web/news search, LinkedIn lookup, TrueSource outreach email send / tracking / scheduling, Google Drive / Calendar / Sheets, Slack / Teams messaging, inbound webhooks, WordPress publishing, image search / download, psychology assessment, **plus a complete in-memory statistical analysis & machine-learning toolkit** (descriptive stats, hypothesis tests, regression, time-series, clustering, PCA, KNN, anomaly detection — 99 tools total).
 
-| Tool | What it does |
+| Category | Sample tools |
 |---|---|
-| `web_search` | Real-time web search via Brave Search or Tavily |
-| `news_search` | Real-time news articles via Brave News or NewsAPI |
-| `linkedin_load_connections` | Loads your LinkedIn connections CSV export |
-| `linkedin_search_connections` | Searches connections by name, company, position, date, etc. |
-| `linkedin_connection_count` | Summary statistics of your loaded connections |
-| `linkedin_get_profile` | Returns your own LinkedIn profile data |
-| `google_drive_check_connection` | Verifies Google Drive credentials, scopes, quota, and reachability |
-| `google_drive_search_files` | Searches Drive by name, content, or metadata |
-| `google_drive_read_file_content` | Reads text content from Drive files and Google Docs exports |
-| `google_drive_download_file_content` | Downloads binary content from Drive files |
-| `google_drive_create_file` | Creates new files or overwrites existing files in Drive |
-| `google_drive_get_file_metadata` | Returns rich file metadata |
-| `google_drive_list_recent_files` | Lists recently modified Drive files |
-| `google_drive_get_file_permissions` | Returns Drive sharing and permission details |
-| `google_drive_upload` | Uploads local files to Google Drive |
-| `google_drive_list` | Lists files in a Drive folder |
-| `get_current_datetime` | Returns the current UTC date/time |
+| **Search & web** | `web_search`, `news_search`, `image_search`, `web_fetch_page` |
+| **LinkedIn** | `linkedin_load_connections`, `linkedin_search_connections`, `linkedin_connection_count`, `linkedin_get_profile`, `linkedin_start_oauth`, `linkedin_get_live_profile` |
+| **WordPress** | `wordpress_site_info`, `wordpress_create_post`, `wordpress_create_page`, `wordpress_upload_media`, `wordpress_set_featured_image`, `wordpress_get_content` |
+| **Google Drive** | `google_drive_search_files`, `google_drive_read_file_content`, `google_drive_create_file`, `google_drive_overwrite_file`, `google_drive_list_recent_files` |
+| **Google Calendar** | `calendar_list_events`, `calendar_create_event`, `calendar_update_event`, `calendar_delete_event` |
+| **Google Sheets** | `sheets_get_metadata`, `sheets_read_range`, `sheets_write_range`, `sheets_append_rows` |
+| **TrueSource email** | `email_send`, `email_validate_address`, `email_get_tracking`, `email_tracking_summary`, `email_schedule`, `email_schedule_cancel` |
+| **Messaging** | `slack_send_message`, `teams_send_message` |
+| **Webhooks** | `webhook_poll_events`, `webhook_clear_events`, `webhook_queue_status` |
+| **Psychology** | `psychology_emotion_taxonomy`, `psychology_sentiment_analyze`, `psychology_alignment_assess` |
+| **Data management** *(v9.0.0)* | `data_load`, `data_info`, `data_preview`, `data_filter`, `data_select`, `data_sample`, `data_drop`, `data_list` |
+| **Descriptive stats** *(v9.0.0)* | `stats_describe`, `stats_frequency`, `stats_histogram`, `stats_crosstab`, `stats_normality` |
+| **Hypothesis tests** *(v9.0.0)* | `stats_ttest`, `stats_anova`, `stats_chi_square`, `stats_confidence_interval`, `stats_mann_whitney`, `stats_proportion_test` |
+| **Regression / correlation** *(v9.0.0)* | `stats_correlation`, `stats_regression`, `stats_partial_correlation` |
+| **Time series** *(v9.0.0)* | `ts_analyze`, `ts_moving_average`, `ts_forecast` |
+| **Machine learning** *(v9.0.0)* | `ml_kmeans`, `ml_pca`, `ml_knn`, `ml_naive_bayes`, `ml_anomaly_detection`, `ml_feature_importance` |
+| **Help & utilities** | `stats_help`, `get_current_datetime` |
+
+> Call `stats_help` for a categorised list of all statistical / ML tools with usage hints.
+
+---
+
+## What's New in v9.0.0 (Major Release)
+
+v9.0.0 consolidates the former **stats-connector / data-analysis** MCP into claude-connector with **zero loss of functionality** from either side. All 67 v8.0.0 tools, transports, and HTTP endpoints are preserved verbatim — 32 statistical & ML tools (plus `stats_help`) are added on top.
+
+- New `src/tools-stats/` directory with 6 modules covering data management, descriptive stats, hypothesis testing, regression / correlation, time series, and machine learning.
+- New `src/store/dataStore.js` providing an in-memory dataset registry (max 20 datasets, up to 2 M rows each, automatic column-type inference).
+- New `src/utils/format.js` for stats output formatting (significance stars, fixed-width tables, CI / Cohen's d / r² interpretation).
+- HTTP body limit raised to **50 MB** to allow large inline-data dataset loading via `data_load`.
+- All logs unified under the `[claude-connector]` tag.
+- Full end-to-end smoke test (`test-merge.js`) verifies all 99 tools register, all 32 stats tools execute correctly, and HTTP MCP transport works.
+
+See [CHANGELOG.md](./CHANGELOG.md) for the complete release notes.
 
 ---
 
