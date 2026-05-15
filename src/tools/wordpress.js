@@ -67,27 +67,66 @@ function getWpConfig() {
   return creds;
 }
 
+// v10.0.1: wpFetch hardened with an explicit AbortController-driven timeout
+// (default 30s) and clearer error categorisation so REST GET / POST failures
+// surface as actionable diagnostics rather than opaque 'fetch failed' strings.
+// Behaviourally backward-compatible with v8.1.0 - same call sites, same return.
+const WP_FETCH_TIMEOUT_MS = parseInt(process.env.WP_FETCH_TIMEOUT_MS || "30000", 10);
+
 async function wpFetch(path, options = {}) {
   const { url, authHeader, baseApi } = getWpConfig();
   const fullUrl = path.startsWith("http") ? path : `${baseApi}${path}`;
 
-  const resp = await fetch(fullUrl, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: authHeader,
-      "User-Agent": CONNECTOR_USER_AGENT,
-      ...(options.headers || {}),
-    },
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WP_FETCH_TIMEOUT_MS);
 
-  const body = await resp.json().catch(() => null);
+  let resp;
+  try {
+    resp = await fetch(fullUrl, {
+      ...options,
+      signal: options.signal || controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authHeader,
+        "User-Agent": CONNECTOR_USER_AGENT,
+        Accept: "application/json",
+        ...(options.headers || {}),
+      },
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === "AbortError") {
+      throw new Error(
+        `WordPress request timed out after ${WP_FETCH_TIMEOUT_MS}ms while contacting ${fullUrl}. ` +
+        `Verify WP_URL is reachable from the connector host and that the site is not behind ` +
+        `a CDN/firewall blocking server-side traffic.`,
+      );
+    }
+    throw new Error(
+      `WordPress network error contacting ${fullUrl}: ${err && err.message ? err.message : String(err)}`,
+    );
+  }
+  clearTimeout(timer);
+
+  // Read the body once as text so we can both parse JSON and include a snippet
+  // in non-JSON error responses (e.g. HTML 403 pages from a security plugin).
+  const rawText = await resp.text().catch(() => "");
+  let body = null;
+  if (rawText) {
+    try {
+      body = JSON.parse(rawText);
+    } catch {
+      body = null;
+    }
+  }
 
   if (!resp.ok) {
+    const wpCode = body && (body.code || body.error_code);
+    const wpMsg = body && (body.message || body.error);
+    const snippet = !body && rawText ? ` Response snippet: ${rawText.slice(0, 240)}` : "";
     const msg =
-      body?.message ||
-      body?.error ||
-      `HTTP ${resp.status} ${resp.statusText}`;
+      wpMsg ||
+      `HTTP ${resp.status} ${resp.statusText}${wpCode ? ` (code=${wpCode})` : ""}${snippet}`;
     throw new Error(`WordPress API error: ${msg}`);
   }
 
@@ -1360,4 +1399,56 @@ export async function handleWpGetContent(args) {
   ].filter((l) => l !== null);
 
   return { content: [{ type: "text", text: lines.join("\n") }] };
+}
+
+// -----------------------------------------------------------------------
+// v10.0.1: wordpress_health diagnostic tool
+// -----------------------------------------------------------------------
+export const wpHealthToolDefinition = {
+  name: "wordpress_health",
+  description:
+    "Runs an end-to-end diagnostic of the WordPress REST API connection: " +
+    "verifies credentials are present, resolves the wp-json/wp/v2 base, " +
+    "performs an authenticated GET on /users/me, and reports round-trip time " +
+    "and user capabilities. Call this first when GET/POST tools appear faulty.",
+  inputSchema: { type: "object", properties: {}, required: [] },
+};
+
+export async function handleWpHealth(_args) {
+  const lines = ["WordPress Health Check", "=".repeat(40)];
+  let creds;
+  try {
+    creds = getWpConfig();
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `${lines.join("\n")}\nstatus:     NOT CONFIGURED\n\n${err.message}` }],
+      isError: true,
+    };
+  }
+  lines.push(`base URL:   ${creds.url}`);
+  lines.push(`REST root:  ${creds.baseApi}`);
+  lines.push(`username:   ${creds.username}`);
+  lines.push(`auth:       Basic (Application Password)`);
+
+  const t0 = Date.now();
+  try {
+    const me = await wpFetch("/users/me?context=edit");
+    const elapsed = Date.now() - t0;
+    lines.push(`status:     OK`);
+    lines.push(`round-trip: ${elapsed}ms`);
+    lines.push(`user ID:    ${me.id}`);
+    lines.push(`name:       ${me.name}`);
+    lines.push(`roles:      ${(me.roles || []).join(", ") || "(none)"}`);
+    const caps = me.capabilities || {};
+    const canPost = !!(caps.publish_posts || caps.edit_posts);
+    const canPage = !!(caps.publish_pages || caps.edit_pages);
+    lines.push(`can post:   ${canPost ? "YES" : "NO"}`);
+    lines.push(`can page:   ${canPage ? "YES" : "NO"}`);
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  } catch (err) {
+    const elapsed = Date.now() - t0;
+    lines.push(`status:     FAILED after ${elapsed}ms`);
+    lines.push(`error:      ${err.message}`);
+    return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
+  }
 }

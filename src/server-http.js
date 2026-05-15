@@ -222,7 +222,9 @@ import {
 
 import {
   wpGetContentToolDefinition,
+  wpHealthToolDefinition,
   handleWpGetContent,
+  handleWpHealth,
 } from "./tools/wordpress.js";
 
 import {
@@ -231,14 +233,19 @@ import {
 } from "./tools/emailTracking.js";
 
 // ---------- v10.0.0: Persistent Memory MCP integration ----------
-import {
-  ALL_MEMORY_TOOL_DEFINITIONS,
-  MEMORY_TOOL_NAMES,
-  dispatchMemoryTool,
-  initMemorySubsystem,
-  getMemoryHealthSnapshot,
-} from "./tools-memory/index.js";
-import { adminDumpHandler as memoryAdminDumpHandler } from "./tools-memory/admin.js";
+// v10.0.1 fix: lazy-load the memory subsystem. The tools-memory/index.js
+// chain transitively imports better-sqlite3 (native module). On hosts that
+// have not yet built that binary (or where the persistent volume is not
+// provisioned), eager imports caused module-load failures that took the
+// entire connector down - which manifested to users as 'WordPress REST API
+// stopped working'. We now resolve the memory bindings on first use only
+// when MEMORY_AUTH_TOKEN is configured.
+let ALL_MEMORY_TOOL_DEFINITIONS = [];
+let MEMORY_TOOL_NAMES = new Set();
+let dispatchMemoryTool = null;
+let initMemorySubsystem = null;
+let getMemoryHealthSnapshot = () => ({ enabled: false });
+let memoryAdminDumpHandler = null;
 
 // ---------- v9.0.0: Statistical analysis & machine learning ----------
 import {
@@ -294,17 +301,26 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
 const MEMORY_AUTH_TOKEN = process.env.MEMORY_AUTH_TOKEN || "";
-const MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN);
+let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN);
 
 // Initialise the persistent memory subsystem when configured.
-// Skipping init keeps the connector usable in environments that have not yet
-// provisioned the /data volume.
+// v10.0.1: dynamic import keeps the rest of the connector functional even
+// when better-sqlite3 fails to load (missing native binary, etc.).
 if (MEMORY_ENABLED) {
   try {
+    const memMod = await import("./tools-memory/index.js");
+    const adminMod = await import("./tools-memory/admin.js");
+    ALL_MEMORY_TOOL_DEFINITIONS = memMod.ALL_MEMORY_TOOL_DEFINITIONS;
+    MEMORY_TOOL_NAMES = memMod.MEMORY_TOOL_NAMES;
+    dispatchMemoryTool = memMod.dispatchMemoryTool;
+    initMemorySubsystem = memMod.initMemorySubsystem;
+    getMemoryHealthSnapshot = memMod.getMemoryHealthSnapshot;
+    memoryAdminDumpHandler = adminMod.adminDumpHandler;
     initMemorySubsystem();
     log("info", "[memory] subsystem ENABLED");
   } catch (err) {
-    log("error", `[memory] subsystem failed to initialise: ${err.message}`);
+    MEMORY_ENABLED = false;
+    log("error", `[memory] subsystem failed to initialise: ${err.message}. Continuing with memory disabled; all other tools (including WordPress REST) remain available.`);
   }
 } else {
   log(
@@ -382,6 +398,7 @@ const TOOLS = [
 
   // ---------- WordPress get content ----------
   wpGetContentToolDefinition,
+  wpHealthToolDefinition,
 
   // ---------- Google Calendar (v8.0.0) ----------
   calendarListEventsToolDefinition,
@@ -472,7 +489,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "10.0.0" },
+    { name: "claude-connector", version: "10.0.1" },
     { capabilities: { tools: {} } }
   );
 
@@ -520,6 +537,7 @@ function createMcpServer() {
         case "wordpress_upload_media":      return await handleWpUploadMedia(args);
         case "wordpress_set_featured_image":return await handleWpSetFeaturedImage(args);
         case "wordpress_get_content":       return await handleWpGetContent(args);
+        case "wordpress_health":            return await handleWpHealth(args);
         case "google_drive_list":           return await handleGoogleDriveList(args);
         case "google_drive_check_connection":      return await handleGoogleDriveCheckConnection(args);
         case "google_drive_search_files":          return await handleGoogleDriveSearchFiles(args);
@@ -736,7 +754,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "10.0.0",
+    version: "10.0.1",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -1104,7 +1122,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v10.0.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v10.0.1 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
