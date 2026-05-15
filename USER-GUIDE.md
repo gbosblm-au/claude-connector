@@ -1,11 +1,11 @@
-# Claude Connector — User Guide
+# Claude Connector - User Guide
 ## Version 4.0.0
 
 ---
 
 ## What Is Claude Connector?
 
-Claude Connector is a self-hosted MCP (Model Context Protocol) server that runs on Railway and gives your Claude conversations superpowers: live web search, news search, LinkedIn profile access, and full WordPress publishing — all without leaving the Claude chat interface.
+Claude Connector is a self-hosted MCP (Model Context Protocol) server that runs on Railway and gives your Claude conversations superpowers: live web search, news search, LinkedIn profile access, and full WordPress publishing - all without leaving the Claude chat interface.
 
 Version 4.0.0 introduces **runtime credential management**. You can now connect your WordPress site and LinkedIn app directly from the Claude chat window, without ever logging into Railway or editing environment variables.
 
@@ -57,7 +57,7 @@ The TrueSource Article Writer skill now automatically asks after every article w
 - Create it as a standalone page with a menu item
 - Keep it in the chat only
 
-The skill handles all steps — credential check, category selection, publish vs draft, menu assignment — through natural conversation.
+The skill handles all steps - credential check, category selection, publish vs draft, menu assignment - through natural conversation.
 
 ### Credential Priority
 
@@ -73,17 +73,17 @@ This means your Railway variables act as a baseline, and you can override them a
 
 If you are deploying Claude Connector for the first time:
 
-### Step 1 — Create a Railway Account
+### Step 1 - Create a Railway Account
 
 Go to [railway.app](https://railway.app) and sign up with GitHub.
 
-### Step 2 — Deploy from the ZIP
+### Step 2 - Deploy from the ZIP
 
 1. Extract the `claude-connector-v4.zip` file.
 2. In Railway dashboard, click **New Project > Deploy from GitHub repo**, or use **New Project > Empty Project** then connect via the Railway CLI.
 3. Alternatively, push the extracted folder to a new GitHub repo and deploy that.
 
-### Step 3 — Set Required Environment Variables
+### Step 3 - Set Required Environment Variables
 
 Only search API credentials need to be in Railway. WordPress and LinkedIn can now be set from Claude.
 
@@ -95,15 +95,15 @@ Only search API credentials need to be in Railway. WordPress and LinkedIn can no
 | `BRAVE_API_KEY` | Your Brave Search API key | [api.search.brave.com](https://api.search.brave.com) |
 | `TAVILY_API_KEY` | Your Tavily API key | [app.tavily.com](https://app.tavily.com) |
 
-**Optional (can be set from Claude instead — see sections below):**
+**Optional (can be set from Claude instead - see sections below):**
 
 | Variable | Notes |
 |---|---|
-| `WP_URL` | Your WordPress site URL — can be set from Claude |
-| `WP_USERNAME` | Your WordPress username — can be set from Claude |
-| `WP_APP_PASSWORD` | WordPress Application Password — can be set from Claude |
-| `LINKEDIN_CLIENT_ID` | LinkedIn OAuth Client ID — can be set from Claude |
-| `LINKEDIN_CLIENT_SECRET` | LinkedIn OAuth Client Secret — can be set from Claude |
+| `WP_URL` | Your WordPress site URL - can be set from Claude |
+| `WP_USERNAME` | Your WordPress username - can be set from Claude |
+| `WP_APP_PASSWORD` | WordPress Application Password - can be set from Claude |
+| `LINKEDIN_CLIENT_ID` | LinkedIn OAuth Client ID - can be set from Claude |
+| `LINKEDIN_CLIENT_SECRET` | LinkedIn OAuth Client Secret - can be set from Claude |
 | `LINKEDIN_REDIRECT_URI` | Auto-detected from Railway domain if not set |
 
 **Optional (upload protection):**
@@ -112,7 +112,7 @@ Only search API credentials need to be in Railway. WordPress and LinkedIn can no
 |---|---|
 | `UPLOAD_API_KEY` | Any string. Protects the /upload/connections CSV endpoint. |
 
-### Step 4 — Add a Persistent Volume (Recommended)
+### Step 4 - Add a Persistent Volume (Recommended)
 
 To make runtime credentials survive redeployments:
 
@@ -122,7 +122,7 @@ To make runtime credentials survive redeployments:
 
 Without a volume, credentials survive the current container session but are cleared on redeploy. You would need to re-enter them from Claude after each deploy.
 
-### Step 5 — Note Your Public URL
+### Step 5 - Note Your Public URL
 
 Once deployed, Railway gives you a public URL like:
 `https://claude-connector-production.up.railway.app`
@@ -159,7 +159,7 @@ An **Application Password** from your WordPress site:
 3. Scroll down to **Application Passwords**.
 4. In the "New Application Password Name" field, type `Claude Connector`.
 5. Click **Add New Application Password**.
-6. Copy the generated password immediately — it is only shown once.
+6. Copy the generated password immediately - it is only shown once.
    It will look like: `AbCd EfGh IjKl MnOp QrSt UvWx`
 
 ### Setting the Credentials
@@ -196,7 +196,7 @@ Claude will call `clear_wordpress_credentials` then walk you through setting new
 
 LinkedIn OAuth allows Claude to fetch your live LinkedIn profile. Connections are still accessed via CSV export (LinkedIn does not provide API access to connection lists without Partner Program status).
 
-### Step 1 — Create a LinkedIn Developer App
+### Step 1 - Create a LinkedIn Developer App
 
 1. Go to [linkedin.com/developers/apps](https://www.linkedin.com/developers/apps).
 2. Click **Create App**.
@@ -206,13 +206,13 @@ LinkedIn OAuth allows Claude to fetch your live LinkedIn profile. Connections ar
 5. Save the app.
 6. From the **Auth** tab, copy your **Client ID** and **Client Secret**.
 
-### Step 2 — Set Credentials from Claude
+### Step 2 - Set Credentials from Claude
 
 > "Set my LinkedIn credentials. Client ID is [your-id] and client secret is [your-secret]"
 
 Claude will call `set_linkedin_credentials` and confirm.
 
-### Step 3 — Authorize Your LinkedIn Account
+### Step 3 - Authorize Your LinkedIn Account
 
 > "Start LinkedIn OAuth authorization"
 
@@ -396,23 +396,23 @@ If both are set, the runtime store wins. This means you can override Railway env
 | LinkedIn OAuth credentials | Railway env vars only | Can be set from Claude or Railway |
 | Article writer publish prompt | Not present | Automatic after every article |
 | Server version | 3.0.0 | 4.0.0 |
-| New files | — | `src/utils/credentialStore.js`, `src/tools/credentials.js` |
+| New files | - | `src/utils/credentialStore.js`, `src/tools/credentials.js` |
 
 ### Update Steps
 
-**Option A — Replace files only (fastest, keeps your Railway config):**
+**Option A - Replace files only (fastest, keeps your Railway config):**
 
 1. In your GitHub repo for the connector, replace these files with the v4 versions:
    - `src/server-http.js`
    - `src/tools/wordpress.js`
    - `src/tools/linkedinOAuth.js`
-   - `src/tools/credentials.js` (new file — add it)
-   - `src/utils/credentialStore.js` (new file — add it)
+   - `src/tools/credentials.js` (new file - add it)
+   - `src/utils/credentialStore.js` (new file - add it)
    - `package.json` (version bump only)
 2. Push to GitHub. Railway auto-redeploys.
 3. Your existing Railway environment variables continue to work as fallback credentials.
 
-**Option B — Full redeploy from zip:**
+**Option B - Full redeploy from zip:**
 
 1. Extract `claude-connector-v4.zip`.
 2. Push all files to your GitHub repo (overwrite everything).
@@ -437,7 +437,7 @@ To update the skill file on Claude.ai:
 
 Claude Connector cannot find WordPress credentials from either the runtime store or Railway env vars.
 
-Fix: Tell Claude — "Set my WordPress credentials" — and provide your site URL, username, and Application Password.
+Fix: Tell Claude - "Set my WordPress credentials" - and provide your site URL, username, and Application Password.
 
 ### "WordPress API error: 401 Unauthorized"
 
@@ -446,7 +446,7 @@ The credentials were accepted but WordPress rejected them. Usually means the App
 Fix:
 1. In WordPress Admin > Users > Your Profile > Application Passwords, revoke the old one.
 2. Create a new Application Password named "Claude Connector".
-3. Tell Claude — "Clear my WordPress credentials and set new ones".
+3. Tell Claude - "Clear my WordPress credentials and set new ones".
 
 ### "WordPress API error: rest_no_route"
 
@@ -469,7 +469,7 @@ Without a Railway Volume, credentials are stored in-container memory and are cle
 ### Connector Not Responding in Claude
 
 1. Check your Railway service is running (Railway dashboard > Deployments).
-2. Open `https://[your-railway-url]/health` in a browser — it should return `{"status":"ok"}`.
+2. Open `https://[your-railway-url]/health` in a browser - it should return `{"status":"ok"}`.
 3. In Claude settings, remove and re-add the connector URL.
 4. Ensure the URL ends in `/mcp` (not just the base URL).
 
@@ -522,4 +522,4 @@ Tell Claude: "Clear my WordPress credentials and connect a new site"
 
 ---
 
-*Claude Connector v4.0.0 — built for claude.ai*
+*Claude Connector v4.0.0 - built for claude.ai*

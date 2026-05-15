@@ -39,19 +39,19 @@ import { CONNECTOR_USER_AGENT } from "../config.js";
 function getWpConfig() {
   // Credential resolution order:
   //   1. Runtime credentials stored via set_wordpress_credentials MCP tool
-  //   2. Environment variables (WP_URL, WP_USERNAME, WP_APP_PASSWORD) — Railway
+  //   2. Environment variables (WP_URL, WP_USERNAME, WP_APP_PASSWORD) - Railway
   // The credentialStore handles this priority internally.
   const creds = getWordPressCredentials();
 
   if (!creds) {
     throw new Error(
       "WordPress is not configured.\n\n" +
-      "Option 1 — Set credentials from Claude (recommended):\n" +
+      "Option 1 - Set credentials from Claude (recommended):\n" +
       "  Call set_wordpress_credentials with:\n" +
       "    wp_url:      https://yoursite.com\n" +
       "    wp_username: your_wordpress_username\n" +
       "    wp_password: your Application Password\n\n" +
-      "Option 2 — Set Railway environment variables:\n" +
+      "Option 2 - Set Railway environment variables:\n" +
       "  WP_URL          = https://yoursite.com\n" +
       "  WP_USERNAME     = your_wp_username\n" +
       "  WP_APP_PASSWORD = Application Password from WP Admin > Users > Profile\n\n" +

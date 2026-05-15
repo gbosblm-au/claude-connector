@@ -1,5 +1,6 @@
 # railway.toml
-# Railway deployment configuration for claude-connector.
+# Railway deployment configuration for claude-connector v10.0.0.
+# Includes the persistent volume required by the integrated Memory MCP.
 # https://railway.app
 
 [build]
@@ -11,6 +12,10 @@ healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+[[volumes]]
+source = "claude-connector-data"
+dest   = "/data"
 
 [[services]]
 name = "claude-connector"

@@ -31,7 +31,7 @@ export const setWordPressCredentialsToolDefinition = {
   description:
     "Stores WordPress connection credentials so Claude can publish articles and pages to your " +
     "WordPress site. Credentials are saved to the connector's data directory and persist for the " +
-    "lifetime of the current deployment. You only need to call this once — credentials are " +
+    "lifetime of the current deployment. You only need to call this once - credentials are " +
     "remembered until you call clear_wordpress_credentials or redeploy the connector.\n\n" +
     "Required: your WordPress site URL, your WordPress username, and an Application Password " +
     "(created in WordPress Admin > Users > Your Profile > Application Passwords).",
@@ -41,7 +41,7 @@ export const setWordPressCredentialsToolDefinition = {
       wp_url: {
         type: "string",
         description:
-          "Your WordPress site URL, e.g. https://yoursite.com — include the protocol, no trailing slash.",
+          "Your WordPress site URL, e.g. https://yoursite.com - include the protocol, no trailing slash.",
       },
       wp_username: {
         type: "string",
@@ -63,7 +63,7 @@ export const setWordPressCredentialsToolDefinition = {
 export const getWordPressCredentialsToolDefinition = {
   name: "get_wordpress_credentials",
   description:
-    "Returns the current WordPress connection status — whether credentials are configured, " +
+    "Returns the current WordPress connection status - whether credentials are configured, " +
     "where they came from (runtime store vs Railway environment variables), and the site URL. " +
     "Passwords are never shown. Call this to confirm WordPress is ready before publishing.",
   inputSchema: { type: "object", properties: {}, required: [] },
@@ -114,7 +114,7 @@ export const setLinkedInCredentialsToolDefinition = {
 export const getLinkedInCredentialsToolDefinition = {
   name: "get_linkedin_credentials",
   description:
-    "Returns the current LinkedIn OAuth configuration status — whether credentials are set, " +
+    "Returns the current LinkedIn OAuth configuration status - whether credentials are set, " +
     "where they came from, and the client ID. The client secret is never shown. " +
     "Call this to confirm LinkedIn OAuth is configured before calling linkedin_start_oauth.",
   inputSchema: { type: "object", properties: {}, required: [] },
@@ -148,7 +148,7 @@ export async function handleSetWordPressCredentials(args) {
       "===========================",
       `Site URL:  ${status.wp_url}`,
       `Username:  ${status.wp_username}`,
-      `Password:  [stored securely — not displayed]`,
+      `Password:  [stored securely - not displayed]`,
       `Source:    ${status.source}`,
       "",
       "WordPress connection is now configured.",
@@ -180,7 +180,7 @@ export async function handleGetWordPressCredentials(_args) {
     if (status.configured) {
       lines.push(`Site URL:   ${status.wp_url}`);
       lines.push(`Username:   ${status.wp_username}`);
-      lines.push(`Password:   [stored — not shown]`);
+      lines.push(`Password:   [stored - not shown]`);
       lines.push("");
       lines.push("Call wordpress_site_info to test the live connection.");
     } else {
@@ -243,7 +243,7 @@ export async function handleSetLinkedInCredentials(args) {
       "LinkedIn Credentials Saved",
       "==========================",
       `Client ID:    ${status.client_id}`,
-      `Client Secret:[stored securely — not displayed]`,
+      `Client Secret:[stored securely - not displayed]`,
       `Redirect URI: ${status.redirect_uri}`,
       `Source:       ${status.source}`,
       "",
@@ -276,7 +276,7 @@ export async function handleGetLinkedInCredentials(_args) {
     if (status.configured) {
       lines.push(`Client ID:    ${status.client_id}`);
       lines.push(`Redirect URI: ${status.redirect_uri}`);
-      lines.push(`Client Secret:[stored — not shown]`);
+      lines.push(`Client Secret:[stored - not shown]`);
       lines.push("");
       lines.push("Call linkedin_start_oauth to begin the OAuth authorization flow.");
     } else {

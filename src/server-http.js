@@ -1,8 +1,15 @@
-// src/server-http.js  v9.0.0
+// src/server-http.js  v10.0.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
-// v9.0.0 (major release): Consolidated former stats-connector (data-analysis)
-// into claude-connector. All previous claude-connector v8.0.0 capabilities are
+// v10.0.0 (major release): Integrates the TrueSource Persistent Memory MCP
+// (six memory_* tools) directly into the connector. Memory storage uses
+// SQLite + FTS5 on the Railway persistent volume mounted at /data. The
+// memory subsystem is gated by MEMORY_AUTH_TOKEN: when set, the six memory
+// tools are advertised and routed; when unset, those tools are omitted from
+// the tool list and the rest of the connector continues to function unchanged.
+//
+// v9.0.0: Consolidated former stats-connector (data-analysis) into
+// claude-connector. All previous claude-connector v8.0.0 capabilities are
 // preserved. Adds 35 statistical / machine-learning tools (data_*, stats_*,
 // ts_*, ml_*, plus stats_help). Express body limit raised to 50mb to support
 // inline-data dataset loading.
@@ -223,6 +230,16 @@ import {
   handleEmailReplyCheck,
 } from "./tools/emailTracking.js";
 
+// ---------- v10.0.0: Persistent Memory MCP integration ----------
+import {
+  ALL_MEMORY_TOOL_DEFINITIONS,
+  MEMORY_TOOL_NAMES,
+  dispatchMemoryTool,
+  initMemorySubsystem,
+  getMemoryHealthSnapshot,
+} from "./tools-memory/index.js";
+import { adminDumpHandler as memoryAdminDumpHandler } from "./tools-memory/admin.js";
+
 // ---------- v9.0.0: Statistical analysis & machine learning ----------
 import {
   dataLoadToolDefinition, dataInfoToolDefinition, dataPreviewToolDefinition,
@@ -276,6 +293,26 @@ import { config } from "./config.js";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
+const MEMORY_AUTH_TOKEN = process.env.MEMORY_AUTH_TOKEN || "";
+const MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN);
+
+// Initialise the persistent memory subsystem when configured.
+// Skipping init keeps the connector usable in environments that have not yet
+// provisioned the /data volume.
+if (MEMORY_ENABLED) {
+  try {
+    initMemorySubsystem();
+    log("info", "[memory] subsystem ENABLED");
+  } catch (err) {
+    log("error", `[memory] subsystem failed to initialise: ${err.message}`);
+  }
+} else {
+  log(
+    "warn",
+    "[memory] MEMORY_AUTH_TOKEN not set - memory_* tools disabled. " +
+      "Generate one with: node -e \"console.log(require('crypto').randomBytes(36).toString('hex'))\"",
+  );
+}
 
 // -----------------------------------------------------------------------
 // Tool registry
@@ -423,6 +460,11 @@ const TOOLS = [
     description: "Returns the current UTC date and time.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
+
+  // ---------- Persistent Memory MCP (v10.0.0) ----------
+  // Only advertised when MEMORY_AUTH_TOKEN is configured so Claude does not
+  // see tools that will always return MEMORY_DISABLED in a misconfigured env.
+  ...(MEMORY_ENABLED ? ALL_MEMORY_TOOL_DEFINITIONS : []),
 ];
 
 // -----------------------------------------------------------------------
@@ -430,7 +472,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "9.0.0" },
+    { name: "claude-connector", version: "10.0.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -570,7 +612,31 @@ function createMcpServer() {
 
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
+
         default:
+          // ---------- v10.0.0: Persistent Memory MCP ----------
+          if (MEMORY_TOOL_NAMES.has(name)) {
+            if (!MEMORY_ENABLED) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      {
+                        error:
+                          "Memory subsystem is disabled. Set MEMORY_AUTH_TOKEN in Railway Variables to enable.",
+                        code: "MEMORY_DISABLED",
+                      },
+                      null,
+                      2,
+                    ),
+                  },
+                ],
+                isError: true,
+              };
+            }
+            return await dispatchMemoryTool(name, args);
+          }
           throw new Error(`Unknown tool: "${name}"`);
       }
     } catch (err) {
@@ -664,10 +730,14 @@ app.use((req, res, next) => {
 // Health
 // -----------------------------------------------------------------------
 app.get("/health", (_req, res) => {
+  const memorySnapshot = MEMORY_ENABLED
+    ? getMemoryHealthSnapshot()
+    : { enabled: false };
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "9.0.0",
+    version: "10.0.0",
+    memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
@@ -683,6 +753,29 @@ app.get("/health", (_req, res) => {
     webhookEnabled: true,
     timestamp: new Date().toISOString(),
   });
+});
+
+// -----------------------------------------------------------------------
+// v10.0.0: Persistent Memory admin export
+// GET /memory/admin/dump - protected full corpus export (bearer required).
+// Returns 404 when the memory subsystem is disabled.
+// -----------------------------------------------------------------------
+app.get("/memory/admin/dump", (req, res) => {
+  if (!MEMORY_ENABLED) {
+    res.status(404).json({ error: "Memory subsystem is not enabled." });
+    return;
+  }
+  const header = req.headers["authorization"] || "";
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  const supplied = match ? match[1].trim() : "";
+  if (!supplied || supplied !== MEMORY_AUTH_TOKEN) {
+    res.status(401).json({
+      error: "Authorization header missing or invalid.",
+      code: "AUTH_REQUIRED",
+    });
+    return;
+  }
+  memoryAdminDumpHandler(req, res);
 });
 
 // -----------------------------------------------------------------------
@@ -1011,7 +1104,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v9.0.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v10.0.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1025,6 +1118,11 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `Webhook receiver: POST /webhook | Secret: ${config.webhookSecret ? "CONFIGURED" : "OPEN (set WEBHOOK_SECRET)"}`);
   log("info", `Web page fetch: ENABLED (web_fetch_page)`);
   log("info", `Drive overwrite: google_drive_overwrite_file | Legacy google_drive_upload: REMOVED`);
+
+  log(
+    "info",
+    `Memory MCP: ${MEMORY_ENABLED ? "ENABLED" : "disabled (set MEMORY_AUTH_TOKEN to enable)"}`,
+  );
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
   try {

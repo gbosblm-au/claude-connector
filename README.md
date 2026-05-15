@@ -1,6 +1,6 @@
 # claude-connector
 
-**Version 9.0.0** — A fully functional **MCP (Model Context Protocol) server** that gives Claude real-time web/news search, LinkedIn lookup, TrueSource outreach email send / tracking / scheduling, Google Drive / Calendar / Sheets, Slack / Teams messaging, inbound webhooks, WordPress publishing, image search / download, psychology assessment, **plus a complete in-memory statistical analysis & machine-learning toolkit** (descriptive stats, hypothesis tests, regression, time-series, clustering, PCA, KNN, anomaly detection — 99 tools total).
+**Version 9.0.0** - A fully functional **MCP (Model Context Protocol) server** that gives Claude real-time web/news search, LinkedIn lookup, TrueSource outreach email send / tracking / scheduling, Google Drive / Calendar / Sheets, Slack / Teams messaging, inbound webhooks, WordPress publishing, image search / download, psychology assessment, **plus a complete in-memory statistical analysis & machine-learning toolkit** (descriptive stats, hypothesis tests, regression, time-series, clustering, PCA, KNN, anomaly detection - 99 tools total).
 
 | Category | Sample tools |
 |---|---|
@@ -28,7 +28,7 @@
 
 ## What's New in v9.0.0 (Major Release)
 
-v9.0.0 consolidates the former **stats-connector / data-analysis** MCP into claude-connector with **zero loss of functionality** from either side. All 67 v8.0.0 tools, transports, and HTTP endpoints are preserved verbatim — 32 statistical & ML tools (plus `stats_help`) are added on top.
+v9.0.0 consolidates the former **stats-connector / data-analysis** MCP into claude-connector with **zero loss of functionality** from either side. All 67 v8.0.0 tools, transports, and HTTP endpoints are preserved verbatim - 32 statistical & ML tools (plus `stats_help`) are added on top.
 
 - New `src/tools-stats/` directory with 6 modules covering data management, descriptive stats, hypothesis testing, regression / correlation, time series, and machine learning.
 - New `src/store/dataStore.js` providing an in-memory dataset registry (max 20 datasets, up to 2 M rows each, automatic column-type inference).
@@ -53,17 +53,17 @@ See `GOOGLE-DRIVE-SETUP.md` for the Drive setup and usage guide.
 
 ## What's New in v5.0.0
 
-- **`wordpress_set_seo_meta`** — Sets Yoast SEO and RankMath meta title and description on any page or post directly from Claude. Validates character length and provides feedback.
-- **`wordpress_create_service_page`** — Creates a fully structured, brand-consistent TrueSource service page with hero, intro section, outcomes list, capabilities grid, FAQs, and CTA. Output is Elementor-compatible HTML. Accepts `custom_css_overrides` for page-specific style adjustments.
-- **Market Intelligence and Service Page Publisher skill** — See `SKILL-market-intelligence-publisher.md`. Orchestrates the full workflow: website analysis, competitor research, gap identification, service page drafting, publishing, SEO meta tagging, and navigation menu update.
-- **Backward compatible** — All v4 tools continue to work unchanged.
+- **`wordpress_set_seo_meta`** - Sets Yoast SEO and RankMath meta title and description on any page or post directly from Claude. Validates character length and provides feedback.
+- **`wordpress_create_service_page`** - Creates a fully structured, brand-consistent TrueSource service page with hero, intro section, outcomes list, capabilities grid, FAQs, and CTA. Output is Elementor-compatible HTML. Accepts `custom_css_overrides` for page-specific style adjustments.
+- **Market Intelligence and Service Page Publisher skill** - See `SKILL-market-intelligence-publisher.md`. Orchestrates the full workflow: website analysis, competitor research, gap identification, service page drafting, publishing, SEO meta tagging, and navigation menu update.
+- **Backward compatible** - All v4 tools continue to work unchanged.
 
 ## What's New in v4.0.0
 
-- **Runtime credential management** — Set WordPress and LinkedIn credentials directly from the Claude chat window using new MCP tools. No Railway dashboard required after initial deployment.
-- **Auto WordPress publish prompt** — The TrueSource Article Writer skill now asks after every article whether to publish to WordPress as a post or page with menu item.
-- **Credential persistence** — Credentials are stored to `./data/credentials.json`. Add a Railway Volume at `/app/data` for persistence across redeployments.
-- **Backward compatible** — Existing Railway environment variables continue to work as fallback credentials.
+- **Runtime credential management** - Set WordPress and LinkedIn credentials directly from the Claude chat window using new MCP tools. No Railway dashboard required after initial deployment.
+- **Auto WordPress publish prompt** - The TrueSource Article Writer skill now asks after every article whether to publish to WordPress as a post or page with menu item.
+- **Credential persistence** - Credentials are stored to `./data/credentials.json`. Add a Railway Volume at `/app/data` for persistence across redeployments.
+- **Backward compatible** - Existing Railway environment variables continue to work as fallback credentials.
 
 See `USER-GUIDE.md` for full setup and usage instructions.
 

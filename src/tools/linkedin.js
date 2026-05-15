@@ -326,7 +326,7 @@ export async function handleLinkedinSearch(args) {
 
   const paginationInfo =
     totalMatches > limit
-      ? `\nShowing ${start + 1}–${start + paginated.length} of ${totalMatches} matches. ` +
+      ? `\nShowing ${start + 1}-${start + paginated.length} of ${totalMatches} matches. ` +
         `Use page=${page + 1} to see more.`
       : "";
 

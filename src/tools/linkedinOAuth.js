@@ -89,7 +89,7 @@ export const linkedinLiveProfileToolDefinition = {
 export async function handleLinkedinOAuthStart(_args) {
   // Credential resolution order:
   //   1. Runtime credentials stored via set_linkedin_credentials MCP tool
-  //   2. Environment variables (LINKEDIN_CLIENT_ID, etc.) — Railway
+  //   2. Environment variables (LINKEDIN_CLIENT_ID, etc.) - Railway
   const { clientId, clientSecret: _secret, redirectUri } = getLinkedInCredentials();
 
   if (!clientId) {
@@ -99,11 +99,11 @@ export async function handleLinkedinOAuthStart(_args) {
           type: "text",
           text:
             "LinkedIn OAuth is not configured.\n\n" +
-            "Option 1 — Set credentials from Claude (recommended):\n" +
+            "Option 1 - Set credentials from Claude (recommended):\n" +
             "  Call set_linkedin_credentials with:\n" +
             "    linkedin_client_id:     your_client_id\n" +
             "    linkedin_client_secret: your_client_secret\n\n" +
-            "Option 2 — Set Railway environment variables:\n" +
+            "Option 2 - Set Railway environment variables:\n" +
             "  LINKEDIN_CLIENT_ID     = your_client_id\n" +
             "  LINKEDIN_CLIENT_SECRET = your_client_secret\n" +
             `  LINKEDIN_REDIRECT_URI  = ${redirectUri}\n\n` +

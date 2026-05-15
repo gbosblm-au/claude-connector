@@ -49,7 +49,7 @@ export const imageDownloadToolDefinition = {
       image_url: {
         type: "string",
         description:
-          "Direct URL of the image to download. Can be any URL — " +
+          "Direct URL of the image to download. Can be any URL - " +
           "Pexels src URL, Unsplash photo URL, or any publicly accessible image URL. " +
           "If provided, 'provider' and 'photo_id' are ignored.",
       },
@@ -70,10 +70,10 @@ export const imageDownloadToolDefinition = {
         type: "string",
         description:
           "Image quality/size to download. " +
-          "'original' — full resolution (largest file). " +
-          "'large' — large size suitable for hero images (~1920px wide). " +
-          "'medium' — medium size suitable for blog content (~1280px wide). " +
-          "'small' — small/thumbnail size. " +
+          "'original' - full resolution (largest file). " +
+          "'large' - large size suitable for hero images (~1920px wide). " +
+          "'medium' - medium size suitable for blog content (~1280px wide). " +
+          "'small' - small/thumbnail size. " +
           "Defaults to 'large'.",
         enum: ["original", "large", "medium", "small"],
       },
@@ -444,8 +444,8 @@ export async function handleImageDownload(args) {
     `Attribution: Photo by ${photographer || "Unknown"} on ${provider === "pexels" ? "Pexels" : "Unsplash"}`,
     ``,
     "Next steps:",
-    "  • wordpress_upload_media — upload this image to WordPress Media Library",
-    "  • google_drive_upload — save this image to Google Drive",
+    "  • wordpress_upload_media - upload this image to WordPress Media Library",
+    "  • google_drive_upload - save this image to Google Drive",
   ].filter(Boolean).join("\n");
 
   return { content: [{ type: "text", text: lines }] };
@@ -535,8 +535,8 @@ export async function handleImageSearchDownload(args) {
     `Attribution: Photo by ${chosen.photographer || "Unknown"} on ${useProvider === "pexels" ? "Pexels" : "Unsplash"}`,
     ``,
     "Next steps:",
-    "  • wordpress_upload_media — upload this image to WordPress Media Library",
-    "  • google_drive_upload — save this image to Google Drive",
+    "  • wordpress_upload_media - upload this image to WordPress Media Library",
+    "  • google_drive_upload - save this image to Google Drive",
     results.length > 1 ? `  • Re-run with result_index: ${idx + 1} to try the next result` : null,
   ].filter(Boolean).join("\n");
 

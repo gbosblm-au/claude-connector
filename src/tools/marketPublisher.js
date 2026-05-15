@@ -3,8 +3,8 @@
 // WordPress SEO meta and Elementor-compatible page publishing tools.
 //
 // These tools extend the core wordpress.js tools with:
-//   1. wordpress_set_seo_meta  — writes Yoast SEO / RankMath meta on any post/page
-//   2. wordpress_create_service_page — creates a fully-structured HTML service page
+//   1. wordpress_set_seo_meta  - writes Yoast SEO / RankMath meta on any post/page
+//   2. wordpress_create_service_page - creates a fully-structured HTML service page
 //      in the TrueSource brand style (CSS class names match the attached stylesheet)
 //      and publishes it via the REST API as Elementor-compatible HTML content.
 //
@@ -150,7 +150,7 @@ export async function handleWpSetSeoMeta(args) {
     // Some hardened WordPress configs disallow unknown meta via REST.
     // In that case, report the limitation and what the user should do manually.
     const lines = [
-      "SEO Meta — Manual Setup Required",
+      "SEO Meta - Manual Setup Required",
       "=================================",
       `Could not set meta via REST API: ${err.message}`,
       "",
@@ -186,14 +186,14 @@ export async function handleWpSetSeoMeta(args) {
       (args.seo_title.length >= 50 && args.seo_title.length <= 60
         ? "GOOD (50-60 chars)"
         : args.seo_title.length < 50
-        ? "SHORT — consider expanding to 50+ chars"
-        : "LONG — consider trimming to under 60 chars"),
+        ? "SHORT - consider expanding to 50+ chars"
+        : "LONG - consider trimming to under 60 chars"),
     "Description length check: " +
       (args.meta_description.length >= 140 && args.meta_description.length <= 160
         ? "GOOD (140-160 chars)"
         : args.meta_description.length < 140
-        ? "SHORT — consider expanding to 140+ chars"
-        : "LONG — consider trimming to under 160 chars"),
+        ? "SHORT - consider expanding to 140+ chars"
+        : "LONG - consider trimming to under 160 chars"),
   ]
     .filter(Boolean)
     .join("\n");
@@ -401,7 +401,7 @@ ${args.outcomes
 </div>`
     : "";
 
-  // Intro body — wrap plain text paragraphs if not already HTML
+  // Intro body - wrap plain text paragraphs if not already HTML
   const introBodyHtml = args.intro_body.includes("<p")
     ? args.intro_body
     : args.intro_body
@@ -537,7 +537,7 @@ ${ctaSecondary}
 
   if (args.parent_id) payload.parent = args.parent_id;
 
-  // Elementor meta — set _elementor_data and mark as Elementor-built
+  // Elementor meta - set _elementor_data and mark as Elementor-built
   payload.meta = {
     _elementor_data: elementorData,
     _elementor_edit_mode: "builder",
