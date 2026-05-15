@@ -1,5 +1,101 @@
 # Claude Connector - Changelog
 
+## v10.0.5 - Three-tier associative conversation retrieval
+
+**Release date**: 15 May 2026
+
+### Added
+
+* **Three-tier associative retrieval in `memory_get_session_context`**. Conversation
+  recall now emulates human associative memory rather than a single-mode search. When
+  `context_hint` is supplied, retrieval runs three tiers in sequence:
+
+  * **Tier 1 - Exact**: FTS5 AND match. All context_hint tokens must appear in the
+    document. Highest confidence. Direct vocabulary overlap with the query.
+  * **Tier 2 - Related**: FTS5 OR match. Any context_hint token surfaces a document.
+    Semantic proximity. Conversations with partial vocabulary overlap are ranked by BM25.
+  * **Tier 3 - Associative**: Tag-web search. Extracts meaningful tags from Tier 1+2
+    results (excluding noise tags such as month-year slugs and "ava") and searches for
+    OTHER conversations that share any of those tags. Surfaces thematically connected
+    conversations that share zero vocabulary with the original context_hint. This is the
+    "web of memory" layer: the conversations a person would mentally group with the current
+    topic even when the opening question uses completely different wording.
+
+  Results are merged in tier-priority order (Tier 1 first claim, Tier 2 fills remainder,
+  Tier 3 fills what remains) up to `conversations_limit`.
+
+* **`retrieval_tier` field on every conversation entry**. Each entry in the
+  `context.conversations` array now carries `retrieval_tier`: one of `"exact"`,
+  `"related"`, `"associative"`, or `"recency"` (zero-results fallback). Callers weight
+  context proportionally: exact = full weight, related = moderate, associative = background
+  context with thematic overlap check, recency = general context not topic-specific.
+
+* **`conversations_tiers` summary in response**. A new top-level field
+  `conversations_tiers: { exact, related, associative, recency }` provides a count
+  breakdown per tier for audit and observability. Present only when `context_hint` was
+  supplied; `null` otherwise.
+
+* **`conversations_mode` updated to `"associative"`** when `context_hint` is supplied
+  (previously `"relevance"`), reflecting the expanded multi-tier behaviour.
+
+* **`extractTagTerms()` helper**. Extracts meaningful tag terms from DB rows for Tier 3
+  seeding. Filters noise tags via `NOISE_TAG_PATTERNS` regex array (month-year slugs,
+  "real-mode", "ava") to prevent false-positive flood in Tier 3 results.
+
+* **`runConvFts()` helper**. Shared FTS5 conversation query function used across all
+  three tiers. Overfetches to absorb JS-side exclusion filtering; errors are caught and
+  empty arrays returned so tiers degrade gracefully rather than throwing.
+
+* **`{ useOr }` option on `safeFtsQuery`** (carried forward from v10.0.4 and formalised
+  in the internal API). Tier 1 uses AND mode; Tiers 2 and 3 use OR mode.
+
+### Changed
+
+* `recencySql` extracted to a named constant shared across all fallback paths.
+* `runConvFts()` overfetches by `excludeIds.size + 5` and filters in JS; the prepared
+  statement has no dynamic NOT IN clause, avoiding statement-reuse issues with
+  variable-length exclusion sets.
+
+### Fixed
+
+* Zero-results fallback (from v10.0.4) is now a formally named path within the
+  three-tier system rather than an ad-hoc check.
+
+---
+
+## v10.0.4 - FTS5 context_hint OR-mode and zero-results fallback
+
+**Release date**: 15 May 2026
+
+### Bug Fixes
+
+* **FTS5 AND-logic bug in `memory_get_session_context`** (critical). The `safeFtsQuery` helper
+  was wrapping each `context_hint` token in double quotes and joining them with a space, which
+  produces an implicit AND in SQLite FTS5. This meant ALL tokens in the hint had to appear in
+  the same conversation document for it to be returned. For a hint like
+  `"consciousness transfer synthetic body robots AI"`, no stored conversation contained all six
+  terms simultaneously, so the query returned zero results even when highly relevant conversations
+  existed. Fixed by adding a `{ useOr }` option to `safeFtsQuery`: the context_hint path now
+  calls `safeFtsQuery(hint, { useOr: true })` which joins tokens with ` OR `, so any matching
+  token surfaces a document and BM25 ranks by total relevance. The existing AND behaviour is
+  preserved for `memory_search` where precise multi-token matching is correct.
+
+* **Zero-results fallback missing in `memory_get_session_context`** (high). When FTS5 succeeded
+  but returned no results (e.g. first conversation on a new topic whose tokens don't yet exist
+  in memory), the function returned an empty `conversations` array rather than falling back to
+  recency. Added an explicit length check after the FTS5 call: if `convRows.length === 0`, the
+  handler re-queries using the recency path before continuing. This ensures the caller always
+  receives the most recent conversations as a safety net, regardless of context_hint match quality.
+
+### Changed
+
+* `safeFtsQuery` signature updated from `safeFtsQuery(raw)` to `safeFtsQuery(raw, { useOr = false } = {})`.
+  Existing callers with no second argument are unaffected (AND mode is the default).
+* `recencyQuery` extracted to a named constant shared by the no-hint path, the exception handler,
+  and the zero-results fallback to eliminate query string duplication.
+
+---
+
 ## v10.0.3 - Conversations category and context-aware session retrieval
 
 **Release date**: 15 May 2026
