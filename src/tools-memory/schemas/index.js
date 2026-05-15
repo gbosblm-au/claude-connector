@@ -1,10 +1,17 @@
 // src/schemas/index.js
 // Zod schemas for all six MCP tool input contracts.
 // Mirrors TDD Section 6 (MCP Tool Specification) field-for-field.
+//
+// v10.0.3 changes:
+//   - Added "conversations" to CATEGORY_ENUM for per-conversation episodic storage.
+//   - Updated memorySessionContextSchema to accept optional context_hint string.
+//     When supplied, memory_get_session_context runs an FTS5 relevance search
+//     over the conversations category instead of a recency sort.
 
 import { z } from "zod";
 
 // Allowed category enum, per TDD Section 5.4.
+// "conversations" is the episodic store for per-conversation records.
 export const CATEGORY_ENUM = [
   "projects",
   "skills",
@@ -12,6 +19,7 @@ export const CATEGORY_ENUM = [
   "contacts",
   "facts",
   "session",
+  "conversations",
 ];
 
 export const categorySchema = z.enum(CATEGORY_ENUM);
@@ -92,6 +100,19 @@ export const memoryListSchema = z
 
 // -----------------------------------------------------------------------
 // 6.6 memory_get_session_context
-// Accepts no parameters in v1.0.
+//
+// context_hint (optional): a short phrase describing the current topic or
+// task. When supplied, the handler runs an FTS5 relevance search over the
+// conversations category and returns the top matches instead of the
+// most-recent-N recency sort. This enables ambient surfacing of relevant
+// prior conversations without requiring Claude to know which keys to look up.
+//
+// conversations_limit (optional): maximum number of conversation entries to
+// return. Defaults to 5. Applies to both recency and relevance modes.
 // -----------------------------------------------------------------------
-export const memorySessionContextSchema = z.object({}).strict();
+export const memorySessionContextSchema = z
+  .object({
+    context_hint: z.string().max(512).optional().nullable(),
+    conversations_limit: z.number().int().min(1).max(20).default(5).optional(),
+  })
+  .strict();

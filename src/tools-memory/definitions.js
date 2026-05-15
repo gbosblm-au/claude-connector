@@ -1,7 +1,12 @@
-// src/tools/definitions.js
+// src/tools-memory/definitions.js
 // MCP tool descriptors. These are returned from ListToolsRequestSchema and
 // drive Claude's tool-call UI. Descriptions are deliberately verbose so
 // Claude reliably picks the correct tool from natural language.
+//
+// v10.0.3 changes:
+//   - Added "conversations" to all category enum arrays.
+//   - Updated memory_get_session_context definition: inputSchema now accepts
+//     context_hint and conversations_limit; description updated accordingly.
 
 export const memoryWriteToolDefinition = {
   name: "memory_write",
@@ -16,7 +21,7 @@ export const memoryWriteToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
         description: "Memory bucket. Choose the most specific match.",
       },
       key: {
@@ -63,7 +68,7 @@ export const memoryReadToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
       },
       key: { type: "string", maxLength: 256 },
       tags: { type: "array", items: { type: "string" } },
@@ -88,7 +93,7 @@ export const memorySearchToolDefinition = {
       },
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
       },
       limit: { type: "number", minimum: 1, maximum: 50, default: 10 },
     },
@@ -106,7 +111,7 @@ export const memoryDeleteToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
       },
       key: { type: "string", maxLength: 256 },
     },
@@ -125,7 +130,7 @@ export const memoryListToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
       },
       include_value: { type: "boolean", default: false },
     },
@@ -137,9 +142,36 @@ export const memoryGetSessionContextToolDefinition = {
   description:
     "Session initialisation tool. Returns a curated context bundle: all entries from projects, " +
     "preferences, and facts; the 20 most-recently-updated skills; the 10 most-recently-updated contacts; " +
-    "and the 5 most-recent session entries. Expired entries are excluded. Call this at the start of any " +
-    "skill or task that has a memory dependency so prior state is loaded before substantive work begins.",
-  inputSchema: { type: "object", properties: {} },
+    "the 5 most-recent session entries; and up to conversations_limit conversation entries (default 5). " +
+    "Expired entries are excluded. " +
+    "Accepts two optional parameters: " +
+    "(1) context_hint - a short phrase describing the current topic or task. When supplied, the handler " +
+    "runs an FTS5 relevance search over the conversations category and returns the most topically relevant " +
+    "prior conversations instead of the most-recent-N recency sort. Pass this whenever there is an active " +
+    "topic so that relevant past work is surfaced automatically. " +
+    "(2) conversations_limit - maximum number of conversation entries to include (1-20, default 5). " +
+    "Call this at the start of any skill or task that has a memory dependency so prior state is loaded " +
+    "before substantive work begins.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      context_hint: {
+        type: "string",
+        maxLength: 512,
+        description:
+          "Optional short phrase describing the current topic or task. When provided, triggers " +
+          "FTS5 relevance ranking for the conversations category instead of recency ordering.",
+      },
+      conversations_limit: {
+        type: "number",
+        minimum: 1,
+        maximum: 20,
+        default: 5,
+        description:
+          "Maximum number of conversation entries to return (default 5, max 20).",
+      },
+    },
+  },
 };
 
 export const ALL_MEMORY_TOOL_DEFINITIONS = [

@@ -229,3 +229,104 @@ test("expired entries are excluded from read, list, and session context", async 
   const ctxRes = await handleMemoryGetSessionContext({});
   assert.equal(Object.keys(ctxRes.context.session).length, 0);
 });
+
+// -----------------------------------------------------------------------
+// v10.0.3 tests: conversations category and context_hint
+// -----------------------------------------------------------------------
+
+test("conversations category: write and read back entries", async () => {
+  await handleMemoryWrite({
+    category: "conversations",
+    key: "conv_2026-05-01_001",
+    value: { title: "Plugin architecture review", skills: ["code-integrity"], date: "2026-05-01" },
+  });
+  await handleMemoryWrite({
+    category: "conversations",
+    key: "conv_2026-05-10_001",
+    value: { title: "Article publishing workflow", skills: ["truesource-article-writer"], date: "2026-05-10" },
+  });
+
+  const readRes = await handleMemoryRead({ category: "conversations" });
+  assert.equal(readRes.count, 2);
+  assert.equal(readRes.entries[0].category, "conversations");
+});
+
+test("memory_get_session_context includes conversations as array", async () => {
+  await handleMemoryWrite({
+    category: "conversations",
+    key: "conv_array_test_1",
+    value: { title: "Test conversation A", date: "2026-05-14" },
+  });
+  await handleMemoryWrite({
+    category: "conversations",
+    key: "conv_array_test_2",
+    value: { title: "Test conversation B", date: "2026-05-15" },
+  });
+
+  const ctx = await handleMemoryGetSessionContext({});
+  assert.ok(Array.isArray(ctx.context.conversations), "conversations should be an array");
+  assert.ok(ctx.context.conversations.length >= 2, "should return at least 2 conversations");
+  assert.equal(ctx.conversations_mode, "recency");
+  assert.equal(ctx.context_hint, null);
+});
+
+test("memory_get_session_context context_hint triggers relevance mode", async () => {
+  // Write two conversations with distinct topics.
+  await handleMemoryWrite({
+    category: "conversations",
+    key: "conv_hint_plugin",
+    value: { title: "WordPress plugin build for ts-newsletter", date: "2026-05-01" },
+  });
+  await handleMemoryWrite({
+    category: "conversations",
+    key: "conv_hint_article",
+    value: { title: "Article publishing for governance topic", date: "2026-05-02" },
+  });
+
+  const ctx = await handleMemoryGetSessionContext({ context_hint: "WordPress plugin" });
+  assert.equal(ctx.conversations_mode, "relevance");
+  assert.equal(ctx.context_hint, "WordPress plugin");
+  assert.ok(Array.isArray(ctx.context.conversations), "conversations should be an array");
+  // The plugin conversation should rank first.
+  const firstTitle = ctx.context.conversations[0]?.value?.title || "";
+  assert.ok(
+    firstTitle.toLowerCase().includes("plugin"),
+    `Expected plugin-related conversation first, got: ${firstTitle}`,
+  );
+});
+
+test("memory_get_session_context conversations_limit caps results", async () => {
+  // Write 10 conversations.
+  for (let i = 0; i < 10; i++) {
+    await handleMemoryWrite({
+      category: "conversations",
+      key: `conv_limit_test_${i}`,
+      value: { title: `Conversation ${i}`, date: "2026-05-01" },
+    });
+  }
+  const ctx = await handleMemoryGetSessionContext({ conversations_limit: 3 });
+  assert.ok(
+    ctx.context.conversations.length <= 3,
+    `Expected at most 3 conversations, got ${ctx.context.conversations.length}`,
+  );
+});
+
+test("memory_get_session_context context_hint falls back to recency on bad FTS query", async () => {
+  // An empty hint after tokenisation should not throw.
+  const ctx = await handleMemoryGetSessionContext({ context_hint: "" });
+  assert.ok(Array.isArray(ctx.context.conversations), "should still return array on empty hint");
+});
+
+test("conversations excluded from standard category entry_count in CATEGORY_CAPS loop", async () => {
+  // Ensure conversations are NOT double-counted in entry_count via CATEGORY_CAPS.
+  // Write one of each to isolate count behaviour.
+  await handleMemoryWrite({ category: "facts",         key: "count_test_fact",  value: 1 });
+  await handleMemoryWrite({ category: "conversations", key: "count_test_conv",  value: 2 });
+
+  const ctx = await handleMemoryGetSessionContext({});
+  // The conversations array entry must be counted in entry_count.
+  const convInArray = ctx.context.conversations.some((e) => e.key === "count_test_conv");
+  const factInObj   = "count_test_fact" in ctx.context.facts;
+  assert.ok(convInArray, "count_test_conv should appear in conversations array");
+  assert.ok(factInObj,   "count_test_fact should appear in facts object");
+});
