@@ -29,6 +29,9 @@ export const config = {
   braveApiKey: process.env.BRAVE_API_KEY || "",
   tavilyApiKey: process.env.TAVILY_API_KEY || "",
   newsApiKey: process.env.NEWS_API_KEY || "",
+  // Serper Google Search API - used as automatic fallback when Brave fails.
+  // Get a free key (2,500 queries/month) at: https://serper.dev
+  serperApiKey: process.env.SERPER_API_KEY || "",
 
   // API keys - image search
   // Pexels: https://www.pexels.com/api/

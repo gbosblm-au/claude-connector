@@ -1,6 +1,13 @@
 // tools/newsSearch.js
 // Supports two news backends: Brave News Search API and NewsAPI.org.
 // Configured via NEWS_PROVIDER env var ("brave" or "newsapi").
+//
+// Brave fallback: when NEWS_PROVIDER=brave (the default) and Brave fails for
+// any reason (missing key, 401, 429, network error), the connector will
+// automatically retry the same query against the Serper Google News API
+// provided SERPER_API_KEY is set in the environment. If SERPER_API_KEY is not
+// set, the original Brave error is re-thrown unchanged. The NewsAPI path is
+// completely unaffected by this change.
 
 import { config, requireBraveKey, requireNewsApiKey } from "../config.js";
 import { clamp, truncate } from "../utils/helpers.js";
@@ -126,7 +133,7 @@ async function braveNewsSearch(query, numResults, freshness, language, fromDate,
 }
 
 // -----------------------------------------------------------------------
-// NewsAPI implementation
+// NewsAPI implementation (unchanged)
 // -----------------------------------------------------------------------
 
 async function newsApiSearch(query, numResults, language, fromDate, toDate, sortBy) {
@@ -176,6 +183,60 @@ async function newsApiSearch(query, numResults, language, fromDate, toDate, sort
 }
 
 // -----------------------------------------------------------------------
+// Serper Google News fallback implementation
+//
+// Called automatically when Brave News fails and SERPER_API_KEY is configured.
+// Endpoint: POST https://google.serper.dev/news
+// Auth: X-API-KEY header
+// Note: Serper news does not support language or fine-grained date filtering
+// via this endpoint. Results are inherently recent Google News articles.
+// The freshness param is accepted and logged but Serper returns recent results
+// by default so it provides equivalent recency coverage.
+// -----------------------------------------------------------------------
+
+async function serperNewsSearch(query, numResults, freshness, language) {
+  const body = {
+    q: query,
+    num: numResults,
+  };
+
+  // Serper news accepts hl (host language) as a lowercase two-letter code.
+  if (language) body.hl = language.toLowerCase();
+
+  log("debug", "Serper news search (Brave fallback)", { query, numResults, language, freshness });
+
+  const resp = await fetch("https://google.serper.dev/news", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-KEY": config.serperApiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => "");
+    throw new Error(
+      `Serper News API error ${resp.status}: ${resp.statusText}. ${errBody}`
+    );
+  }
+
+  const data = await resp.json();
+  const news = data?.news || [];
+
+  return news.map((item) => ({
+    title: item.title || "",
+    url: item.link || "",
+    description: truncate(item.snippet || "", 400),
+    publishedAt: item.date || "",
+    source: item.source || "",
+    author: "",
+    thumbnail: item.imageUrl || "",
+    provider: "serper",
+  }));
+}
+
+// -----------------------------------------------------------------------
 // Handler
 // -----------------------------------------------------------------------
 
@@ -196,15 +257,34 @@ export async function handleNewsSearch(args) {
 
   const start = Date.now();
   let articles;
+  // Tracks the provider that actually supplied the results; used in the
+  // summary line so callers can see whether Serper fallback was activated.
+  let newsProviderUsed = config.newsProvider;
 
   if (config.newsProvider === "newsapi") {
     articles = await newsApiSearch(query, numResults, language, fromDate, toDate, sortBy);
   } else {
-    articles = await braveNewsSearch(query, numResults, freshness, language, fromDate, toDate);
+    // Brave path with automatic Serper fallback.
+    try {
+      articles = await braveNewsSearch(query, numResults, freshness, language, fromDate, toDate);
+      newsProviderUsed = "brave";
+    } catch (braveErr) {
+      if (config.serperApiKey) {
+        log(
+          "warn",
+          `Brave news search failed - falling back to Serper. Brave error: ${braveErr.message}`
+        );
+        articles = await serperNewsSearch(query, numResults, freshness, language);
+        newsProviderUsed = "serper";
+      } else {
+        // No Serper key configured - re-throw original Brave error.
+        throw braveErr;
+      }
+    }
   }
 
   const elapsed = Date.now() - start;
-  log("info", `News search completed in ${elapsed}ms, ${articles.length} articles`);
+  log("info", `News search completed in ${elapsed}ms, ${articles.length} articles (provider: ${newsProviderUsed})`);
 
   if (articles.length === 0) {
     return {
@@ -236,7 +316,7 @@ export async function handleNewsSearch(args) {
     : "";
 
   const summary =
-    `News results for "${query}" (${articles.length} articles, provider: ${config.newsProvider}${dateRange}, elapsed: ${elapsed}ms)\n\n${formatted}`;
+    `News results for "${query}" (${articles.length} articles, provider: ${newsProviderUsed}${dateRange}, elapsed: ${elapsed}ms)\n\n${formatted}`;
 
   return { content: [{ type: "text", text: summary }] };
 }

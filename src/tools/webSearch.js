@@ -1,6 +1,13 @@
 // tools/webSearch.js
 // Supports two search backends: Brave Search API and Tavily.
 // Configured via SEARCH_PROVIDER env var ("brave" or "tavily").
+//
+// Brave fallback: when SEARCH_PROVIDER=brave (the default) and Brave fails for
+// any reason (missing key, 401, 429, network error), the connector will
+// automatically retry the same query against the Serper Google Search API
+// provided SERPER_API_KEY is set in the environment. If SERPER_API_KEY is not
+// set, the original Brave error is re-thrown unchanged. The Tavily path is
+// completely unaffected by this change.
 
 import { config, requireBraveKey, requireTavilyKey } from "../config.js";
 import { clamp, truncate } from "../utils/helpers.js";
@@ -54,6 +61,10 @@ export const webSearchToolDefinition = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Brave Search implementation
+// ---------------------------------------------------------------------------
+
 async function braveSearchDetailed(query, numResults, freshness, country) {
   requireBraveKey();
 
@@ -106,6 +117,10 @@ async function braveSearchDetailed(query, numResults, freshness, country) {
     raw: data,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Tavily Search implementation (unchanged)
+// ---------------------------------------------------------------------------
 
 async function tavilySearchDetailed(query, numResults, freshness) {
   requireTavilyKey();
@@ -171,14 +186,128 @@ async function tavilySearchDetailed(query, numResults, freshness) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Serper Google Search fallback implementation
+//
+// Called automatically when Brave fails and SERPER_API_KEY is configured.
+// Serper API docs: https://serper.dev/api-reference
+// Endpoint: POST https://google.serper.dev/search
+// Auth: X-API-KEY header
+// Freshness maps to Serper's tbs (time-based search) parameter.
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps a Brave-style freshness code to the equivalent Serper tbs value.
+ * Returns an empty string when no freshness is requested.
+ * @param {string} freshness - "pd" | "pw" | "pm" | "py" | ""
+ * @returns {string}
+ */
+function freshnessToSerperTbs(freshness) {
+  switch (freshness) {
+    case "pd": return "qdr:d";
+    case "pw": return "qdr:w";
+    case "pm": return "qdr:m";
+    case "py": return "qdr:y";
+    default:   return "";
+  }
+}
+
+async function serperWebSearchDetailed(query, numResults, freshness, country) {
+  const body = {
+    q: query,
+    num: numResults,
+  };
+
+  // Serper accepts gl (geo-location) as a lowercase two-letter country code.
+  if (country) body.gl = country.toLowerCase();
+
+  const tbs = freshnessToSerperTbs(freshness);
+  if (tbs) body.tbs = tbs;
+
+  log("debug", "Serper web search (Brave fallback)", { query, numResults, country, tbs });
+
+  const resp = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-KEY": config.serperApiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => "");
+    throw new Error(
+      `Serper Search API error ${resp.status}: ${resp.statusText}. ${errBody}`
+    );
+  }
+
+  const data = await resp.json();
+  const organic = data?.organic || [];
+
+  const mappedResults = organic.map((result) => ({
+    title: result.title || "",
+    url: result.link || "",
+    description: truncate(result.snippet || "", 500),
+    age: result.date || "",
+    language: "",
+    source: "serper",
+  }));
+
+  return {
+    provider: "serper",
+    results: mappedResults,
+    locations: [],
+    raw: data,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Provider dispatcher
+//
+// Brave is the default. If Brave throws for any reason and SERPER_API_KEY is
+// configured, the same query is retried against Serper. The Tavily path is
+// completely unaffected.
+// ---------------------------------------------------------------------------
+
 async function searchDetailed({ query, numResults, freshness, country }) {
   if (config.searchProvider === "tavily") {
     return tavilySearchDetailed(query, numResults, freshness);
   }
-  return braveSearchDetailed(query, numResults, freshness, country);
+
+  // Brave path with automatic Serper fallback.
+  try {
+    return await braveSearchDetailed(query, numResults, freshness, country);
+  } catch (braveErr) {
+    if (config.serperApiKey) {
+      log(
+        "warn",
+        `Brave web search failed - falling back to Serper. Brave error: ${braveErr.message}`
+      );
+      return await serperWebSearchDetailed(query, numResults, freshness, country);
+    }
+    // No Serper key configured - re-throw original Brave error.
+    throw braveErr;
+  }
 }
 
-function formatWebResults(query, results, elapsed) {
+// ---------------------------------------------------------------------------
+// Output formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Formats web search results into a human-readable string.
+ * @param {string} query       - The original search query.
+ * @param {Array}  results     - Normalised result objects.
+ * @param {number} elapsed     - Milliseconds taken for the search.
+ * @param {string} providerUsed - The provider that actually returned results
+ *   ("brave", "serper", or "tavily"). Falls back to config.searchProvider when
+ *   not supplied so the function remains backward-compatible.
+ * @returns {string}
+ */
+function formatWebResults(query, results, elapsed, providerUsed) {
+  const displayProvider = providerUsed || config.searchProvider;
+
   if (results.length === 0) {
     return `No results found for query: "${query}"`;
   }
@@ -195,8 +324,12 @@ function formatWebResults(query, results, elapsed) {
     })
     .join("\n\n---\n\n");
 
-  return `Web search results for "${query}" (${results.length} results, provider: ${config.searchProvider}, elapsed: ${elapsed}ms)\n\n${formatted}`;
+  return `Web search results for "${query}" (${results.length} results, provider: ${displayProvider}, elapsed: ${elapsed}ms)\n\n${formatted}`;
 }
+
+// ---------------------------------------------------------------------------
+// Main handler (exported)
+// ---------------------------------------------------------------------------
 
 export async function handleWebSearch(args) {
   const query = (args?.query || "").trim();
@@ -247,10 +380,13 @@ export async function handleWebSearch(args) {
   }
 
   const results = primarySearch?.results || [];
+  // Use the provider that actually answered the query (may differ from
+  // config.searchProvider when Serper fallback was activated).
+  const providerUsed = primarySearch?.provider || config.searchProvider;
   const elapsed = Date.now() - start;
-  log("info", `Web search completed in ${elapsed}ms, ${results.length} results`);
+  log("info", `Web search completed in ${elapsed}ms, ${results.length} results (provider: ${providerUsed})`);
 
-  const standardWebText = formatWebResults(query, results, elapsed);
+  const standardWebText = formatWebResults(query, results, elapsed, providerUsed);
 
   if (leadResearchResult?.formattedText) {
     const combined = [
