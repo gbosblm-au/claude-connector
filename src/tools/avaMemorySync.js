@@ -1,16 +1,40 @@
 // src/tools/avaMemorySync.js
-// Three tools for durable MySQL-backed memory via the ts-ava-memory WordPress plugin.
+// Three tools for memory management and health reporting.
 //
-//   ava_memory_backup        Push all Railway SQLite records to WordPress MySQL.
-//   ava_memory_restore       Pull all WordPress MySQL records back into Railway SQLite.
-//   ava_memory_sync_status   Compare record counts and last-updated timestamps.
+// v10.3.0: MySQL-primary mode awareness added.
 //
-// Both backup and restore use bulk upsert so they are safe to call repeatedly;
-// they are idempotent.  Backup should be called at session close; restore should
-// be called automatically when the Railway memory store is detected as empty on
-// session open.
+// When AVA_MEMORY_WP_URL + AVA_MEMORY_WP_KEY are set, MySQL IS the primary
+// memory store. All memory_* tool calls go directly to MySQL via the WordPress
+// REST API. There is no Railway SQLite layer to sync. In this mode:
+//
+//   ava_memory_backup     - Returns an informational message confirming MySQL
+//                           is already the live store. No action taken.
+//   ava_memory_restore    - Returns an informational message confirming MySQL
+//                           is already the live store. No action taken.
+//   ava_memory_sync_status - Returns live MySQL health stats (entry counts by
+//                            category, last updated timestamp).
+//
+// When MEMORY_AUTH_TOKEN is set without WP keys (SQLite fallback mode), the
+// original backup / restore / sync behaviour is preserved unchanged.
+//
+// Both backup and restore in SQLite mode use bulk upsert so they are safe to
+// call repeatedly; they are idempotent. Backup should be called at session
+// close; restore should be called automatically when the Railway memory store
+// is detected as empty on session open.
 
 import { config } from '../config.js';
+
+/* =========================================================================
+   Mode detection
+   ========================================================================= */
+
+/**
+ * Returns true when MySQL is the primary memory store (WP keys configured).
+ * Returns false when SQLite fallback is active (MEMORY_AUTH_TOKEN only).
+ */
+function isMysqlPrimaryMode() {
+  return !!(config.avaMemoryWpUrl && config.avaMemoryWpKey);
+}
 
 /* =========================================================================
    TOOL DEFINITIONS
@@ -19,9 +43,11 @@ import { config } from '../config.js';
 export const avaMemoryBackupToolDefinition = {
   name: 'ava_memory_backup',
   description:
-    'Push ALL records currently in the Railway SQLite memory store to the ' +
-    'WordPress MySQL durable backup (ts-ava-memory plugin). Call this at the ' +
-    'end of every substantive session to ensure memory survives a Railway reset. ' +
+    'In MySQL-primary mode: confirms that MySQL is already the live memory store ' +
+    'and no backup action is required. In SQLite fallback mode: push ALL records ' +
+    'currently in the Railway SQLite memory store to the WordPress MySQL durable ' +
+    'backup (ts-ava-memory plugin). Call this at the end of every substantive ' +
+    'session to ensure memory survives a Railway reset. ' +
     'The operation is a full bulk-upsert: safe to call multiple times. ' +
     'Returns a summary of inserted and updated record counts.',
   inputSchema: {
@@ -42,9 +68,11 @@ export const avaMemoryBackupToolDefinition = {
 export const avaMemoryRestoreToolDefinition = {
   name: 'ava_memory_restore',
   description:
-    'Pull ALL records from the WordPress MySQL durable backup into the Railway ' +
-    'SQLite memory store. Call this automatically on session open when the Railway ' +
-    'memory store is found to be empty (0 records). ' +
+    'In MySQL-primary mode: confirms that MySQL is already the live memory store ' +
+    'and no restore action is required. In SQLite fallback mode: pull ALL records ' +
+    'from the WordPress MySQL durable backup into the Railway SQLite memory store. ' +
+    'Call this automatically on session open when the Railway memory store is ' +
+    'found to be empty (0 records). ' +
     'The operation is a full bulk-upsert: safe to call multiple times. ' +
     'Returns a summary of inserted and updated record counts.',
   inputSchema: {
@@ -57,9 +85,12 @@ export const avaMemoryRestoreToolDefinition = {
 export const avaMemorySyncStatusToolDefinition = {
   name: 'ava_memory_sync_status',
   description:
-    'Compare the Railway SQLite memory store against the WordPress MySQL durable ' +
-    'backup. Returns record counts for both stores, the most-recent updated_at ' +
-    'timestamp in each, and a recommendation on whether a backup or restore is needed.',
+    'In MySQL-primary mode: returns live MySQL memory health stats (entry counts ' +
+    'by category, total records, last updated timestamp, and active store mode). ' +
+    'In SQLite fallback mode: compares the Railway SQLite memory store against the ' +
+    'WordPress MySQL durable backup, returning record counts for both stores, the ' +
+    'most-recent updated_at timestamp in each, and a recommendation on whether a ' +
+    'backup or restore is needed.',
   inputSchema: {
     type: 'object',
     properties: {},
@@ -90,7 +121,7 @@ async function wpFetch(wpUrl, wpKey, path, options = {}) {
   const headers = {
     'X-Ava-Memory-Key': wpKey,
     'Content-Type': 'application/json',
-    'User-Agent': 'claude-connector/7.0.1 (ava-memory-sync)',
+    'User-Agent': 'claude-connector/10.3.0 (ava-memory-sync)',
     ...options.headers,
   };
 
@@ -109,8 +140,8 @@ async function wpFetch(wpUrl, wpKey, path, options = {}) {
 
 /**
  * Read all records from the Railway SQLite memory store via the internal
- * dispatchMemoryTool handler.  We import lazily to avoid circular dependency
- * and to handle the case where memory is disabled.
+ * dispatchMemoryTool handler. Used only in SQLite fallback mode.
+ * Lazy import avoids circular dependency and handles disabled memory gracefully.
  */
 async function readAllRailwayRecords(includeCategories) {
   let dispatchFn;
@@ -140,7 +171,7 @@ async function readAllRailwayRecords(includeCategories) {
             id:             entry.id,
             category:       entry.category,
             key_name:       entry.key,
-            value:          entry.value,   // already a string from SQLite
+            value:          entry.value,
             tags:           entry.tags,
             created_at:     entry.created_at,
             updated_at:     entry.updated_at,
@@ -160,6 +191,7 @@ async function readAllRailwayRecords(includeCategories) {
 
 /**
  * Write records into Railway SQLite via dispatchMemoryTool.
+ * Used only in SQLite fallback mode.
  */
 async function writeRecordsToRailway(records) {
   let dispatchFn;
@@ -177,7 +209,6 @@ async function writeRecordsToRailway(records) {
 
   for (const record of records) {
     try {
-      // Parse value back if it is a JSON string.
       let parsedValue;
       try {
         parsedValue = JSON.parse(record.value);
@@ -185,7 +216,6 @@ async function writeRecordsToRailway(records) {
         parsedValue = record.value;
       }
 
-      // Calculate ttl_days if ttl timestamp is provided.
       let ttl_days = null;
       if (record.ttl) {
         const expiresAt = new Date(record.ttl).getTime();
@@ -227,23 +257,45 @@ async function writeRecordsToRailway(records) {
    HANDLERS
    ========================================================================= */
 
+/**
+ * ava_memory_backup
+ *
+ * MySQL-primary mode: no-op. Returns a clear message explaining that MySQL
+ * is already the live store and no backup step is required.
+ *
+ * SQLite fallback mode: reads all records from Railway SQLite and pushes
+ * them to WordPress MySQL via bulk-upsert.
+ */
 export async function handleAvaMemoryBackup(args) {
+  // MySQL-primary mode: MySQL IS the store. There is no SQLite layer to back up.
+  if (isMysqlPrimaryMode()) {
+    return {
+      success:   true,
+      mode:      'mysql-primary',
+      message:
+        'Running in MySQL-primary mode. All memory_write calls go directly to ' +
+        'MySQL via the WordPress REST API. There is no Railway SQLite layer. ' +
+        'No backup action is required or possible.',
+      backed_up_at: new Date().toISOString(),
+    };
+  }
+
+  // SQLite fallback mode: original backup logic.
   const { wpUrl, wpKey } = getWpConfig();
   const includeCategories = args.include_categories || [];
 
-  // 1. Read all records from Railway SQLite.
   const records = await readAllRailwayRecords(includeCategories);
 
   if (records.length === 0) {
     return {
-      success: true,
-      message: 'Railway memory store is empty - nothing to back up.',
-      railway_records: 0,
+      success:          true,
+      mode:             'sqlite-fallback',
+      message:          'Railway memory store is empty - nothing to back up.',
+      railway_records:  0,
       wordpress_result: null,
     };
   }
 
-  // 2. Push to WordPress in bulk.
   const wpResult = await wpFetch(wpUrl, wpKey, '/bulk-upsert', {
     method: 'POST',
     body: JSON.stringify({ records }),
@@ -251,6 +303,7 @@ export async function handleAvaMemoryBackup(args) {
 
   return {
     success:          true,
+    mode:             'sqlite-fallback',
     message:          `Backup complete. ${records.length} records pushed to WordPress MySQL.`,
     railway_records:  records.length,
     wordpress_result: wpResult.results,
@@ -258,26 +311,49 @@ export async function handleAvaMemoryBackup(args) {
   };
 }
 
+/**
+ * ava_memory_restore
+ *
+ * MySQL-primary mode: no-op. Returns a clear message explaining that MySQL
+ * is already the live store and no restore step is required.
+ *
+ * SQLite fallback mode: pulls all records from WordPress MySQL and writes
+ * them into Railway SQLite.
+ */
 export async function handleAvaMemoryRestore(args) {
+  // MySQL-primary mode: MySQL IS the store. There is no SQLite layer to restore into.
+  if (isMysqlPrimaryMode()) {
+    return {
+      success:      true,
+      mode:         'mysql-primary',
+      message:
+        'Running in MySQL-primary mode. All memory_read calls go directly to ' +
+        'MySQL via the WordPress REST API. There is no Railway SQLite layer. ' +
+        'No restore action is required or possible.',
+      restored_at: new Date().toISOString(),
+    };
+  }
+
+  // SQLite fallback mode: original restore logic.
   const { wpUrl, wpKey } = getWpConfig();
 
-  // 1. Fetch all records from WordPress.
   const wpData = await wpFetch(wpUrl, wpKey, '/all');
 
   if (!wpData.records || wpData.records.length === 0) {
     return {
-      success: true,
-      message: 'WordPress MySQL backup is empty - nothing to restore.',
+      success:           true,
+      mode:              'sqlite-fallback',
+      message:           'WordPress MySQL backup is empty - nothing to restore.',
       wordpress_records: 0,
-      railway_result: null,
+      railway_result:    null,
     };
   }
 
-  // 2. Write into Railway SQLite.
   const railwayResult = await writeRecordsToRailway(wpData.records);
 
   return {
     success:           true,
+    mode:              'sqlite-fallback',
     message:           `Restore complete. ${wpData.records.length} records pulled from WordPress MySQL.`,
     wordpress_records: wpData.records.length,
     railway_result:    railwayResult,
@@ -285,10 +361,61 @@ export async function handleAvaMemoryRestore(args) {
   };
 }
 
+/**
+ * ava_memory_sync_status
+ *
+ * MySQL-primary mode: returns live MySQL health stats from the /stats endpoint.
+ * No SQLite comparison is performed because there is no SQLite layer.
+ *
+ * SQLite fallback mode: compares Railway SQLite vs WordPress MySQL record
+ * counts and returns a sync recommendation.
+ */
 export async function handleAvaMemorySyncStatus() {
+  if (isMysqlPrimaryMode()) {
+    // MySQL-primary mode: report MySQL health directly.
+    const { wpUrl, wpKey } = getWpConfig();
+
+    let wpStats;
+    let error = null;
+    try {
+      wpStats = await wpFetch(wpUrl, wpKey, '/stats');
+    } catch (err) {
+      wpStats = null;
+      error = err.message;
+    }
+
+    // Derive last_updated from the latest updated_at in the entries, if available.
+    let lastUpdated = null;
+    let byCategory = {};
+    let total = 0;
+
+    if (wpStats) {
+      for (const row of wpStats.categories || []) {
+        const count = parseInt(row.count, 10) || 0;
+        byCategory[row.category] = count;
+        total += count;
+      }
+      lastUpdated = wpStats.last_updated || null;
+    }
+
+    return {
+      mode:        'mysql-primary',
+      description: 'Memory reads and writes go directly to MySQL. No SQLite layer is active.',
+      mysql: {
+        connected:    error === null,
+        total_records: total,
+        by_category:  byCategory,
+        last_updated: lastUpdated,
+        error:        error,
+        endpoint:     config.avaMemoryWpUrl || null,
+      },
+      checked_at: new Date().toISOString(),
+    };
+  }
+
+  // SQLite fallback mode: original comparison logic.
   const { wpUrl, wpKey } = getWpConfig();
 
-  // 1. WordPress stats.
   let wpStats;
   try {
     wpStats = await wpFetch(wpUrl, wpKey, '/stats');
@@ -296,7 +423,6 @@ export async function handleAvaMemorySyncStatus() {
     wpStats = { error: err.message, total: null };
   }
 
-  // 2. Railway stats via memory_list across all categories.
   let railwayTotal = 0;
   let railwayLastUpdated = null;
 
@@ -315,7 +441,6 @@ export async function handleAvaMemorySyncStatus() {
     railwayTotal = -1;
   }
 
-  // 3. Recommendation.
   let recommendation = 'unknown';
   if (railwayTotal >= 0 && wpStats.total !== null) {
     if (railwayTotal === 0 && wpStats.total > 0) {
@@ -330,6 +455,7 @@ export async function handleAvaMemorySyncStatus() {
   }
 
   return {
+    mode: 'sqlite-fallback',
     railway: {
       total:        railwayTotal,
       last_updated: railwayLastUpdated,

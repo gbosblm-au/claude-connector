@@ -1,5 +1,12 @@
-// src/server-http.js  v10.0.0
+// src/server-http.js  v10.3.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
+//
+// v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
+// AVA_MEMORY_WP_KEY are set, all six memory_* tools read and write directly
+// to MySQL via the WordPress REST API. No Railway SQLite layer is involved.
+// The ava_memory_backup and ava_memory_restore tools return informational
+// no-op responses in MySQL-primary mode; ava_memory_sync_status returns live
+// MySQL health stats instead of a SQLite vs MySQL comparison.
 //
 // v10.0.0 (major release): Integrates the TrueSource Persistent Memory MCP
 // (six memory_* tools) directly into the connector. Memory storage uses
@@ -505,7 +512,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "10.0.1" },
+    { name: "claude-connector", version: "10.3.0" },
     { capabilities: { tools: {} } }
   );
 
