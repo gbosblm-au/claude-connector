@@ -174,6 +174,15 @@ export const config = {
   teamsWebhookUrl: process.env.TEAMS_WEBHOOK_URL || "",
 
   // ---------------------------------------------------------------------------
+  // Ava Memory Sync (v10.1.0)
+  // Durable MySQL-backed memory backup via the ts-ava-memory WordPress plugin.
+  // AVA_MEMORY_WP_URL: REST base URL, e.g. https://truesourceconsulting.com.au/wp-json/ava-memory/v1
+  // AVA_MEMORY_WP_KEY: Secret key matching the value set in Settings > Ava Memory in WordPress.
+  // ---------------------------------------------------------------------------
+  avaMemoryWpUrl: (process.env.AVA_MEMORY_WP_URL || '').replace(/\/$/, ''),
+  avaMemoryWpKey: process.env.AVA_MEMORY_WP_KEY || '',
+
+  // ---------------------------------------------------------------------------
   // Inbound Webhook receiver (v8.0.0)
   // WEBHOOK_SECRET: shared secret validated via X-Webhook-Secret header
   // WEBHOOK_QUEUE_SIZE: max events held in memory (default 200)

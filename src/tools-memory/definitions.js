@@ -144,18 +144,11 @@ export const memoryGetSessionContextToolDefinition = {
     "preferences, and facts; the 20 most-recently-updated skills; the 10 most-recently-updated contacts; " +
     "the 5 most-recent session entries; and up to conversations_limit conversation entries (default 5). " +
     "Expired entries are excluded. " +
-    "When context_hint is supplied, conversation retrieval uses THREE-TIER ASSOCIATIVE search: " +
-    "Tier 1 (exact): all context_hint tokens must appear in the document (AND logic, highest confidence). " +
-    "Tier 2 (related): any context_hint token matches (OR logic, semantic proximity). " +
-    "Tier 3 (associative): extracts meaningful tags from Tier 1+2 results and searches other " +
-    "conversations sharing those tags - the web-of-memory layer that surfaces thematically connected " +
-    "conversations even when they share no vocabulary with the context_hint. " +
-    "Each returned conversation entry is annotated with a retrieval_tier field: " +
-    "'exact', 'related', 'associative', or 'recency' (zero-results fallback). " +
-    "The response includes a conversations_tiers count breakdown for audit. " +
-    "Pass context_hint whenever there is an active topic - construct it with both core keywords " +
-    "AND conceptual-neighbor terms (related concepts, synonyms, domain labels) to maximise " +
-    "Tier 2 and Tier 3 recall. 8-15 words is appropriate; never pass the full message verbatim. " +
+    "Accepts two optional parameters: " +
+    "(1) context_hint - a short phrase describing the current topic or task. When supplied, the handler " +
+    "runs an FTS5 relevance search over the conversations category and returns the most topically relevant " +
+    "prior conversations instead of the most-recent-N recency sort. Pass this whenever there is an active " +
+    "topic so that relevant past work is surfaced automatically. " +
     "(2) conversations_limit - maximum number of conversation entries to include (1-20, default 5). " +
     "Call this at the start of any skill or task that has a memory dependency so prior state is loaded " +
     "before substantive work begins.",

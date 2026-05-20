@@ -4,7 +4,8 @@
 // v10.0.0 (major release): Integrates the TrueSource Persistent Memory MCP
 // (six memory_* tools) directly into the connector. Memory storage uses
 // SQLite + FTS5 on the Railway persistent volume mounted at /data. The
-// memory subsystem is gated by MEMORY_AUTH_TOKEN: when set, the six memory
+// memory subsystem is gated by AVA_MEMORY_WP_URL+AVA_MEMORY_WP_KEY (MySQL-primary)
+// or MEMORY_AUTH_TOKEN (SQLite fallback). When neither is configured, the six memory
 // tools are advertised and routed; when unset, those tools are omitted from
 // the tool list and the rest of the connector continues to function unchanged.
 //
@@ -296,12 +297,21 @@ import { log } from "./utils/logger.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
 import { getLinkedInCredentials } from "./utils/credentialStore.js";
 import { config } from "./config.js";
+import {
+  avaMemoryBackupToolDefinition,
+  avaMemoryRestoreToolDefinition,
+  avaMemorySyncStatusToolDefinition,
+  handleAvaMemoryBackup,
+  handleAvaMemoryRestore,
+  handleAvaMemorySyncStatus,
+} from "./tools/avaMemorySync.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
+// Memory is enabled when either MySQL-primary (WP) or SQLite (legacy) is configured.
 const MEMORY_AUTH_TOKEN = process.env.MEMORY_AUTH_TOKEN || "";
-let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN);
+let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN) || Boolean(config.avaMemoryWpUrl && config.avaMemoryWpKey);
 
 // Initialise the persistent memory subsystem when configured.
 // v10.0.1: dynamic import keeps the rest of the connector functional even
@@ -314,9 +324,9 @@ if (MEMORY_ENABLED) {
     MEMORY_TOOL_NAMES = memMod.MEMORY_TOOL_NAMES;
     dispatchMemoryTool = memMod.dispatchMemoryTool;
     initMemorySubsystem = memMod.initMemorySubsystem;
-    getMemoryHealthSnapshot = memMod.getMemoryHealthSnapshot;
+    getMemoryHealthSnapshot = async () => memMod.getMemoryHealthSnapshot();
     memoryAdminDumpHandler = adminMod.adminDumpHandler;
-    initMemorySubsystem();
+    await initMemorySubsystem();
     log("info", "[memory] subsystem ENABLED");
   } catch (err) {
     MEMORY_ENABLED = false;
@@ -324,9 +334,9 @@ if (MEMORY_ENABLED) {
   }
 } else {
   log(
-    "warn",
-    "[memory] MEMORY_AUTH_TOKEN not set - memory_* tools disabled. " +
-      "Generate one with: node -e \"console.log(require('crypto').randomBytes(36).toString('hex'))\"",
+    "info",
+    "[memory] memory_* tools disabled. Set AVA_MEMORY_WP_URL+AVA_MEMORY_WP_KEY (MySQL-primary) " +
+      "or MEMORY_AUTH_TOKEN (SQLite) in Railway Variables to enable.",
   );
 }
 
@@ -477,6 +487,12 @@ const TOOLS = [
     description: "Returns the current UTC date and time.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
+
+  // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
+  // Only advertised when AVA_MEMORY_WP_URL and AVA_MEMORY_WP_KEY are configured.
+  ...(config.avaMemoryWpUrl && config.avaMemoryWpKey
+    ? [avaMemoryBackupToolDefinition, avaMemoryRestoreToolDefinition, avaMemorySyncStatusToolDefinition]
+    : []),
 
   // ---------- Persistent Memory MCP (v10.0.0) ----------
   // Only advertised when MEMORY_AUTH_TOKEN is configured so Claude does not
@@ -631,6 +647,11 @@ function createMcpServer() {
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
 
+        // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
+        case "ava_memory_backup":       return await handleAvaMemoryBackup(args);
+        case "ava_memory_restore":      return await handleAvaMemoryRestore(args);
+        case "ava_memory_sync_status":  return await handleAvaMemorySyncStatus();
+
         default:
           // ---------- v10.0.0: Persistent Memory MCP ----------
           if (MEMORY_TOOL_NAMES.has(name)) {
@@ -642,7 +663,7 @@ function createMcpServer() {
                     text: JSON.stringify(
                       {
                         error:
-                          "Memory subsystem is disabled. Set MEMORY_AUTH_TOKEN in Railway Variables to enable.",
+                          "Memory subsystem is disabled. Set AVA_MEMORY_WP_URL+AVA_MEMORY_WP_KEY (MySQL-primary) or MEMORY_AUTH_TOKEN (SQLite fallback) in Railway Variables to enable.",
                         code: "MEMORY_DISABLED",
                       },
                       null,
@@ -1139,7 +1160,7 @@ httpServer.listen(PORT, HOST, () => {
 
   log(
     "info",
-    `Memory MCP: ${MEMORY_ENABLED ? "ENABLED" : "disabled (set MEMORY_AUTH_TOKEN to enable)"}`,
+    `Memory MCP: ${MEMORY_ENABLED ? "ENABLED" : "disabled (set AVA_MEMORY_WP_URL+AVA_MEMORY_WP_KEY or MEMORY_AUTH_TOKEN to enable)"}`,
   );
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
