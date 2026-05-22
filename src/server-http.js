@@ -305,6 +305,16 @@ import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
 import { getLinkedInCredentials } from "./utils/credentialStore.js";
 import { config } from "./config.js";
 import {
+  skillReadToolDefinition,
+  skillWriteToolDefinition,
+  skillHistoryToolDefinition,
+  skillRollbackToolDefinition,
+  handleSkillRead,
+  handleSkillWrite,
+  handleSkillHistory,
+  handleSkillRollback,
+} from "./tools/skill.js";
+import {
   avaMemoryBackupToolDefinition,
   avaMemoryRestoreToolDefinition,
   avaMemorySyncStatusToolDefinition,
@@ -319,6 +329,11 @@ const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
 // Memory is enabled when either MySQL-primary (WP) or SQLite (legacy) is configured.
 const MEMORY_AUTH_TOKEN = process.env.MEMORY_AUTH_TOKEN || "";
 let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN) || Boolean(config.avaMemoryWpUrl && config.avaMemoryWpKey);
+
+// Skill tools are enabled when SKILL_FILE_PATH is explicitly set in Railway Variables.
+// The default paths resolve to /data/skill/ but tools are only advertised when the
+// operator has provisioned the volume and set the env var.
+const SKILL_ENABLED = Boolean(config.skillFilePath);
 
 // Initialise the persistent memory subsystem when configured.
 // v10.0.1: dynamic import keeps the rest of the connector functional even
@@ -495,6 +510,18 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {}, required: [] },
   },
 
+  // ---------- Ava Skill Volume (v10.4.0) ----------
+  // Only advertised when SKILL_FILE_PATH is configured so Claude does not
+  // see tools that will always error in a non-provisioned environment.
+  ...(SKILL_ENABLED
+    ? [
+        skillReadToolDefinition,
+        skillWriteToolDefinition,
+        skillHistoryToolDefinition,
+        skillRollbackToolDefinition,
+      ]
+    : []),
+
   // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
   // Only advertised when AVA_MEMORY_WP_URL and AVA_MEMORY_WP_KEY are configured.
   ...(config.avaMemoryWpUrl && config.avaMemoryWpKey
@@ -512,7 +539,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "10.3.0" },
+    { name: "claude-connector", version: "10.4.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -653,6 +680,12 @@ function createMcpServer() {
 
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
+
+        // ---------- Ava Skill Volume (v10.4.0) ----------
+        case "skill_read":     return await handleSkillRead(args);
+        case "skill_write":    return await handleSkillWrite(args);
+        case "skill_history":  return await handleSkillHistory(args);
+        case "skill_rollback": return await handleSkillRollback(args);
 
         // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
         case "ava_memory_backup":       return await handleAvaMemoryBackup(args);
@@ -1150,7 +1183,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v10.0.1 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v10.4.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1168,6 +1201,11 @@ httpServer.listen(PORT, HOST, () => {
   log(
     "info",
     `Memory MCP: ${MEMORY_ENABLED ? "ENABLED" : "disabled (set AVA_MEMORY_WP_URL+AVA_MEMORY_WP_KEY or MEMORY_AUTH_TOKEN to enable)"}`,
+  );
+
+  log(
+    "info",
+    `Skill Volume: ${SKILL_ENABLED ? `ENABLED (${process.env.SKILL_FILE_PATH})` : "disabled (set SKILL_FILE_PATH to enable)"}`,
   );
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)

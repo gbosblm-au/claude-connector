@@ -4,7 +4,7 @@
 
 // User-Agent string sent with all outbound HTTP requests.
 // Identifies the connector to remote servers and security systems.
-export const CONNECTOR_USER_AGENT = 'claude-connector/7.0.0 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)';
+export const CONNECTOR_USER_AGENT = 'claude-connector/10.4.0 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)';
 import { existsSync } from "node:fs";
 
 const DEFAULT_LINKEDIN_CSV_PATH = new URL("../data/connections.csv", import.meta.url).pathname;
@@ -181,6 +181,22 @@ export const config = {
   // ---------------------------------------------------------------------------
   avaMemoryWpUrl: (process.env.AVA_MEMORY_WP_URL || '').replace(/\/$/, ''),
   avaMemoryWpKey: process.env.AVA_MEMORY_WP_KEY || '',
+
+  // ---------------------------------------------------------------------------
+  // Ava Skill Volume (v10.4.0)
+  // Persistent SKILL.md storage on Railway Volume mounted at /data.
+  // SKILL_FILE_PATH:    Full path to canonical SKILL.md.
+  // SKILL_VERSION_DIR:  Directory for archived version files.
+  // SKILL_META_PATH:    Full path to skill_meta.json version metadata.
+  // WP_SKILL_URL:       REST base URL e.g. https://site.com/wp-json/ava-skill/v1
+  // WP_SKILL_KEY:       Secret key matching the ts-ava-skill WordPress plugin setting.
+  // Skill tools are advertised when SKILL_FILE_PATH is set in Railway Variables.
+  // ---------------------------------------------------------------------------
+  skillFilePath:   process.env.SKILL_FILE_PATH   || '',
+  skillVersionDir: process.env.SKILL_VERSION_DIR || '',
+  skillMetaPath:   process.env.SKILL_META_PATH   || '',
+  wpSkillUrl:      (process.env.WP_SKILL_URL || '').replace(/\/$/, ''),
+  wpSkillKey:      process.env.WP_SKILL_KEY || '',
 
   // ---------------------------------------------------------------------------
   // Inbound Webhook receiver (v8.0.0)
