@@ -1,4 +1,4 @@
-// src/server-http.js  v10.3.0
+// src/server-http.js  v10.6.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -317,6 +317,7 @@ import {
   handleSkillMergeAdditions,
   handleSkillHistory,
   handleSkillRollback,
+  handleSkillRestoreFromWp,
 } from "./tools/skill.js";
 import {
   avaMemoryBackupToolDefinition,
@@ -330,6 +331,9 @@ import {
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
+// Restore token gates POST /restore-skill (push-from-WordPress back to Railway volume).
+// Must match RAILWAY_RESTORE_TOKEN configured in the ts-ava-skill WordPress plugin Settings tab.
+const RAILWAY_RESTORE_TOKEN = process.env.RAILWAY_RESTORE_TOKEN || "";
 // Memory is enabled when either MySQL-primary (WP) or SQLite (legacy) is configured.
 const MEMORY_AUTH_TOKEN = process.env.MEMORY_AUTH_TOKEN || "";
 let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN) || Boolean(config.avaMemoryWpUrl && config.avaMemoryWpKey);
@@ -514,7 +518,7 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {}, required: [] },
   },
 
-  // ---------- Ava Skill Volume (v10.5.0) ----------
+  // ---------- Ava Skill Volume (v10.6.0) ----------
   // Only advertised when SKILL_FILE_PATH is configured so Claude does not
   // see tools that will always error in a non-provisioned environment.
   ...(SKILL_ENABLED
@@ -545,7 +549,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "10.5.0" },
+    { name: "claude-connector", version: "10.6.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -687,7 +691,7 @@ function createMcpServer() {
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
 
-        // ---------- Ava Skill Volume (v10.5.0) ----------
+        // ---------- Ava Skill Volume (v10.6.0) ----------
         case "skill_read":              return await handleSkillRead(args);
         case "skill_write":             return await handleSkillWrite(args);
         case "skill_write_addition":    return await handleSkillWriteAddition(args);
@@ -1169,6 +1173,58 @@ app.post("/upload/connections", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------
+// POST /restore-skill
+// Receives a canonical SKILL.md push from the WordPress admin "Push to Railway"
+// button (ts-ava-skill plugin v1.3.0+). Validates X-Railway-Restore-Token, then
+// runs the full canonicalWrite sequence (archive, version increment, WP backup).
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+// -----------------------------------------------------------------------
+app.post("/restore-skill", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    res.status(503).json({ error: "Skill Volume not configured. Set SKILL_FILE_PATH in Railway Variables." });
+    return;
+  }
+
+  if (!RAILWAY_RESTORE_TOKEN) {
+    res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables. Configure it to enable WordPress restore pushes." });
+    return;
+  }
+
+  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
+
+  if (!providedToken) {
+    res.status(401).json({ error: "Missing X-Railway-Restore-Token header." });
+    return;
+  }
+
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
+    return;
+  }
+
+  const body = req.body || {};
+
+  if (!body.content || typeof body.content !== "string" || !body.content.trim()) {
+    res.status(400).json({ error: "content is required and must not be empty." });
+    return;
+  }
+
+  try {
+    const result = await handleSkillRestoreFromWp(body);
+    if (result.success) {
+      log("info", `restore-skill: ${result.version_id} (${result.line_count} lines) from ${body.source || "wordpress-push"}`);
+      res.json(result);
+    } else {
+      log("error", `restore-skill failed: ${result.error}`);
+      res.status(500).json(result);
+    }
+  } catch (err) {
+    log("error", `restore-skill exception: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
 app.use((_req, res) => {
@@ -1177,6 +1233,7 @@ app.use((_req, res) => {
     endpoints: {
       mcp: "POST /mcp",
       health: "GET /health",
+      restoreSkill: "POST /restore-skill (X-Railway-Restore-Token required)",
       linkedinCallback: "GET /auth/linkedin/callback",
       trackOpen: "GET /track/open?id=...",
       trackClick: "GET /track/click?id=...&url=...",
@@ -1191,7 +1248,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v10.5.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v10.6.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1215,6 +1272,7 @@ httpServer.listen(PORT, HOST, () => {
     "info",
     `Skill Volume: ${SKILL_ENABLED ? `ENABLED (${process.env.SKILL_FILE_PATH})` : "disabled (set SKILL_FILE_PATH to enable)"}`,
   );
+  log("info", `Skill restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-skill)" : SKILL_ENABLED ? "disabled (set RAILWAY_RESTORE_TOKEN)" : "disabled (SKILL_FILE_PATH not set)"}`);
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
   try {

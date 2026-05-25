@@ -1,4 +1,4 @@
-// src/tools/skill.js  v10.5.0
+// src/tools/skill.js  v10.6.0
 // Six tools for Ava SKILL.md management on Railway persistent volume.
 //
 // skill_read            - Load SKILL.md (current, pending, additions, or historical).
@@ -130,7 +130,7 @@ async function pushToWordPress(endpoint, content, meta, wpSkillUrl, wpSkillKey) 
   try {
     const res = await fetch(`${wpSkillUrl}/${endpoint}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey, 'User-Agent': 'claude-connector/10.5.0 (ava-skill-sync)' },
+      headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey, 'User-Agent': 'claude-connector/10.6.0 (ava-skill-sync)' },
       body: JSON.stringify({ content, version_id: meta.version_id, line_count: meta.line_count, change_summary: meta.change_summary, timestamp: meta.timestamp }),
     });
     if (!res.ok) { const t = await res.text().catch(()=>''); return { ok: false, status: res.status, error: t.slice(0,200) }; }
@@ -477,9 +477,29 @@ export async function handleSkillWriteAddition(args) {
 
   const meta      = readAdditionsMeta(additionsMetaPath);
   const newCount  = (meta.count || 0) + 1;
-  writeAdditionsMeta(additionsMetaPath, { count: newCount, last_updated: new Date().toISOString(), last_session_id: sessionId });
+  const additionTs = new Date().toISOString();
+  writeAdditionsMeta(additionsMetaPath, { count: newCount, last_updated: additionTs, last_session_id: sessionId });
 
   log('info', `skill_write_addition: staged block for ${sessionId} (total pending: ${newCount})`);
+
+  // Non-blocking WordPress additions sync — mirrors the Railway pending queue to WP
+  // so the WP admin pending queue view stays current after every staged addition.
+  const { wpSkillUrl, wpSkillKey } = paths;
+  if (wpSkillUrl && wpSkillKey) {
+    const fullAdditionsContent = readFileSync(additionsPath, 'utf8');
+    pushToWordPress(
+      'additions',
+      fullAdditionsContent,
+      {
+        version_id:      `additions-${newCount}`,
+        line_count:      countLines(fullAdditionsContent),
+        change_summary:  `Addition from ${sessionId}: ${changeSummary}`,
+        timestamp:       additionTs,
+      },
+      wpSkillUrl,
+      wpSkillKey
+    ).catch(err => log('warn', `skill_write_addition WP sync failed: ${err.message}`));
+  }
 
   return {
     content: [{ type: 'text', text: JSON.stringify({
@@ -586,4 +606,35 @@ export async function handleSkillRollback(args) {
   const restoredContent = readFileSync(`${versionDir}${targetFile}`, 'utf8');
   const result = await canonicalWrite(restoredContent, `Rollback to ${versionId}: ${changeSummary}`, paths);
   return { content: [{ type: 'text', text: JSON.stringify({ ...result, rolled_back_from: versionId, source_file: targetFile }, null, 2) }] };
+}
+
+// ---------------------------------------------------------------------------
+// WordPress restore handler (called by POST /restore-skill in server-http.js)
+// Accepts a parsed request body from the WordPress admin "Push to Railway" action,
+// runs the full canonicalWrite sequence (archive, version increment, meta update,
+// history update, non-blocking WP backup echo), and returns a plain result object.
+// ---------------------------------------------------------------------------
+
+export async function handleSkillRestoreFromWp(body) {
+  const paths         = getSkillPaths();
+  const { filePath, versionDir } = paths;
+  const content       = typeof body.content        === 'string' ? body.content        : '';
+  const changeSummary = typeof body.change_summary === 'string'
+    ? body.change_summary.slice(0, 200)
+    : 'WordPress admin restore push';
+
+  if (!content.trim()) {
+    return { success: false, error: 'content is required and must not be empty.' };
+  }
+
+  ensureDirs(filePath, versionDir);
+
+  try {
+    const result = await canonicalWrite(content, changeSummary, paths);
+    log('info', `restore-skill: wrote ${result.version_id} (${result.line_count} lines) from WordPress push`);
+    return { success: true, ...result };
+  } catch (err) {
+    log('error', `restore-skill canonicalWrite failed: ${err.message}`);
+    return { success: false, error: err.message };
+  }
 }
