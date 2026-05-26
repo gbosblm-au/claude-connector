@@ -1,4 +1,4 @@
-// src/server-http.js  v10.6.0
+// src/server-http.js  v10.7.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -320,6 +320,12 @@ import {
   handleSkillRestoreFromWp,
 } from "./tools/skill.js";
 import {
+  booksReadToolDefinition,
+  booksLogWriteToolDefinition,
+  handleBooksRead,
+  handleBooksLogWrite,
+} from "./tools/books.js";
+import {
   avaMemoryBackupToolDefinition,
   avaMemoryRestoreToolDefinition,
   avaMemorySyncStatusToolDefinition,
@@ -518,7 +524,7 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {}, required: [] },
   },
 
-  // ---------- Ava Skill Volume (v10.6.0) ----------
+  // ---------- Ava Skill Volume (v10.7.0) ----------
   // Only advertised when SKILL_FILE_PATH is configured so Claude does not
   // see tools that will always error in a non-provisioned environment.
   ...(SKILL_ENABLED
@@ -529,6 +535,8 @@ const TOOLS = [
         skillMergeAdditionsToolDefinition,
         skillHistoryToolDefinition,
         skillRollbackToolDefinition,
+        booksReadToolDefinition,
+        booksLogWriteToolDefinition,
       ]
     : []),
 
@@ -549,7 +557,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "10.6.0" },
+    { name: "claude-connector", version: "10.7.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -691,13 +699,15 @@ function createMcpServer() {
         case "get_current_datetime":
           return { content: [{ type: "text", text: JSON.stringify(getCurrentDateTime(), null, 2) }] };
 
-        // ---------- Ava Skill Volume (v10.6.0) ----------
+        // ---------- Ava Skill Volume (v10.7.0) ----------
         case "skill_read":              return await handleSkillRead(args);
         case "skill_write":             return await handleSkillWrite(args);
         case "skill_write_addition":    return await handleSkillWriteAddition(args);
         case "skill_merge_additions":   return await handleSkillMergeAdditions(args);
         case "skill_history":           return await handleSkillHistory(args);
         case "skill_rollback":          return await handleSkillRollback(args);
+        case "books_read":             return await handleBooksRead(args);
+        case "books_log_write":        return await handleBooksLogWrite(args);
 
         // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
         case "ava_memory_backup":       return await handleAvaMemoryBackup(args);
@@ -1248,7 +1258,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v10.6.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v10.7.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
