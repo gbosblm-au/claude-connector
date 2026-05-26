@@ -178,14 +178,11 @@ export async function handleBooksRead(_args) {
 
   const content     = readFileSync(booksPath, 'utf8');
   const entryCount  = countEntries(content);
-  const lastUpdated = (() => {
-    try {
-      const { statSync } = await import('node:fs'); const { mtimeMs } = statSync(booksPath);
-      return new Date(mtimeMs).toISOString();
-    } catch {
-      return null;
-    }
-  })();
+  let lastUpdated = null;
+  try {
+    const { mtimeMs } = statSync(booksPath);
+    lastUpdated = new Date(mtimeMs).toISOString();
+  } catch { /* non-critical — last_updated omitted if stat fails */ }
 
   log('info', `books_read: returned ${entryCount} entries`);
 
