@@ -865,7 +865,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "10.0.1",
+    version: "10.8.0",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -880,6 +880,7 @@ app.get("/health", (_req, res) => {
     slackEnabled: !!(config.slackBotToken),
     teamsEnabled: !!(config.teamsWebhookUrl),
     webhookEnabled: true,
+    profilesEnabled: PROFILES_ENABLED,
     timestamp: new Date().toISOString(),
   });
 });
