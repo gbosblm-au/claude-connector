@@ -1,4 +1,4 @@
-// src/server-http.js  v10.7.0
+// src/server-http.js  v10.8.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -324,7 +324,15 @@ import {
   booksLogWriteToolDefinition,
   handleBooksRead,
   handleBooksLogWrite,
+  handleBooksRestoreFromWp,
 } from "./tools/books.js";
+import {
+  profileReadToolDefinition,
+  profileWritePersonToolDefinition,
+  handleProfileRead,
+  handleProfileWritePerson,
+  handleProfilesRestoreFromWp,
+} from "./tools/profiles.js";
 import {
   avaMemoryBackupToolDefinition,
   avaMemoryRestoreToolDefinition,
@@ -348,6 +356,10 @@ let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN) || Boolean(config.avaMemoryWpUrl
 // The default paths resolve to /data/skill/ but tools are only advertised when the
 // operator has provisioned the volume and set the env var.
 const SKILL_ENABLED = Boolean(config.skillFilePath);
+
+// Profiles tools are enabled when SKILL_FILE_PATH is set (they share the same volume).
+// Can also be enabled independently via PROFILES_FILE_PATH.
+const PROFILES_ENABLED = Boolean(config.skillFilePath) || Boolean(process.env.PROFILES_FILE_PATH);
 
 // Initialise the persistent memory subsystem when configured.
 // v10.0.1: dynamic import keeps the rest of the connector functional even
@@ -540,6 +552,18 @@ const TOOLS = [
       ]
     : []),
 
+  // ---------- Ava User Profiles (v10.8.0) ----------
+  // Enabled when SKILL_FILE_PATH or PROFILES_FILE_PATH is configured.
+  // profile_read called at session start after skill_read.
+  // profile_write_person called after substantive turns when profile-relevant
+  // information emerges, and when a new person is confirmed after anomaly check.
+  ...(PROFILES_ENABLED
+    ? [
+        profileReadToolDefinition,
+        profileWritePersonToolDefinition,
+      ]
+    : []),
+
   // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
   // Only advertised when AVA_MEMORY_WP_URL and AVA_MEMORY_WP_KEY are configured.
   ...(config.avaMemoryWpUrl && config.avaMemoryWpKey
@@ -557,7 +581,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "10.7.0" },
+    { name: "claude-connector", version: "10.8.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -708,6 +732,10 @@ function createMcpServer() {
         case "skill_rollback":          return await handleSkillRollback(args);
         case "books_read":             return await handleBooksRead(args);
         case "books_log_write":        return await handleBooksLogWrite(args);
+
+        // ---------- Ava User Profiles (v10.8.0) ----------
+        case "profile_read":           return await handleProfileRead(args);
+        case "profile_write_person":   return await handleProfileWritePerson(args);
 
         // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
         case "ava_memory_backup":       return await handleAvaMemoryBackup(args);
@@ -1235,20 +1263,126 @@ app.post("/restore-skill", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------
+// POST /restore-books
+// Receives a BOOKS_READ.md push from the WordPress admin "Push to Railway"
+// button (ts-ava-skill plugin v1.5.0+). Validates X-Railway-Restore-Token,
+// then writes the content directly to BOOKS_READ.md on the Railway volume.
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+// -----------------------------------------------------------------------
+app.post("/restore-books", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    res.status(503).json({ error: "Skill Volume not configured. Set SKILL_FILE_PATH in Railway Variables." });
+    return;
+  }
+
+  if (!RAILWAY_RESTORE_TOKEN) {
+    res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+    return;
+  }
+
+  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
+
+  if (!providedToken) {
+    res.status(401).json({ error: "Missing X-Railway-Restore-Token header." });
+    return;
+  }
+
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
+    return;
+  }
+
+  const body = req.body || {};
+
+  if (!body.content || typeof body.content !== "string" || !body.content.trim()) {
+    res.status(400).json({ error: "content is required and must not be empty." });
+    return;
+  }
+
+  try {
+    const result = await handleBooksRestoreFromWp(body);
+    if (result.success) {
+      log("info", `restore-books: ${result.entry_count} entries from ${body.source || "wordpress-push"}`);
+      res.json(result);
+    } else {
+      log("error", `restore-books failed: ${result.error}`);
+      res.status(500).json(result);
+    }
+  } catch (err) {
+    log("error", `restore-books exception: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -----------------------------------------------------------------------
+// POST /restore-profiles
+// Receives a PROFILES.md push from the WordPress admin "Push to Railway"
+// button (ts-ava-skill plugin v1.6.0+). Validates X-Railway-Restore-Token,
+// then writes the content directly to PROFILES.md on the Railway volume.
+// Requires SKILL_FILE_PATH (or PROFILES_FILE_PATH) + RAILWAY_RESTORE_TOKEN.
+// -----------------------------------------------------------------------
+app.post("/restore-profiles", async (req, res) => {
+  if (!PROFILES_ENABLED) {
+    res.status(503).json({ error: "Profiles not configured. Set SKILL_FILE_PATH or PROFILES_FILE_PATH in Railway Variables." });
+    return;
+  }
+
+  if (!RAILWAY_RESTORE_TOKEN) {
+    res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+    return;
+  }
+
+  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
+
+  if (!providedToken) {
+    res.status(401).json({ error: "Missing X-Railway-Restore-Token header." });
+    return;
+  }
+
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
+    return;
+  }
+
+  const body = req.body || {};
+
+  if (!body.content || typeof body.content !== "string" || !body.content.trim()) {
+    res.status(400).json({ error: "content is required and must not be empty." });
+    return;
+  }
+
+  try {
+    const result = await handleProfilesRestoreFromWp(body);
+    if (result.success) {
+      log("info", `restore-profiles: ${result.person_count} person(s) from ${body.source || "wordpress-push"}`);
+      res.json(result);
+    } else {
+      log("error", `restore-profiles failed: ${result.error}`);
+      res.status(500).json(result);
+    }
+  } catch (err) {
+    log("error", `restore-profiles exception: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
 app.use((_req, res) => {
   res.status(404).json({
     error: "Not found",
     endpoints: {
-      mcp: "POST /mcp",
-      health: "GET /health",
-      restoreSkill: "POST /restore-skill (X-Railway-Restore-Token required)",
+      mcp:              "POST /mcp",
+      health:           "GET /health",
+      restoreSkill:     "POST /restore-skill (X-Railway-Restore-Token required)",
+      restoreBooks:     "POST /restore-books (X-Railway-Restore-Token required)",
+      restoreProfiles:  "POST /restore-profiles (X-Railway-Restore-Token required)",
       linkedinCallback: "GET /auth/linkedin/callback",
-      trackOpen: "GET /track/open?id=...",
-      trackClick: "GET /track/click?id=...&url=...",
-      upload: "POST /upload/connections",
-      webhook: "POST /webhook",
+      trackOpen:        "GET /track/open?id=...",
+      trackClick:       "GET /track/click?id=...&url=...",
+      upload:           "POST /upload/connections",
+      webhook:          "POST /webhook",
     },
   });
 });
@@ -1258,7 +1392,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v10.7.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v10.8.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1283,6 +1417,9 @@ httpServer.listen(PORT, HOST, () => {
     `Skill Volume: ${SKILL_ENABLED ? `ENABLED (${process.env.SKILL_FILE_PATH})` : "disabled (set SKILL_FILE_PATH to enable)"}`,
   );
   log("info", `Skill restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-skill)" : SKILL_ENABLED ? "disabled (set RAILWAY_RESTORE_TOKEN)" : "disabled (SKILL_FILE_PATH not set)"}`);
+  log("info", `Books restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-books)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
+  log("info", `Profiles: ${PROFILES_ENABLED ? "ENABLED (profile_read, profile_write_person)" : "disabled (set SKILL_FILE_PATH or PROFILES_FILE_PATH to enable)"}`);
+  log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
   try {

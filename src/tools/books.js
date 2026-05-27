@@ -1,4 +1,4 @@
-// src/tools/books.js  v10.7.0
+// src/tools/books.js  v10.8.0
 // Two tools for Ava BOOKS_READ.md management on Railway persistent volume.
 //
 // books_read      - Read the full BOOKS_READ.md file on demand. Not loaded at session start.
@@ -196,6 +196,35 @@ export async function handleBooksRead(_args) {
       }, null, 2),
     }],
   };
+}
+
+// ---------------------------------------------------------------------------
+// WordPress restore handler (called by POST /restore-books in server-http.js)
+// Accepts a parsed request body from the WordPress admin "Push to Railway" action
+// for the Books Read tab. Validates content and writes directly to BOOKS_READ.md
+// on the Railway Volume. Returns a plain result object.
+// ---------------------------------------------------------------------------
+
+export async function handleBooksRestoreFromWp(body) {
+  const { booksPath } = getBooksPaths();
+  const content       = typeof body.content        === 'string' ? body.content        : '';
+  const changeSummary = typeof body.change_summary === 'string' ? body.change_summary : 'WordPress admin books restore push';
+
+  if (!content.trim()) {
+    return { success: false, error: 'content is required and must not be empty.' };
+  }
+
+  ensureDir(booksPath);
+
+  try {
+    writeFileSync(booksPath, content, 'utf8');
+    const entryCount = countEntries(content);
+    log('info', `restore-books: wrote ${content.split('\n').length} lines, ${entryCount} entries from WordPress push`);
+    return { success: true, entry_count: entryCount, change_summary: changeSummary };
+  } catch (err) {
+    log('error', `restore-books write failed: ${err.message}`);
+    return { success: false, error: err.message };
+  }
 }
 
 export async function handleBooksLogWrite(args) {
