@@ -1,4 +1,4 @@
-// src/server-http.js  v10.8.0
+// src/server-http.js  v11.0.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -334,6 +334,17 @@ import {
   handleProfilesRestoreFromWp,
 } from "./tools/profiles.js";
 import {
+  skillCompileToolDefinition,
+  skillLoadSpecialistToolDefinition,
+  personalityWriteToolDefinition,
+  dispatchRuleAddToolDefinition,
+  handleSkillCompile,
+  handleSkillLoadSpecialist,
+  handlePersonalityWrite,
+  handleDispatchRuleAdd,
+  handleModulesRestoreFromWp,
+} from "./tools/skill-modular.js";
+import {
   avaMemoryBackupToolDefinition,
   avaMemoryRestoreToolDefinition,
   avaMemorySyncStatusToolDefinition,
@@ -356,6 +367,8 @@ let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN) || Boolean(config.avaMemoryWpUrl
 // The default paths resolve to /data/skill/ but tools are only advertised when the
 // operator has provisioned the volume and set the env var.
 const SKILL_ENABLED = Boolean(config.skillFilePath);
+// Modular skill system - activated by SKILL_MODULAR_ENABLED=true AND SKILL_FILE_PATH set.
+const SKILL_MODULAR_ENABLED = SKILL_ENABLED && process.env.SKILL_MODULAR_ENABLED === "true";
 
 // Profiles tools are enabled when SKILL_FILE_PATH is set (they share the same volume).
 // Can also be enabled independently via PROFILES_FILE_PATH.
@@ -552,6 +565,18 @@ const TOOLS = [
       ]
     : []),
 
+  // ---------- Modular Skill System (v11.0.0) ----------
+  // Only advertised when SKILL_MODULAR_ENABLED=true (requires SKILL_FILE_PATH).
+  // skill_compile replaces skill_read at session start when modular mode is active.
+  ...(SKILL_MODULAR_ENABLED
+    ? [
+        skillCompileToolDefinition,
+        skillLoadSpecialistToolDefinition,
+        personalityWriteToolDefinition,
+        dispatchRuleAddToolDefinition,
+      ]
+    : []),
+
   // ---------- Ava User Profiles (v10.8.0) ----------
   // Enabled when SKILL_FILE_PATH or PROFILES_FILE_PATH is configured.
   // profile_read called at session start after skill_read.
@@ -730,6 +755,11 @@ function createMcpServer() {
         case "skill_merge_additions":   return await handleSkillMergeAdditions(args);
         case "skill_history":           return await handleSkillHistory(args);
         case "skill_rollback":          return await handleSkillRollback(args);
+        // ---------- Modular Skill System (v11.0.0) ----------
+        case "skill_compile":           return await handleSkillCompile(args);
+        case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
+        case "personality_write":       return await handlePersonalityWrite(args);
+        case "dispatch_rule_add":       return await handleDispatchRuleAdd(args);
         case "books_read":             return await handleBooksRead(args);
         case "books_log_write":        return await handleBooksLogWrite(args);
 
@@ -1367,6 +1397,89 @@ app.post("/restore-profiles", async (req, res) => {
   }
 });
 
+// POST /restore-modules
+// Push all modular skill files from WordPress to Railway volume /data/skill/ava/.
+// Body: { files: { "relative/path": "content" }, change_summary?, timestamp?, source? }
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+app.post("/restore-modules", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(404).json({ error: "SKILL_FILE_PATH not set. Cannot restore modules." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+  }
+  const providedToken = req.headers["x-railway-restore-token"] || "";
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
+  }
+  try {
+    const body = req.body || {};
+    const result = await handleModulesRestoreFromWp(body);
+    if (!result.success) return res.status(500).json(result);
+    log("info", `restore-modules: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
+    return res.json(result);
+  } catch (err) {
+    log("error", `restore-modules exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /restore-personality
+// Push PERSONALITY.md from WordPress to Railway volume /data/skill/ava/PERSONALITY.md.
+// Body: { content, change_summary?, timestamp?, source? }
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+app.post("/restore-personality", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(404).json({ error: "SKILL_FILE_PATH not set. Cannot restore personality." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+  }
+  const providedToken = req.headers["x-railway-restore-token"] || "";
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
+  }
+  try {
+    const body = req.body || {};
+    const fileContent = typeof body.content === "string" ? body.content : "";
+    if (!fileContent) return res.status(400).json({ error: "content is required" });
+    const result = await handleModulesRestoreFromWp({ files: { "PERSONALITY.md": fileContent } });
+    log("info", `restore-personality: written from ${body.source || "wordpress-push"}`);
+    return res.json({ success: true, message: "PERSONALITY.md restored to Railway volume." });
+  } catch (err) {
+    log("error", `restore-personality exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /restore-dispatch-rules
+// Push DISPATCH_RULES.json from WordPress to Railway volume /data/skill/ava/DISPATCH_RULES.json.
+// Body: { content, change_summary?, timestamp?, source? }
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+app.post("/restore-dispatch-rules", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(404).json({ error: "SKILL_FILE_PATH not set. Cannot restore dispatch rules." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+  }
+  const providedToken = req.headers["x-railway-restore-token"] || "";
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
+  }
+  try {
+    const body = req.body || {};
+    const fileContent = typeof body.content === "string" ? body.content : "";
+    if (!fileContent) return res.status(400).json({ error: "content is required" });
+    const result = await handleModulesRestoreFromWp({ files: { "DISPATCH_RULES.json": fileContent } });
+    log("info", `restore-dispatch-rules: written from ${body.source || "wordpress-push"}`);
+    return res.json({ success: true, message: "DISPATCH_RULES.json restored to Railway volume." });
+  } catch (err) {
+    log("error", `restore-dispatch-rules exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
@@ -1376,9 +1489,12 @@ app.use((_req, res) => {
     endpoints: {
       mcp:              "POST /mcp",
       health:           "GET /health",
-      restoreSkill:     "POST /restore-skill (X-Railway-Restore-Token required)",
-      restoreBooks:     "POST /restore-books (X-Railway-Restore-Token required)",
-      restoreProfiles:  "POST /restore-profiles (X-Railway-Restore-Token required)",
+      restoreSkill:          "POST /restore-skill (X-Railway-Restore-Token required)",
+      restoreBooks:          "POST /restore-books (X-Railway-Restore-Token required)",
+      restoreProfiles:       "POST /restore-profiles (X-Railway-Restore-Token required)",
+      restoreModules:        "POST /restore-modules (X-Railway-Restore-Token required)",
+      restorePersonality:    "POST /restore-personality (X-Railway-Restore-Token required)",
+      restoreDispatchRules:  "POST /restore-dispatch-rules (X-Railway-Restore-Token required)",
       linkedinCallback: "GET /auth/linkedin/callback",
       trackOpen:        "GET /track/open?id=...",
       trackClick:       "GET /track/click?id=...&url=...",
@@ -1393,7 +1509,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v10.8.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v11.0.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1421,6 +1537,8 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `Books restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-books)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
   log("info", `Profiles: ${PROFILES_ENABLED ? "ENABLED (profile_read, profile_write_person)" : "disabled (set SKILL_FILE_PATH or PROFILES_FILE_PATH to enable)"}`);
   log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
+  log("info", `Modular skill: ${SKILL_MODULAR_ENABLED ? "ENABLED (skill_compile, personality_write, dispatch_rule_add, skill_load_specialist)" : "disabled (set SKILL_MODULAR_ENABLED=true + SKILL_FILE_PATH to enable)"}`);
+  log("info", `Module restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-modules, /restore-personality, /restore-dispatch-rules)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
   try {
