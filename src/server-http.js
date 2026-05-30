@@ -1,4 +1,4 @@
-// src/server-http.js  v11.1.0
+// src/server-http.js  v11.2.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -34,7 +34,7 @@ import "dotenv/config";
 import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -372,6 +372,56 @@ const SKILL_ENABLED = Boolean(config.skillFilePath);
 // Modular skill system - activated by SKILL_MODULAR_ENABLED=true AND SKILL_FILE_PATH set.
 const SKILL_MODULAR_ENABLED = SKILL_ENABLED && process.env.SKILL_MODULAR_ENABLED === "true";
 
+// ---------------------------------------------------------------------------
+// Runtime modular mode helpers (v11.2.0)
+//
+// SKILL_MODULAR_ENABLED (above) reflects the env var at startup time only.
+// isModularEnabled() checks a mode file on the Railway volume first, allowing
+// WordPress to toggle the mode without a redeploy. The mode file takes
+// precedence over the env var when present.
+//
+// Mode file path: {SKILL_FILE_PATH_base}/.modular_mode  (default: /data/skill/.modular_mode)
+// File content: the string "true" or "false".
+// ---------------------------------------------------------------------------
+
+function getModeFilePath() {
+  const skillPath = process.env.SKILL_FILE_PATH || "/data/skill/SKILL.md";
+  return skillPath.replace(/SKILL\.md$/, "") + ".modular_mode";
+}
+
+function isModularEnabled() {
+  if (!SKILL_ENABLED) return false;
+  const modePath = getModeFilePath();
+  if (existsSync(modePath)) {
+    try {
+      const val = readFileSync(modePath, "utf8").trim();
+      return val === "true";
+    } catch { /* fall through to env var */ }
+  }
+  return process.env.SKILL_MODULAR_ENABLED === "true";
+}
+
+function getModularModeStatus() {
+  const modePath = getModeFilePath();
+  const hasFile  = existsSync(modePath);
+  let fileValue  = null;
+  if (hasFile) {
+    try { fileValue = readFileSync(modePath, "utf8").trim(); } catch { /* ignore */ }
+  }
+  const envVar  = process.env.SKILL_MODULAR_ENABLED || "not set";
+  const enabled = isModularEnabled();
+  return {
+    enabled,
+    source:          hasFile ? "mode_file" : "env_var",
+    env_var:         envVar,
+    file_value:      fileValue,
+    mode_file_path:  modePath,
+    note:            hasFile
+      ? "Mode file present — overrides SKILL_MODULAR_ENABLED env var. Delete the file to revert to env var control."
+      : "No mode file. Using SKILL_MODULAR_ENABLED env var (requires redeploy to change).",
+  };
+}
+
 // Profiles tools are enabled when SKILL_FILE_PATH is set (they share the same volume).
 // Can also be enabled independently via PROFILES_FILE_PATH.
 const PROFILES_ENABLED = Boolean(config.skillFilePath) || Boolean(process.env.PROFILES_FILE_PATH);
@@ -609,11 +659,29 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "11.1.0" },
+    { name: "claude-connector", version: "11.2.0" },
     { capabilities: { tools: {} } }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // Build the effective tool list at request time so that modular mode changes
+    // (written via POST /set-modular-mode) take effect without a Railway redeploy.
+    // The static TOOLS array is correct for all non-modular tools; we just replace
+    // the modular section with a live isModularEnabled() check.
+    const MODULAR_TOOL_NAMES = new Set([
+      "skill_compile", "skill_load_specialist", "personality_write", "dispatch_rule_add",
+    ]);
+    const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
+    const modularTools = isModularEnabled()
+      ? [
+          skillCompileToolDefinition,
+          skillLoadSpecialistToolDefinition,
+          personalityWriteToolDefinition,
+          dispatchRuleAddToolDefinition,
+        ]
+      : [];
+    return { tools: [...baseTools, ...modularTools] };
+  });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
@@ -899,7 +967,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "11.1.0",
+    version: "11.2.0",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -1487,6 +1555,56 @@ app.post("/restore-dispatch-rules", async (req, res) => {
 // -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Modular mode read/write endpoints (v11.2.0)
+// GET  /modular-mode         - returns effective mode, source, and env var value (no auth)
+// POST /set-modular-mode     - writes .modular_mode file (requires X-Railway-Restore-Token)
+//
+// The mode file is checked by isModularEnabled() on every ListTools request,
+// so toggling takes effect at the start of the next Claude session without
+// a Railway redeploy. The file overrides SKILL_MODULAR_ENABLED env var when present.
+// ---------------------------------------------------------------------------
+
+app.get("/modular-mode", (_req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(503).json({ error: "Skill volume not configured (SKILL_FILE_PATH not set)." });
+  }
+  res.json(getModularModeStatus());
+});
+
+app.post("/set-modular-mode", (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(503).json({ error: "Skill volume not configured (SKILL_FILE_PATH not set)." });
+  }
+  const token = req.headers["x-railway-restore-token"] || "";
+  if (!RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
+  }
+  const body    = req.body || {};
+  const enabled = body.enabled;
+  if (typeof enabled !== "boolean") {
+    return res.status(400).json({ error: "enabled (boolean) is required in request body." });
+  }
+  const modePath = getModeFilePath();
+  try {
+    const dir = modePath.replace(/[/\\][^/\\]+$/, "");
+    if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(modePath, String(enabled), "utf8");
+    log("info", `set-modular-mode: mode file written -> ${enabled}`);
+    const status = getModularModeStatus();
+    return res.json({
+      success:  true,
+      enabled,
+      previous: !enabled,
+      status,
+      note: "Mode file written. Takes effect at the start of the next Claude session (new MCP connection). No Railway redeploy needed.",
+    });
+  } catch (err) {
+    log("error", `set-modular-mode: failed to write mode file: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.use((_req, res) => {
   res.status(404).json({
     error: "Not found",
@@ -1499,6 +1617,8 @@ app.use((_req, res) => {
       restoreModules:        "POST /restore-modules (X-Railway-Restore-Token required)",
       restorePersonality:    "POST /restore-personality (X-Railway-Restore-Token required)",
       restoreDispatchRules:  "POST /restore-dispatch-rules (X-Railway-Restore-Token required)",
+      modularModeGet:        "GET /modular-mode (no auth)",
+      modularModeSet:        "POST /set-modular-mode (X-Railway-Restore-Token required)",
       linkedinCallback: "GET /auth/linkedin/callback",
       trackOpen:        "GET /track/open?id=...",
       trackClick:       "GET /track/click?id=...&url=...",
@@ -1513,7 +1633,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v11.0.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v11.2.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1541,7 +1661,7 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `Books restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-books)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
   log("info", `Profiles: ${PROFILES_ENABLED ? "ENABLED (profile_read, profile_write_person)" : "disabled (set SKILL_FILE_PATH or PROFILES_FILE_PATH to enable)"}`);
   log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
-  log("info", `Modular skill: ${SKILL_MODULAR_ENABLED ? "ENABLED (skill_compile, personality_write, dispatch_rule_add, skill_load_specialist)" : "disabled (set SKILL_MODULAR_ENABLED=true + SKILL_FILE_PATH to enable)"}`);
+  log("info", `Modular skill: env_var=${process.env.SKILL_MODULAR_ENABLED || "not set"} | effective=${isModularEnabled() ? "ENABLED" : "disabled"} | runtime toggle: GET /modular-mode, POST /set-modular-mode`);
   log("info", `Module restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-modules, /restore-personality, /restore-dispatch-rules)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
