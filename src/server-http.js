@@ -1,4 +1,4 @@
-// src/server-http.js  v11.0.0
+// src/server-http.js  v11.1.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -311,6 +311,7 @@ import {
   skillMergeAdditionsToolDefinition,
   skillHistoryToolDefinition,
   skillRollbackToolDefinition,
+  skillAuditToolDefinition,
   handleSkillRead,
   handleSkillWrite,
   handleSkillWriteAddition,
@@ -318,6 +319,7 @@ import {
   handleSkillHistory,
   handleSkillRollback,
   handleSkillRestoreFromWp,
+  handleSkillAudit,
 } from "./tools/skill.js";
 import {
   booksReadToolDefinition,
@@ -560,6 +562,7 @@ const TOOLS = [
         skillMergeAdditionsToolDefinition,
         skillHistoryToolDefinition,
         skillRollbackToolDefinition,
+        skillAuditToolDefinition,
         booksReadToolDefinition,
         booksLogWriteToolDefinition,
       ]
@@ -606,7 +609,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "10.8.0" },
+    { name: "claude-connector", version: "11.1.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -755,6 +758,7 @@ function createMcpServer() {
         case "skill_merge_additions":   return await handleSkillMergeAdditions(args);
         case "skill_history":           return await handleSkillHistory(args);
         case "skill_rollback":          return await handleSkillRollback(args);
+        case "skill_audit":             return await handleSkillAudit(args);
         // ---------- Modular Skill System (v11.0.0) ----------
         case "skill_compile":           return await handleSkillCompile(args);
         case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
@@ -895,7 +899,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "10.8.0",
+    version: "11.1.0",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -1531,7 +1535,7 @@ httpServer.listen(PORT, HOST, () => {
 
   log(
     "info",
-    `Skill Volume: ${SKILL_ENABLED ? `ENABLED (${process.env.SKILL_FILE_PATH})` : "disabled (set SKILL_FILE_PATH to enable)"}`,
+    `Skill Volume: ${SKILL_ENABLED ? `ENABLED (${process.env.SKILL_FILE_PATH}) — skill_read, skill_write, skill_write_addition, skill_merge_additions, skill_history, skill_rollback, skill_audit` : "disabled (set SKILL_FILE_PATH to enable)"}`,
   );
   log("info", `Skill restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-skill)" : SKILL_ENABLED ? "disabled (set RAILWAY_RESTORE_TOKEN)" : "disabled (SKILL_FILE_PATH not set)"}`);
   log("info", `Books restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-books)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);

@@ -49,6 +49,7 @@ import {
   mkdirSync,
   existsSync,
   readdirSync,
+  statSync,
 } from 'node:fs';
 import { log } from '../utils/logger.js';
 
@@ -637,4 +638,154 @@ export async function handleSkillRestoreFromWp(body) {
     log('error', `restore-skill canonicalWrite failed: ${err.message}`);
     return { success: false, error: err.message };
   }
+}
+
+// ---------------------------------------------------------------------------
+// skill_audit tool definition and handler (v11.1.0)
+// ---------------------------------------------------------------------------
+
+export const skillAuditToolDefinition = {
+  name: 'skill_audit',
+  description:
+    'Audit all Ava skill files on the Railway persistent volume. ' +
+    'Identifies whether modular or canonical skill mode is active, and returns ' +
+    'file names, line counts, and last-modified dates for all relevant skill files. ' +
+    'Canonical mode returns: SKILL.md, PROFILES.md, PERSONALITY.md, BOOKS_READ.md. ' +
+    'Modular mode returns: CORE.md, PERSONALITY.md, MANIFEST.json, DISPATCH_RULES.json, ' +
+    'and every specialist module file in the modules/ directory. ' +
+    'Use to verify the health and completeness of skill files after any deployment, push, ' +
+    'or Railway redeploy. Safe read-only operation; no files are modified.',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    required: [],
+  },
+};
+
+export async function handleSkillAudit(_args) {
+  const skillPath    = process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md';
+  const baseDir      = skillPath.replace(/SKILL\.md$/, '');
+  const avaDir       = baseDir + 'ava/';
+  const modularEnabled = process.env.SKILL_MODULAR_ENABLED === 'true';
+
+  // Build a file-info record for a single path.
+  // label   - short human-readable name shown in results (e.g. "SKILL.md")
+  // fullPath - absolute path on the Railway volume
+  // relPath  - shown as the "file" field in the result (baseDir-relative when possible)
+  function fileInfo(fullPath, label) {
+    const relPath = fullPath.startsWith(baseDir)
+      ? fullPath.slice(baseDir.length)
+      : fullPath;
+
+    if (!existsSync(fullPath)) {
+      return { label, file: relPath, exists: false, lines: null, last_modified: null, size_bytes: null };
+    }
+
+    try {
+      const stat    = statSync(fullPath);
+      const content = readFileSync(fullPath, 'utf8');
+      const lines   = content.split('\n').length;
+      return {
+        label,
+        file:          relPath,
+        exists:        true,
+        lines,
+        last_modified: stat.mtime.toISOString(),
+        size_bytes:    stat.size,
+      };
+    } catch (err) {
+      log('warn', `skill_audit: could not stat/read ${fullPath}: ${err.message}`);
+      return {
+        label,
+        file:    relPath,
+        exists:  true,
+        error:   err.message,
+        lines:   null,
+        last_modified: null,
+        size_bytes:    null,
+      };
+    }
+  }
+
+  const result = {
+    mode:             modularEnabled ? 'modular' : 'canonical',
+    skill_path_base:  baseDir,
+    files:            [],
+    summary:          {},
+  };
+
+  if (modularEnabled) {
+    // -------------------------------------------------------------------
+    // Modular mode: audit CORE, PERSONALITY, MANIFEST, DISPATCH_RULES,
+    // and every file in the modules/ directory (recursive).
+    // -------------------------------------------------------------------
+    result.files.push(fileInfo(avaDir + 'CORE.md',              'CORE.md'));
+    result.files.push(fileInfo(avaDir + 'PERSONALITY.md',       'PERSONALITY.md'));
+    result.files.push(fileInfo(avaDir + 'MANIFEST.json',        'MANIFEST.json'));
+    result.files.push(fileInfo(avaDir + 'DISPATCH_RULES.json',  'DISPATCH_RULES.json'));
+
+    // Walk the modules/ directory
+    const modulesDir = avaDir + 'modules/';
+    if (existsSync(modulesDir)) {
+      let moduleEntries;
+      try {
+        // Node >= 18.17 supports { recursive: true }
+        moduleEntries = readdirSync(modulesDir, { recursive: true, withFileTypes: true });
+      } catch {
+        // Fallback: flat read (non-recursive)
+        moduleEntries = readdirSync(modulesDir).map(name => ({ name, isDirectory: () => false }));
+      }
+
+      const moduleFiles = moduleEntries
+        .filter(entry => !entry.isDirectory())
+        .map(entry => {
+          // withFileTypes + recursive gives `path` property in Node >= 20
+          const entryPath = entry.path ? `${entry.path}/${entry.name}` : `${modulesDir}${entry.name}`;
+          const relLabel  = entryPath.startsWith(modulesDir)
+            ? 'modules/' + entryPath.slice(modulesDir.length)
+            : entry.name;
+          return { fullPath: entryPath, label: relLabel };
+        })
+        .sort((a, b) => a.label.localeCompare(b.label));
+
+      for (const { fullPath, label } of moduleFiles) {
+        result.files.push(fileInfo(fullPath, label));
+      }
+    } else {
+      result.modules_dir_note = `modules/ directory not found at ${modulesDir}. Run Push All Module Files from WordPress to populate.`;
+    }
+  } else {
+    // -------------------------------------------------------------------
+    // Canonical mode: SKILL.md, PROFILES.md, PERSONALITY.md, BOOKS_READ.md
+    // -------------------------------------------------------------------
+    const profilesPath   = process.env.PROFILES_FILE_PATH
+      || skillPath.replace(/SKILL\.md$/, 'PROFILES.md');
+    const personalityPath = avaDir + 'PERSONALITY.md';
+    const booksPath       = skillPath.replace(/SKILL\.md$/, 'BOOKS_READ.md');
+
+    result.files.push(fileInfo(skillPath,      'SKILL.md'));
+    result.files.push(fileInfo(profilesPath,   'PROFILES.md'));
+    result.files.push(fileInfo(personalityPath, 'PERSONALITY.md'));
+    result.files.push(fileInfo(booksPath,       'BOOKS_READ.md'));
+  }
+
+  // Build summary
+  const existing = result.files.filter(f => f.exists);
+  const missing  = result.files.filter(f => !f.exists);
+  result.summary = {
+    mode:         result.mode,
+    files_found:  existing.length,
+    files_missing: missing.length,
+    missing_files: missing.map(f => f.file),
+    total_lines:  existing.reduce((sum, f) => sum + (f.lines || 0), 0),
+  };
+
+  log('info', `skill_audit: ${result.mode} mode, ${existing.length} files found, ${missing.length} missing`);
+
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(result, null, 2),
+    }],
+  };
 }
