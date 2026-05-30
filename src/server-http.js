@@ -1,4 +1,4 @@
-// src/server-http.js  v11.2.1
+// src/server-http.js  v11.3.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -373,7 +373,7 @@ const SKILL_ENABLED = Boolean(config.skillFilePath);
 const SKILL_MODULAR_ENABLED = SKILL_ENABLED && process.env.SKILL_MODULAR_ENABLED === "true";
 
 // ---------------------------------------------------------------------------
-// Runtime modular mode helpers (v11.2.1)
+// Runtime modular mode helpers (v11.3.0)
 //
 // SKILL_MODULAR_ENABLED (above) reflects the env var at startup time only.
 // isModularEnabled() checks a mode file on the Railway volume first, allowing
@@ -659,7 +659,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "11.2.1" },
+    { name: "claude-connector", version: "11.3.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -967,7 +967,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "11.2.1",
+    version: "11.3.0",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -1556,7 +1556,7 @@ app.post("/restore-dispatch-rules", async (req, res) => {
 // 404
 // -----------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Modular mode read/write endpoints (v11.2.1)
+// Modular mode read/write endpoints (v11.3.0)
 // GET  /modular-mode         - returns effective mode, source, and env var value (no auth)
 // POST /set-modular-mode     - writes .modular_mode file (requires X-Railway-Restore-Token)
 //
@@ -1633,7 +1633,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v11.2.1 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v11.3.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1662,6 +1662,7 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `Profiles: ${PROFILES_ENABLED ? "ENABLED (profile_read, profile_write_person)" : "disabled (set SKILL_FILE_PATH or PROFILES_FILE_PATH to enable)"}`);
   log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
   log("info", `Modular skill: env_var=${process.env.SKILL_MODULAR_ENABLED || "not set"} | effective=${isModularEnabled() ? "ENABLED" : "disabled"} | runtime toggle: GET /modular-mode, POST /set-modular-mode`);
+  log("info", `Person-aware dispatch: AVA_PERSON_PRIOR_ENABLED=${process.env.AVA_PERSON_PRIOR_ENABLED || "not set (defaults true)"}`);
   log("info", `Module restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-modules, /restore-personality, /restore-dispatch-rules)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)

@@ -1,4 +1,4 @@
-// src/tools/skill-modular.js  v11.0.0
+// src/tools/skill-modular.js  v11.3.0
 // Modular skill system for Ava.
 //
 // Four tools:
@@ -15,13 +15,16 @@
 //   DISPATCH_RULES.json          - learned routing intelligence (evolves with feedback)
 //   modules/                     - specialist module files
 //
-// Dispatcher algorithm (5 layers):
-//   Layer 0: Mandatory modules from trigger conditions
-//   Layer 1: Lexical/phrasal scoring against MANIFEST triggers
-//   Layer 2: Tag-web association
-//   Layer 3: Adjacency expansion
-//   Layer 4: Dependency resolution
-//   Layer 5: Budget enforcement and demotion
+// Dispatcher algorithm (6 layers from v11.3.0):
+//   Layer 0: Person Prior - module frequency boost from PROFILES.md (NEW v11.3.0)
+//   Layer 1: Mandatory modules from trigger conditions
+//   Layer 2: Lexical/phrasal scoring against MANIFEST triggers
+//   Layer 3: Tag-web association
+//   Layer 4: Adjacency expansion
+//   Layer 5: Dependency resolution
+//   Layer 6: Budget enforcement and demotion
+//
+// Works for any person with a module_frequency table in PROFILES.md.
 //
 // Compilation is fast: the MANIFEST is small (~50KB), walked programmatically.
 // All editing and file I/O happens in Node.js, no LLM calls during compilation.
@@ -51,6 +54,7 @@ function getModularPaths() {
     modulesDir:        avaDir + 'modules/',
     archiveDir:        avaDir + 'archive/',
     canonicalSkill:    skillFilePath,
+    profilesFile:      process.env.PROFILES_FILE_PATH || skillFilePath.replace(/SKILL\.md$/, 'PROFILES.md'),
   };
 }
 
@@ -73,8 +77,86 @@ function countLines(content) {
   return content ? content.split('\n').length : 0;
 }
 
+
 // ---------------------------------------------------------------------------
-// Dispatcher - 5-layer algorithm
+// Layer 0: Person Prior (v11.3.0)
+// ---------------------------------------------------------------------------
+
+function parseModuleFrequency(profilesContent, personName) {
+  if (!profilesContent || !personName) return null;
+  const lines = profilesContent.split('\n');
+  const escapedName = personName.trim().replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+  const personHeaderRe = new RegExp('^##\\s+' + escapedName + '\\s*$', 'i');
+  let inPerson = false, inFreq = false, headerSeen = false, maxTotal = 0;
+  const rows = [];
+  for (const line of lines) {
+    if (!inPerson) { if (personHeaderRe.test(line)) inPerson = true; continue; }
+    if (/^##\s/.test(line)) break;
+    if (!inFreq) { if (/^###\s+[Mm]odule\s+[Ff]requency/.test(line)) inFreq = true; continue; }
+    if (/^###/.test(line)) break;
+    if (/^\|/.test(line)) {
+      const cells = line.split('|').map(c => c.trim()).filter(Boolean);
+      if (!headerSeen) { if (cells[0] === 'module_id') headerSeen = true; continue; }
+      if (/^[-:]+$/.test(cells[0])) continue;
+      if (cells.length >= 4) {
+        const moduleId = cells[0], sessActive = parseInt(cells[1],10), sessTotal = parseInt(cells[2],10);
+        const frequency = parseFloat(cells[3]), lastActive = cells[4] || '';
+        if (moduleId && !isNaN(frequency)) {
+          rows.push({ module_id: moduleId, sessions_active: sessActive, sessions_total: sessTotal, frequency, last_active: lastActive });
+          if (sessTotal > maxTotal) maxTotal = sessTotal;
+        }
+      }
+    }
+  }
+  return rows.length > 0 ? { rows, sessions_total: maxTotal } : null;
+}
+
+function personPriorLayer(profilesFile, personName, priorConfig) {
+  const noop = { boostSet: new Set(), priorModules: [], active: false };
+  if (!personName) return noop;
+  if (priorConfig && priorConfig.enabled === false) {
+    log('info', 'skill-modular: person prior: disabled via config');
+    return noop;
+  }
+  const threshold   = (typeof priorConfig?.frequency_threshold      === 'number') ? priorConfig.frequency_threshold      : 0.6;
+  const maxModules  = (typeof priorConfig?.max_prior_modules         === 'number') ? priorConfig.max_prior_modules         : 12;
+  const minSessions = (typeof priorConfig?.min_sessions_before_prior === 'number') ? priorConfig.min_sessions_before_prior : 3;
+  let profilesContent = null;
+  try { if (existsSync(profilesFile)) profilesContent = readFileSync(profilesFile, 'utf8'); }
+  catch (err) { log('warn', `skill-modular: person prior: cannot read profiles: ${err.message}`); return noop; }
+  if (!profilesContent) {
+    log('info', 'skill-modular: person prior: PROFILES.md not found - Layer 0 no-op');
+    return noop;
+  }
+  const parsed = parseModuleFrequency(profilesContent, personName);
+  if (!parsed) {
+    log('info', `skill-modular: person prior: no module_frequency for "${personName}" - Layer 0 no-op`);
+    return noop;
+  }
+  if (parsed.sessions_total < minSessions) {
+    log('info', `skill-modular: person prior: sessions=${parsed.sessions_total} < min=${minSessions} - suppressed`);
+    return noop;
+  }
+  const qualified    = parsed.rows.filter(r => r.frequency >= threshold).sort((a,b) => b.frequency - a.frequency).slice(0, maxModules);
+  const priorModules = qualified.map(r => r.module_id);
+  log('info', `skill-modular: person prior for "${personName}": ${priorModules.length} modules (threshold=${threshold}, sessions=${parsed.sessions_total})`);
+  return { boostSet: new Set(priorModules), priorModules, active: priorModules.length > 0 };
+}
+
+function checkPriorOverride(priorConfig, priorModules, layer1Scores) {
+  if (!priorConfig?.override_on_conflicting_message) return false;
+  if (!priorModules || priorModules.length === 0) return false;
+  const lexical = Object.keys(layer1Scores);
+  if (lexical.length === 0) return false;
+  if (!priorModules.some(m => lexical.includes(m))) {
+    log('info', 'skill-modular: person prior: zero overlap with lexical - prior suppressed (conflicting session type)');
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher - 6-layer algorithm (Layer 0 = Person Prior v11.3.0)
 // ---------------------------------------------------------------------------
 
 function tokenise(text) {
@@ -271,7 +353,7 @@ function layer4Dependencies(manifest, candidateMap) {
   return additions;
 }
 
-function layer5Budget(manifest, finalCandidates, mandatorySet, highConfidenceSet) {
+function layer5Budget(manifest, finalCandidates, mandatorySet, highConfidenceSet, priorSet = new Set()) {
   const budget = manifest.budget || {};
   const maxLines = budget.max_compiled_lines || 750;
   const coreLines = budget.core_reserve_lines || 250;
@@ -294,8 +376,10 @@ function layer5Budget(manifest, finalCandidates, mandatorySet, highConfidenceSet
   // Need to demote - sort by score ascending (lowest first) to demote cheapest first
   // Protected: mandatory and high-confidence
   const demotionOrder = budget.demotion_order || ['weak_co_load', 'co_load_low_weight', 'co_load_high_weight', 'primary_low_weight'];
-  const surviving = candidates.filter(id => mandatorySet.has(id) || highConfidenceSet.has(id));
-  const demotion = candidates.filter(id => !mandatorySet.has(id) && !highConfidenceSet.has(id));
+  const tier1     = candidates.filter(id => mandatorySet.has(id) || highConfidenceSet.has(id));
+  const tier2     = candidates.filter(id => !mandatorySet.has(id) && !highConfidenceSet.has(id) &&  priorSet.has(id));
+  const surviving = [...tier1, ...tier2];
+  const demotion  = candidates.filter(id => !mandatorySet.has(id) && !highConfidenceSet.has(id) && !priorSet.has(id));
 
   // Sort demotion candidates: put lower-scored ones first
   let currentTotal = 0;
@@ -333,7 +417,7 @@ function applyLearnedLinkages(dispatchRules, query, candidates) {
   return additions;
 }
 
-function compileSkill(query, contextHint, paths) {
+function compileSkill(query, contextHint, paths, personPrior = null) {
   const manifest = readJsonFile(paths.manifestFile, { modules: [], mandatory_for_triggers: {}, tag_web: {}, budget: {} });
   const dispatchRules = readJsonFile(paths.dispatchRulesFile, { layer0_mandatory: { rules: [] }, learned_linkages: { rules: [] } });
 
@@ -344,11 +428,16 @@ function compileSkill(query, contextHint, paths) {
   const conditions = detectTriggerConditions(query);
   log('info', `skill-modular: conditions detected: ${conditions.join(', ') || 'none'}`);
 
-  // Layer 0 - mandatory
-  const mandatorySet = layer0Mandatory(manifest, dispatchRules, conditions);
-  log('info', `skill-modular: layer0 mandatory: ${[...mandatorySet].join(', ')}`);
+  // Person prior boosting set
+  const priorBoostSet   = personPrior?.boostSet    || new Set();
+  const priorModuleList = personPrior?.priorModules || [];
+  const priorActive     = personPrior?.active       || false;
 
-  // Layer 1 - lexical scoring
+  // Layer 1 - mandatory
+  const mandatorySet = layer0Mandatory(manifest, dispatchRules, conditions);
+  log('info', `skill-modular: layer1 mandatory: ${[...mandatorySet].join(', ')}`);
+
+  // Layer 2 - lexical scoring
   const layer1Scores = layer1Score(manifest, query, contextHint);
   const highConfidenceSet = new Set(
     Object.entries(layer1Scores).filter(([, v]) => v.highConfidence).map(([id]) => id)
@@ -357,22 +446,37 @@ function compileSkill(query, contextHint, paths) {
 
   // Add mandatory to candidate map
   for (const id of mandatorySet) {
-    candidateMap[id] = Math.max(candidateMap[id] || 0, 10); // mandatory gets max score
+    candidateMap[id] = Math.max(candidateMap[id] || 0, 10);
   }
 
-  // Layer 2 - tag web
+  // Layer 0 injection: apply person prior AFTER lexical scoring.
+  // Override check: zero overlap with lexical candidates suppresses prior.
+  const priorCfg      = dispatchRules.person_prior_config || {};
+  const priorOverride = checkPriorOverride(priorCfg, priorModuleList, layer1Scores);
+  const activePriorSet = priorOverride ? new Set() : priorBoostSet;
+
+  if (priorActive && !priorOverride) {
+    for (const id of activePriorSet) {
+      if (!mandatorySet.has(id)) {
+        candidateMap[id] = Math.max(candidateMap[id] || 0, 3.0); // prior score: above tag-web, below mandatory
+      }
+    }
+    log('info', `skill-modular: layer0 prior injected: ${priorModuleList.join(', ')}`);
+  }
+
+  // Layer 3 - tag web
   const layer2 = layer2TagWeb(manifest, candidateMap);
   for (const [id, score] of Object.entries(layer2)) {
     candidateMap[id] = Math.max(candidateMap[id] || 0, score);
   }
 
-  // Layer 3 - adjacency
+  // Layer 4 - adjacency
   const layer3 = layer3Adjacency(manifest, Object.keys(candidateMap));
   for (const [id, score] of Object.entries(layer3)) {
     candidateMap[id] = Math.max(candidateMap[id] || 0, score);
   }
 
-  // Layer 4 - dependencies
+  // Layer 5 - dependencies
   const layer4 = layer4Dependencies(manifest, candidateMap);
   for (const [id, score] of Object.entries(layer4)) {
     candidateMap[id] = Math.max(candidateMap[id] || 0, score);
@@ -384,9 +488,9 @@ function compileSkill(query, contextHint, paths) {
     candidateMap[id] = Math.max(candidateMap[id] || 0, 0.5);
   }
 
-  // Layer 5 - budget enforcement
+  // Layer 6 - budget enforcement (prior-boosted = tier-2 protected)
   const allCandidates = Object.keys(candidateMap);
-  const survivingIds = layer5Budget(manifest, allCandidates, mandatorySet, highConfidenceSet);
+  const survivingIds = layer5Budget(manifest, allCandidates, mandatorySet, highConfidenceSet, activePriorSet);
 
   // Separate meta-self-check (always last)
   const selfCheckId = 'meta-self-check';
@@ -422,12 +526,17 @@ function compileSkill(query, contextHint, paths) {
   }
 
   const compiled = parts.join('');
+  const priorLoaded = priorModuleList.filter(id => survivingIds.includes(id));
+  const priorCut    = priorModuleList.filter(id => !survivingIds.includes(id));
+  if (priorCut.length > 0) log('info', `skill-modular: prior modules cut by budget: ${priorCut.join(', ')}`);
   return {
     compiled,
-    modules_loaded: [selfCheckId, ...orderedIds, selfCheckId !== orderedIds[orderedIds.length - 1] ? selfCheckId : null].filter(Boolean),
-    conditions_detected: conditions,
-    line_count: countLines(compiled),
-    specialist_count: orderedIds.length,
+    modules_loaded:          [...orderedIds, selfCheckId],
+    conditions_detected:     conditions,
+    line_count:              countLines(compiled),
+    specialist_count:        orderedIds.length,
+    person_prior_modules:    priorLoaded,
+    person_prior_overridden: priorOverride || false,
   };
 }
 
@@ -439,9 +548,13 @@ export const skillCompileToolDefinition = {
   name: 'skill_compile',
   description:
     'Compile a session SKILL.md from CORE.md + selected specialist modules based on the opening ' +
-    'query and context_hint. Runs the 5-layer dispatcher (mandatory, lexical, tag-web, adjacency, ' +
-    'budget) and returns a compiled skill file in the same format as skill_read so the session stub ' +
-    'needs no changes. Call at session start in place of skill_read when SKILL_MODULAR_ENABLED=true.',
+    'query and context_hint. Runs the 6-layer dispatcher (person prior, mandatory, lexical, ' +
+    'tag-web, adjacency, budget) and returns a compiled skill file in the same format as skill_read ' +
+    'so the session stub needs no changes. Call at session start in place of skill_read when ' +
+    'SKILL_MODULAR_ENABLED=true. Pass person_name from profile_read result to activate Layer 0 ' +
+    'person-aware dispatching: modules with frequency >= threshold in that person\'s PROFILES.md ' +
+    'module_frequency table are boosted as a floor before lexical layers run. Works for any person ' +
+    'in PROFILES.md, not only Brian.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -452,6 +565,10 @@ export const skillCompileToolDefinition = {
       context_hint: {
         type: 'string',
         description: 'The context_hint string constructed for memory_get_session_context. Used as additional signal for module selection.',
+      },
+      person_name: {
+        type: 'string',
+        description: 'Name of the person from profile_read (e.g. "Brian" or "Mai"). Activates Layer 0 person-aware dispatch: modules with frequency >= threshold in that person\'s PROFILES.md module_frequency table are boosted into the compile as a prior floor. Optional but strongly recommended when profile_read has run. Omit for anonymous or unrecognised persons.',
       },
       session_id: {
         type: 'string',
@@ -570,14 +687,30 @@ export async function handleSkillCompile(args) {
     };
   }
 
-  const query = typeof args.query === 'string' ? args.query : '';
-  const contextHint = typeof args.context_hint === 'string' ? args.context_hint : '';
-  const sessionId = typeof args.session_id === 'string' ? args.session_id : new Date().toISOString().slice(0, 10);
+  const query       = typeof args.query        === 'string' ? args.query.trim()        : '';
+  const contextHint = typeof args.context_hint  === 'string' ? args.context_hint.trim()  : '';
+  const personName  = typeof args.person_name   === 'string' ? args.person_name.trim()   : '';
+  const sessionId   = typeof args.session_id    === 'string' ? args.session_id            : new Date().toISOString().slice(0, 10);
+
+  // Layer 0: Person Prior - module frequency prior from PROFILES.md.
+  // Gated by AVA_PERSON_PRIOR_ENABLED env var (defaults to true).
+  const priorEnvEnabled  = process.env.AVA_PERSON_PRIOR_ENABLED !== 'false';
+  const dispatchRulesRaw = readJsonFile(paths.dispatchRulesFile, {});
+  const priorConfig      = dispatchRulesRaw.person_prior_config || {};
+  const personPrior      = (priorEnvEnabled && personName)
+    ? personPriorLayer(paths.profilesFile, personName, priorConfig)
+    : { boostSet: new Set(), priorModules: [], active: false };
+
+  if (!priorEnvEnabled) log('info', 'skill_compile: AVA_PERSON_PRIOR_ENABLED=false - Layer 0 skipped');
 
   try {
-    const result = compileSkill(query, contextHint, paths);
+    const result = compileSkill(query, contextHint, paths, personPrior);
 
-    log('info', `skill_compile: session ${sessionId}: ${result.specialist_count} specialists, ${result.line_count} lines`);
+    const priorNote = personPrior.active
+      ? `Person prior (${personName}): ${result.person_prior_modules?.length || 0}/${personPrior.priorModules.length} prior modules loaded${result.person_prior_overridden ? ' [overridden]' : ''}.`
+      : `Person prior: inactive (${personName ? 'no frequency data or below min_sessions' : 'no person_name supplied'}).`;
+
+    log('info', `skill_compile: session ${sessionId}: ${result.specialist_count} specialists, ${result.line_count} lines. ${priorNote}`);
 
     return {
       content: [{
@@ -586,11 +719,14 @@ export async function handleSkillCompile(args) {
           content: result.compiled,
           target: 'compiled',
           session_id: sessionId,
-          conditions_detected: result.conditions_detected,
-          modules_loaded: result.modules_loaded,
-          specialist_count: result.specialist_count,
-          line_count: result.line_count,
-          note: `Modular compilation: ${result.specialist_count} specialists + CORE. Conditions: ${result.conditions_detected.join(', ') || 'none'}.`,
+          conditions_detected:     result.conditions_detected,
+          modules_loaded:          result.modules_loaded,
+          specialist_count:        result.specialist_count,
+          line_count:              result.line_count,
+          person_prior_modules:    result.person_prior_modules   || [],
+          person_prior_overridden: result.person_prior_overridden || false,
+          person_prior_active:     personPrior.active,
+          note: `Modular compilation: ${result.specialist_count} specialists + CORE. Conditions: ${result.conditions_detected.join(', ') || 'none'}. ${priorNote}`,
           additions_count: 0,
           additions_content: '',
           additions_note: 'No pending additions in modular mode. Use skill_write_addition for IFA cycle additions to canonical SKILL.md.',
