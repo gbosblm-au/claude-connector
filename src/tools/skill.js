@@ -666,12 +666,36 @@ export async function handleSkillAudit(_args) {
   const skillPath    = process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md';
   const baseDir      = skillPath.replace(/SKILL\.md$/, '');
   const avaDir       = baseDir + 'ava/';
-  const modularEnabled = process.env.SKILL_MODULAR_ENABLED === 'true';
+
+  // ---------------------------------------------------------------------------
+  // Determine effective mode by reading the mode file first (mirrors
+  // isModularEnabled() in server-http.js). The mode file at baseDir/.modular_mode
+  // takes precedence over the SKILL_MODULAR_ENABLED env var when present.
+  // This is the same logic the ListTools handler uses to decide whether to
+  // include skill_compile in the tool list.
+  // ---------------------------------------------------------------------------
+  const modeFilePath  = baseDir + '.modular_mode';
+  const envVarValue   = process.env.SKILL_MODULAR_ENABLED || 'not set';
+  let modeSource      = 'env_var';
+  let modeFileValue   = null;
+  let modularEnabled  = false;
+
+  if (existsSync(modeFilePath)) {
+    try {
+      modeFileValue  = readFileSync(modeFilePath, 'utf8').trim();
+      modularEnabled = modeFileValue === 'true';
+      modeSource     = 'mode_file';
+    } catch (err) {
+      log('warn', `skill_audit: could not read mode file ${modeFilePath}: ${err.message}`);
+      // Fall through to env var
+    }
+  }
+
+  if (modeSource === 'env_var') {
+    modularEnabled = envVarValue === 'true';
+  }
 
   // Build a file-info record for a single path.
-  // label   - short human-readable name shown in results (e.g. "SKILL.md")
-  // fullPath - absolute path on the Railway volume
-  // relPath  - shown as the "file" field in the result (baseDir-relative when possible)
   function fileInfo(fullPath, label) {
     const relPath = fullPath.startsWith(baseDir)
       ? fullPath.slice(baseDir.length)
@@ -708,11 +732,17 @@ export async function handleSkillAudit(_args) {
   }
 
   const result = {
-    mode:             modularEnabled ? 'modular' : 'canonical',
-    skill_path_base:  baseDir,
-    files:            [],
-    summary:          {},
+    mode:            modularEnabled ? 'modular' : 'canonical',
+    mode_source:     modeSource,
+    env_var:         envVarValue,
+    mode_file_path:  modeFilePath,
+    skill_path_base: baseDir,
+    files:           [],
+    summary:         {},
   };
+
+  // Include mode_file_value in output only when the file is present
+  if (modeFileValue !== null) result.mode_file_value = modeFileValue;
 
   if (modularEnabled) {
     // -------------------------------------------------------------------
@@ -739,7 +769,6 @@ export async function handleSkillAudit(_args) {
       const moduleFiles = moduleEntries
         .filter(entry => !entry.isDirectory())
         .map(entry => {
-          // withFileTypes + recursive gives `path` property in Node >= 20
           const entryPath = entry.path ? `${entry.path}/${entry.name}` : `${modulesDir}${entry.name}`;
           const relLabel  = entryPath.startsWith(modulesDir)
             ? 'modules/' + entryPath.slice(modulesDir.length)
@@ -758,13 +787,13 @@ export async function handleSkillAudit(_args) {
     // -------------------------------------------------------------------
     // Canonical mode: SKILL.md, PROFILES.md, PERSONALITY.md, BOOKS_READ.md
     // -------------------------------------------------------------------
-    const profilesPath   = process.env.PROFILES_FILE_PATH
+    const profilesPath    = process.env.PROFILES_FILE_PATH
       || skillPath.replace(/SKILL\.md$/, 'PROFILES.md');
     const personalityPath = avaDir + 'PERSONALITY.md';
     const booksPath       = skillPath.replace(/SKILL\.md$/, 'BOOKS_READ.md');
 
-    result.files.push(fileInfo(skillPath,      'SKILL.md'));
-    result.files.push(fileInfo(profilesPath,   'PROFILES.md'));
+    result.files.push(fileInfo(skillPath,       'SKILL.md'));
+    result.files.push(fileInfo(profilesPath,    'PROFILES.md'));
     result.files.push(fileInfo(personalityPath, 'PERSONALITY.md'));
     result.files.push(fileInfo(booksPath,       'BOOKS_READ.md'));
   }
@@ -772,15 +801,39 @@ export async function handleSkillAudit(_args) {
   // Build summary
   const existing = result.files.filter(f => f.exists);
   const missing  = result.files.filter(f => !f.exists);
+
   result.summary = {
-    mode:         result.mode,
-    files_found:  existing.length,
-    files_missing: missing.length,
-    missing_files: missing.map(f => f.file),
-    total_lines:  existing.reduce((sum, f) => sum + (f.lines || 0), 0),
+    mode:           result.mode,
+    mode_source:    modeSource,
+    files_found:    existing.length,
+    files_missing:  missing.length,
+    missing_files:  missing.map(f => f.file),
+    total_lines:    existing.reduce((sum, f) => sum + (f.lines || 0), 0),
   };
 
-  log('info', `skill_audit: ${result.mode} mode, ${existing.length} files found, ${missing.length} missing`);
+  // ---------------------------------------------------------------------------
+  // Modular readiness check: if mode file says modular but core modular files
+  // are missing, skill_compile will fail even though it appears in the tool list.
+  // Surface this clearly so the problem is immediately actionable.
+  // ---------------------------------------------------------------------------
+  if (modularEnabled) {
+    const coreExists     = existsSync(avaDir + 'CORE.md');
+    const manifestExists = existsSync(avaDir + 'MANIFEST.json');
+    if (!coreExists || !manifestExists) {
+      result.summary.modular_readiness = 'NOT READY';
+      result.summary.modular_readiness_note =
+        'Modular mode is enabled (mode file = true) but required files are missing from Railway. ' +
+        'skill_compile will appear in the tool list but will fail when called. ' +
+        'Run Push All Module Files from WordPress (Ava Skill > Modules tab) to populate ' +
+        `${avaDir} with CORE.md, MANIFEST.json, and all specialist modules before starting a modular session.`;
+    } else {
+      result.summary.modular_readiness = 'READY';
+      result.summary.modular_readiness_note =
+        'CORE.md and MANIFEST.json present. skill_compile should load successfully.';
+    }
+  }
+
+  log('info', `skill_audit: mode=${result.mode} (${modeSource}), env_var=${envVarValue}, files_found=${existing.length}, missing=${missing.length}`);
 
   return {
     content: [{
