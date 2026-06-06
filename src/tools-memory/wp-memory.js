@@ -31,6 +31,31 @@ import { ToolError } from './errors.js';
    HTTP helper
    ========================================================================= */
 
+// ---------------------------------------------------------------------------
+// v12.0.0: Tenant-aware config and fetch.
+// In tenant mode, memory calls route to the ts-gateway/v1/memory/* endpoints
+// with api_key in the POST body. In owner mode, the original wp-memory path
+// is used with X-Ava-Memory-Key header.
+// ---------------------------------------------------------------------------
+
+function getClientMode() {
+  return (process.env.TS_CLIENT_MODE || 'owner').toLowerCase();
+}
+
+function getGatewayConfig() {
+  const gatewayUrl = (process.env.TS_TENANT_GATEWAY_URL || '').replace(/\/$/, '');
+  const apiKey     = process.env.TS_CLIENT_API_KEY || '';
+  const tenantId   = process.env.TS_TENANT_ID || '';
+  if (!gatewayUrl || !apiKey) {
+    throw new ToolError(
+      'TENANT_GATEWAY_NOT_CONFIGURED',
+      'TS_TENANT_GATEWAY_URL and TS_CLIENT_API_KEY must both be set for tenant memory access.',
+      503,
+    );
+  }
+  return { gatewayUrl, apiKey, tenantId };
+}
+
 function getWpConfig() {
   const wpUrl = (config.avaMemoryWpUrl || '').replace(/\/$/, '');
   const wpKey = config.avaMemoryWpKey || '';
@@ -44,14 +69,74 @@ function getWpConfig() {
   return { wpUrl, wpKey };
 }
 
+/**
+ * Unified memory fetch. In tenant mode routes to the gateway memory endpoints.
+ * In owner mode uses the existing wp-memory path unchanged.
+ *
+ * Tenant gateway endpoints expect { api_key, ...payload } in the POST body.
+ * The gateway validates the key, resolves the tenant_id, and namespaces the record.
+ */
 async function wpFetch(path, options = {}) {
+  const mode = getClientMode();
+
+  if (mode === 'tenant') {
+    const { gatewayUrl, apiKey } = getGatewayConfig();
+    // Remap owner memory paths to gateway memory paths
+    // e.g. /write -> /memory/write, /read -> /memory/read
+    const segment = path.replace(/^\//, '');
+    const url = `${gatewayUrl}/memory/${segment}`;
+
+    // Inject api_key into the POST body
+    let body = {};
+    if (options.body) {
+      try { body = JSON.parse(options.body); } catch (_) {}
+    }
+    body.api_key = apiKey;
+
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent':   'claude-connector/12.0.0 (ts-gateway-tenant-memory)',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch (netErr) {
+      throw new ToolError(
+        'TENANT_GATEWAY_NETWORK_ERROR',
+        `Cannot reach tenant memory gateway at ${gatewayUrl}: ${netErr.message}`,
+        503,
+      );
+    }
+
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => '');
+      let detail = bodyText.slice(0, 300);
+      try {
+        const parsed = JSON.parse(bodyText);
+        detail = parsed.error || parsed.message || detail;
+      } catch (_) {}
+      throw new ToolError(
+        'TENANT_GATEWAY_API_ERROR',
+        `Tenant memory gateway returned ${res.status}: ${detail}`,
+        res.status >= 500 ? 502 : res.status,
+      );
+    }
+
+    return res.json();
+  }
+
+  // Owner mode: original behaviour unchanged
   const { wpUrl, wpKey } = getWpConfig();
   const url = `${wpUrl}${path}`;
 
   const headers = {
     'X-Ava-Memory-Key': wpKey,
     'Content-Type': 'application/json',
-    'User-Agent': 'claude-connector/7.0.1 (ava-memory-mysql-primary)',
+    'User-Agent': 'claude-connector/12.0.0 (ava-memory-mysql-primary)',
     ...options.headers,
   };
 

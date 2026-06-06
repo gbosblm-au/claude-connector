@@ -4,7 +4,7 @@
 
 // User-Agent string sent with all outbound HTTP requests.
 // Identifies the connector to remote servers and security systems.
-export const CONNECTOR_USER_AGENT = 'claude-connector/11.5.0 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)';
+export const CONNECTOR_USER_AGENT = 'claude-connector/12.0.0 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)';
 import { existsSync } from "node:fs";
 
 const DEFAULT_LINKEDIN_CSV_PATH = new URL("../data/connections.csv", import.meta.url).pathname;
@@ -181,6 +181,21 @@ export const config = {
   // ---------------------------------------------------------------------------
   avaMemoryWpUrl: (process.env.AVA_MEMORY_WP_URL || '').replace(/\/$/, ''),
   avaMemoryWpKey: process.env.AVA_MEMORY_WP_KEY || '',
+
+  // ---------------------------------------------------------------------------
+  // Multi-tenant client gateway (v12.0.0)
+  // TS_CLIENT_MODE:          'owner' (default) | 'tenant'
+  // TS_TENANT_GATEWAY_URL:   Base URL of TrueSource Client Gateway REST API
+  //                          e.g. https://truesourceconsulting.com.au/wp-json/ts-gateway/v1
+  // TS_CLIENT_API_KEY:       Plain API key generated for this tenant by the gateway plugin.
+  //                          Only set in tenant-mode connector deployments, never in owner deployment.
+  // TS_TENANT_ID:            Tenant ID slug (e.g. 'smith-partners').
+  //                          Used for Railway file path routing and memory namespace.
+  // ---------------------------------------------------------------------------
+  tsClientMode:        (process.env.TS_CLIENT_MODE           || 'owner').toLowerCase(),
+  tsTenantGatewayUrl:  (process.env.TS_TENANT_GATEWAY_URL    || '').replace(/\/$/, ''),
+  tsClientApiKey:       process.env.TS_CLIENT_API_KEY         || '',
+  tsTenantId:           process.env.TS_TENANT_ID              || '',
 
   // ---------------------------------------------------------------------------
   // Ava Skill Volume (v10.4.0)

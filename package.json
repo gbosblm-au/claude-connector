@@ -1,7 +1,7 @@
 {
   "name": "claude-connector",
-  "version": "11.5.0",
-  "description": "MCP server for Claude with persistent memory, real-time web search, news search, LinkedIn connections lookup, TrueSource outreach email send/tracking/scheduling, Google Drive/Calendar/Sheets integration, Slack/Teams messaging, inbound webhooks, WordPress publishing, image search/download, psychology assessment, plus comprehensive statistical analysis and machine learning",
+  "version": "12.0.0",
+  "description": "MCP server for Claude with persistent memory, real-time web search, news search, LinkedIn connections lookup, TrueSource outreach email send/tracking/scheduling, Google Drive/Calendar/Sheets integration, Slack/Teams messaging, inbound webhooks, WordPress publishing, image search/download, psychology assessment, plus comprehensive statistical analysis and machine learning + multi-tenant client gateway support",
   "type": "module",
   "main": "src/index.js",
   "scripts": {

@@ -44,17 +44,34 @@ import { log } from '../utils/logger.js';
 function getModularPaths() {
   const skillFilePath = process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md';
   const baseDir = skillFilePath.replace(/SKILL\.md$/, '');
-  const avaDir = baseDir + 'ava/';
+
+  // v12.0.0: Tenant mode. Client personal files (CORE, PERSONALITY, PROFILES,
+  // DISPATCH_RULES) live in /data/clients/{tenant_id}/. The shared module pool
+  // always stays in ava/modules/ so base module updates apply to all clients.
+  const clientMode   = (process.env.TS_CLIENT_MODE || 'owner').toLowerCase();
+  const tenantId     = process.env.TS_TENANT_ID || '';
+  const ownerAvaDir  = baseDir + 'ava/';
+
+  const avaDir = (clientMode === 'tenant' && tenantId)
+    ? `/data/clients/${tenantId}/`
+    : ownerAvaDir;
+
+  const sharedModulesDir = ownerAvaDir + 'modules/';
+
   return {
     avaDir,
     coreFile:          avaDir + 'CORE.md',
     personalityFile:   avaDir + 'PERSONALITY.md',
     manifestFile:      avaDir + 'MANIFEST.json',
     dispatchRulesFile: avaDir + 'DISPATCH_RULES.json',
-    modulesDir:        avaDir + 'modules/',
+    modulesDir:        sharedModulesDir,
     archiveDir:        avaDir + 'archive/',
     canonicalSkill:    skillFilePath,
-    profilesFile:      process.env.PROFILES_FILE_PATH || skillFilePath.replace(/SKILL\.md$/, 'PROFILES.md'),
+    profilesFile:      process.env.PROFILES_FILE_PATH || avaDir + 'PROFILES.md',
+    isTenantMode:      clientMode === 'tenant',
+    tenantId,
+    ownerAvaDir,
+    sharedModulesDir,
   };
 }
 

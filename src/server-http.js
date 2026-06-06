@@ -1,4 +1,4 @@
-// src/server-http.js  v11.3.0
+// src/server-http.js  v12.0.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
@@ -31,6 +31,8 @@
 //              + tools: email_schedule, email_schedule_cancel, email_schedule_list
 
 import "dotenv/config";
+// v12.0.0: Tenant authentication middleware
+import { tenantAuthMiddleware, logTenantModeStatus, isTenantMode } from './middleware/tenantAuth.js';
 import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -1236,7 +1238,10 @@ app.get("/auth/linkedin/callback", async (req, res) => {
 // -----------------------------------------------------------------------
 const streamableSessions = {};
 
-app.all("/mcp", async (req, res) => {
+// v12.0.0: Tenant authentication gate.
+// In tenant mode, validates the API key against the TrueSource Client Gateway
+// before the MCP session is allowed to proceed. In owner mode this is a no-op.
+app.all("/mcp", tenantAuthMiddleware, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
   try {
     if (sessionId && streamableSessions[sessionId]) {
@@ -1793,6 +1798,7 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `Books restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-books)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
   log("info", `Profiles: ${PROFILES_ENABLED ? "ENABLED (profile_read, profile_write_person)" : "disabled (set SKILL_FILE_PATH or PROFILES_FILE_PATH to enable)"}`);
   log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
+    logTenantModeStatus();
   log("info", `Modular skill: env_var=${process.env.SKILL_MODULAR_ENABLED || "not set"} | effective=${isModularEnabled() ? "ENABLED" : "disabled"} | runtime toggle: GET /modular-mode, POST /set-modular-mode`);
   log("info", `Person-aware dispatch: AVA_PERSON_PRIOR_ENABLED=${process.env.AVA_PERSON_PRIOR_ENABLED || "not set (defaults true)"}`);
   log("info", `Module restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-modules, /restore-personality, /restore-dispatch-rules)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
