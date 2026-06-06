@@ -354,6 +354,31 @@ import {
   handleAvaMemoryRestore,
   handleAvaMemorySyncStatus,
 } from "./tools/avaMemorySync.js";
+import {
+  moduleWriteToolDefinition,
+  archiveListToolDefinition,
+  archiveReadToolDefinition,
+  archiveWriteToolDefinition,
+  referenceListToolDefinition,
+  referenceReadToolDefinition,
+  referenceWriteToolDefinition,
+  scriptListToolDefinition,
+  scriptReadToolDefinition,
+  scriptWriteToolDefinition,
+  handleModuleWrite,
+  handleArchiveList,
+  handleArchiveRead,
+  handleArchiveWrite,
+  handleReferenceList,
+  handleReferenceRead,
+  handleReferenceWrite,
+  handleScriptList,
+  handleScriptRead,
+  handleScriptWrite,
+  handleArchiveRestoreFromWp,
+  handleReferenceRestoreFromWp,
+  handleScriptRestoreFromWp,
+} from "./tools/skill-content.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -615,6 +640,16 @@ const TOOLS = [
         skillAuditToolDefinition,
         booksReadToolDefinition,
         booksLogWriteToolDefinition,
+        // ---------- Content sections (archive / references / scripts) ----------
+        archiveListToolDefinition,
+        archiveReadToolDefinition,
+        archiveWriteToolDefinition,
+        referenceListToolDefinition,
+        referenceReadToolDefinition,
+        referenceWriteToolDefinition,
+        scriptListToolDefinition,
+        scriptReadToolDefinition,
+        scriptWriteToolDefinition,
       ]
     : []),
 
@@ -627,6 +662,7 @@ const TOOLS = [
         skillLoadSpecialistToolDefinition,
         personalityWriteToolDefinition,
         dispatchRuleAddToolDefinition,
+        moduleWriteToolDefinition,
       ]
     : []),
 
@@ -659,7 +695,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "11.3.0" },
+    { name: "claude-connector", version: "11.4.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -669,7 +705,7 @@ function createMcpServer() {
     // The static TOOLS array is correct for all non-modular tools; we just replace
     // the modular section with a live isModularEnabled() check.
     const MODULAR_TOOL_NAMES = new Set([
-      "skill_compile", "skill_load_specialist", "personality_write", "dispatch_rule_add",
+      "skill_compile", "skill_load_specialist", "personality_write", "dispatch_rule_add", "module_write",
     ]);
     const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
     const modularTools = isModularEnabled()
@@ -678,6 +714,7 @@ function createMcpServer() {
           skillLoadSpecialistToolDefinition,
           personalityWriteToolDefinition,
           dispatchRuleAddToolDefinition,
+          moduleWriteToolDefinition,
         ]
       : [];
     return { tools: [...baseTools, ...modularTools] };
@@ -832,8 +869,19 @@ function createMcpServer() {
         case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
         case "personality_write":       return await handlePersonalityWrite(args);
         case "dispatch_rule_add":       return await handleDispatchRuleAdd(args);
+        case "module_write":            return await handleModuleWrite(args);
         case "books_read":             return await handleBooksRead(args);
         case "books_log_write":        return await handleBooksLogWrite(args);
+        // ---------- Content Sections: Archive / References / Scripts (v11.4.0) ----------
+        case "archive_list":            return handleArchiveList(args);
+        case "archive_read":            return handleArchiveRead(args);
+        case "archive_write":           return await handleArchiveWrite(args);
+        case "reference_list":          return handleReferenceList(args);
+        case "reference_read":          return handleReferenceRead(args);
+        case "reference_write":         return await handleReferenceWrite(args);
+        case "script_list":             return handleScriptList(args);
+        case "script_read":             return handleScriptRead(args);
+        case "script_write":            return await handleScriptWrite(args);
 
         // ---------- Ava User Profiles (v10.8.0) ----------
         case "profile_read":           return await handleProfileRead(args);
@@ -1552,6 +1600,87 @@ app.post("/restore-dispatch-rules", async (req, res) => {
   }
 });
 
+// POST /restore-archive
+// Receives archive file(s) push from the WordPress admin "Push to Railway" button.
+// Body: { files: { "filename.md": "content" }, change_summary?, source? }
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+app.post("/restore-archive", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(503).json({ error: "SKILL_FILE_PATH not set. Cannot restore archive." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+  }
+  const providedToken = req.headers["x-railway-restore-token"] || "";
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
+  }
+  try {
+    const body   = req.body || {};
+    const result = await handleArchiveRestoreFromWp(body);
+    if (!result.success) return res.status(500).json(result);
+    log("info", `restore-archive: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
+    return res.json(result);
+  } catch (err) {
+    log("error", `restore-archive exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /restore-references
+// Receives reference file(s) push from the WordPress admin "Push to Railway" button.
+// Body: { files: { "filename.md": "content" }, change_summary?, source? }
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+app.post("/restore-references", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(503).json({ error: "SKILL_FILE_PATH not set. Cannot restore references." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+  }
+  const providedToken = req.headers["x-railway-restore-token"] || "";
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
+  }
+  try {
+    const body   = req.body || {};
+    const result = await handleReferenceRestoreFromWp(body);
+    if (!result.success) return res.status(500).json(result);
+    log("info", `restore-references: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
+    return res.json(result);
+  } catch (err) {
+    log("error", `restore-references exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /restore-scripts
+// Receives script file(s) push from the WordPress admin "Push to Railway" button.
+// Body: { files: { "extract_somatic.py": "content" }, change_summary?, source? }
+// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
+app.post("/restore-scripts", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(503).json({ error: "SKILL_FILE_PATH not set. Cannot restore scripts." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
+  }
+  const providedToken = req.headers["x-railway-restore-token"] || "";
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
+  }
+  try {
+    const body   = req.body || {};
+    const result = await handleScriptRestoreFromWp(body);
+    if (!result.success) return res.status(500).json(result);
+    log("info", `restore-scripts: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
+    return res.json(result);
+  } catch (err) {
+    log("error", `restore-scripts exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
@@ -1609,21 +1738,24 @@ app.use((_req, res) => {
   res.status(404).json({
     error: "Not found",
     endpoints: {
-      mcp:              "POST /mcp",
-      health:           "GET /health",
+      mcp:                   "POST /mcp",
+      health:                "GET /health",
       restoreSkill:          "POST /restore-skill (X-Railway-Restore-Token required)",
       restoreBooks:          "POST /restore-books (X-Railway-Restore-Token required)",
       restoreProfiles:       "POST /restore-profiles (X-Railway-Restore-Token required)",
       restoreModules:        "POST /restore-modules (X-Railway-Restore-Token required)",
       restorePersonality:    "POST /restore-personality (X-Railway-Restore-Token required)",
       restoreDispatchRules:  "POST /restore-dispatch-rules (X-Railway-Restore-Token required)",
+      restoreArchive:        "POST /restore-archive (X-Railway-Restore-Token required)",
+      restoreReferences:     "POST /restore-references (X-Railway-Restore-Token required)",
+      restoreScripts:        "POST /restore-scripts (X-Railway-Restore-Token required)",
       modularModeGet:        "GET /modular-mode (no auth)",
       modularModeSet:        "POST /set-modular-mode (X-Railway-Restore-Token required)",
-      linkedinCallback: "GET /auth/linkedin/callback",
-      trackOpen:        "GET /track/open?id=...",
-      trackClick:       "GET /track/click?id=...&url=...",
-      upload:           "POST /upload/connections",
-      webhook:          "POST /webhook",
+      linkedinCallback:      "GET /auth/linkedin/callback",
+      trackOpen:             "GET /track/open?id=...",
+      trackClick:            "GET /track/click?id=...&url=...",
+      upload:                "POST /upload/connections",
+      webhook:               "POST /webhook",
     },
   });
 });
@@ -1633,7 +1765,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v11.3.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v11.4.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
@@ -1664,6 +1796,9 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `Modular skill: env_var=${process.env.SKILL_MODULAR_ENABLED || "not set"} | effective=${isModularEnabled() ? "ENABLED" : "disabled"} | runtime toggle: GET /modular-mode, POST /set-modular-mode`);
   log("info", `Person-aware dispatch: AVA_PERSON_PRIOR_ENABLED=${process.env.AVA_PERSON_PRIOR_ENABLED || "not set (defaults true)"}`);
   log("info", `Module restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-modules, /restore-personality, /restore-dispatch-rules)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
+  log("info", `Content sections: ${SKILL_ENABLED ? "ENABLED (archive_list/read/write, reference_list/read/write, script_list/read/write)" : "disabled (set SKILL_FILE_PATH)"}`);
+  log("info", `Content restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-archive, /restore-references, /restore-scripts)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
+  log("info", `module_write: ${SKILL_ENABLED ? (isModularEnabled() ? "ENABLED (modular mode active)" : "disabled (modular mode off)") : "disabled (set SKILL_FILE_PATH)"}`);;
 
   // Boot the in-process scheduler (loads schedule_store.json + starts cron)
   try {
