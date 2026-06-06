@@ -695,7 +695,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "11.4.0" },
+    { name: "claude-connector", version: "11.5.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -872,7 +872,7 @@ function createMcpServer() {
         case "module_write":            return await handleModuleWrite(args);
         case "books_read":             return await handleBooksRead(args);
         case "books_log_write":        return await handleBooksLogWrite(args);
-        // ---------- Content Sections: Archive / References / Scripts (v11.4.0) ----------
+        // ---------- Content Sections: Archive / References / Scripts (v11.5.0) ----------
         case "archive_list":            return handleArchiveList(args);
         case "archive_read":            return handleArchiveRead(args);
         case "archive_write":           return await handleArchiveWrite(args);
@@ -1765,7 +1765,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v11.4.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v11.5.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
