@@ -454,6 +454,70 @@ function getModularModeStatus() {
 // Can also be enabled independently via PROFILES_FILE_PATH.
 const PROFILES_ENABLED = Boolean(config.skillFilePath) || Boolean(process.env.PROFILES_FILE_PATH);
 
+// ---------------------------------------------------------------------------
+// Personal-file WordPress Gateway backup (v12.1.0)
+//
+// When running in tenant mode (TS_CLIENT_MODE=tenant), personality_write,
+// profile_write_person, and dispatch_rule_add call backupPersonalFileToGateway()
+// after each successful write so that the WordPress Client Gateway always holds
+// a current copy for disaster recovery.
+//
+// No new env vars needed: TS_TENANT_GATEWAY_URL and TS_CLIENT_API_KEY are
+// already required for tenant mode authentication (tenantAuth.js).
+// ---------------------------------------------------------------------------
+
+// Base directory of the skill volume (e.g. /data/skill/ava).
+// Derived from SKILL_FILE_PATH (/data/skill/ava/SKILL.md) via dirname().
+const SKILL_BASE_DIR = SKILL_ENABLED ? dirname(config.skillFilePath) : null;
+
+// Tenant gateway URL and API key (already set as env vars in tenant mode).
+const TENANT_GATEWAY_URL = (process.env.TS_TENANT_GATEWAY_URL || "").replace(/\/$/, "");
+const TENANT_API_KEY     = process.env.TS_CLIENT_API_KEY || "";
+
+/**
+ * Back up a personal file to the WordPress Client Gateway after it has been
+ * updated on the Railway volume. Only runs in tenant mode with a gateway URL
+ * and API key configured. Non-blocking: failures are logged but never surface
+ * to the caller or affect the tool result.
+ *
+ * @param {'PERSONALITY.md'|'PROFILES.md'|'DISPATCH_RULES.json'} fileKey
+ * @param {string} filePath  Absolute path to the file on the Railway volume.
+ */
+async function backupPersonalFileToGateway(fileKey, filePath) {
+  if (!isTenantMode() || !TENANT_GATEWAY_URL || !TENANT_API_KEY) return;
+
+  let content;
+  try {
+    content = readFileSync(filePath, "utf8");
+  } catch (readErr) {
+    log("warn", `[wp-backup] Cannot read ${fileKey} for gateway backup: ${readErr.message}`);
+    return;
+  }
+
+  if (!content || !content.trim()) return;
+
+  const backupUrl = `${TENANT_GATEWAY_URL}/backup/personal`;
+  try {
+    const resp = await fetch(backupUrl, {
+      method:  "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent":   "claude-connector/12.1.0 (TrueSource tenant mode)",
+      },
+      body:   JSON.stringify({ api_key: TENANT_API_KEY, file_key: fileKey, content }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (resp.ok) {
+      log("info", `[wp-backup] ${fileKey} backed up to WordPress gateway (tenant: ${process.env.TS_TENANT_ID || "unknown"})`);
+    } else {
+      const errSnippet = (await resp.text().catch(() => "")).slice(0, 200);
+      log("warn", `[wp-backup] ${fileKey} gateway backup HTTP ${resp.status}: ${errSnippet}`);
+    }
+  } catch (fetchErr) {
+    log("warn", `[wp-backup] ${fileKey} gateway backup fetch failed: ${fetchErr.message}`);
+  }
+}
+
 // Initialise the persistent memory subsystem when configured.
 // v10.0.1: dynamic import keeps the rest of the connector functional even
 // when better-sqlite3 fails to load (missing native binary, etc.).
@@ -870,8 +934,24 @@ function createMcpServer() {
         // ---------- Modular Skill System (v11.0.0) ----------
         case "skill_compile":           return await handleSkillCompile(args);
         case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
-        case "personality_write":       return await handlePersonalityWrite(args);
-        case "dispatch_rule_add":       return await handleDispatchRuleAdd(args);
+        case "personality_write": {
+          const _personalityResult = await handlePersonalityWrite(args);
+          // Non-blocking WordPress gateway backup (tenant mode only).
+          if (SKILL_BASE_DIR) {
+            backupPersonalFileToGateway("PERSONALITY.md", `${SKILL_BASE_DIR}/PERSONALITY.md`)
+              .catch(() => {}); // swallow - never let backup failure propagate
+          }
+          return _personalityResult;
+        }
+        case "dispatch_rule_add": {
+          const _dispatchResult = await handleDispatchRuleAdd(args);
+          // Non-blocking WordPress gateway backup (tenant mode only).
+          if (SKILL_BASE_DIR) {
+            backupPersonalFileToGateway("DISPATCH_RULES.json", `${SKILL_BASE_DIR}/DISPATCH_RULES.json`)
+              .catch(() => {});
+          }
+          return _dispatchResult;
+        }
         case "module_write":            return await handleModuleWrite(args);
         case "books_read":             return await handleBooksRead(args);
         case "books_log_write":        return await handleBooksLogWrite(args);
@@ -888,7 +968,15 @@ function createMcpServer() {
 
         // ---------- Ava User Profiles (v10.8.0) ----------
         case "profile_read":           return await handleProfileRead(args);
-        case "profile_write_person":   return await handleProfileWritePerson(args);
+        case "profile_write_person": {
+          const _profileResult = await handleProfileWritePerson(args);
+          // Non-blocking WordPress gateway backup (tenant mode only).
+          if (PROFILES_ENABLED && SKILL_BASE_DIR) {
+            backupPersonalFileToGateway("PROFILES.md", `${SKILL_BASE_DIR}/PROFILES.md`)
+              .catch(() => {});
+          }
+          return _profileResult;
+        }
 
         // ---------- Ava Memory Sync - durable MySQL backup (v10.1.0) ----------
         case "ava_memory_backup":       return await handleAvaMemoryBackup(args);
