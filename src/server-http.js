@@ -165,12 +165,7 @@ import {
   handleEmailGetSenderProfiles,
   handleEmailValidateAddress,
 } from "./tools/email.js";
-import {
-  emailGetTrackingToolDefinition,
-  emailTrackingSummaryToolDefinition,
-  handleEmailGetTracking,
-  handleEmailTrackingSummary,
-} from "./tools/emailTracking.js";
+
 import {
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
@@ -238,10 +233,7 @@ import {
   handleWpHealth,
 } from "./tools/wordpress.js";
 
-import {
-  emailReplyCheckToolDefinition,
-  handleEmailReplyCheck,
-} from "./tools/emailTracking.js";
+
 
 // ---------- v10.0.0: Persistent Memory MCP integration ----------
 // v10.0.1 fix: lazy-load the memory subsystem. The tools-memory/index.js
@@ -604,9 +596,6 @@ const TOOLS = [
   emailGetConfigToolDefinition,
   emailGetSenderProfilesToolDefinition,
   emailValidateAddressToolDefinition,
-  emailGetTrackingToolDefinition,
-  emailTrackingSummaryToolDefinition,
-  emailReplyCheckToolDefinition,
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
   emailScheduleListToolDefinition,
@@ -849,9 +838,6 @@ function createMcpServer() {
         case "email_get_config":             return await handleEmailGetConfig(args);
         case "email_get_sender_profiles":    return await handleEmailGetSenderProfiles(args);
         case "email_validate_address":       return await handleEmailValidateAddress(args);
-        case "email_get_tracking":           return await handleEmailGetTracking(args);
-        case "email_tracking_summary":       return await handleEmailTrackingSummary(args);
-        case "email_reply_check":            return await handleEmailReplyCheck(args);
         case "email_schedule":               return await handleEmailSchedule(args);
         case "email_schedule_cancel":        return await handleEmailScheduleCancel(args);
         case "email_schedule_list":          return await handleEmailScheduleList(args);
