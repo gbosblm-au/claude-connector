@@ -1814,6 +1814,83 @@ app.post("/set-modular-mode", (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// GET /skill-export  (v12.2.0)
+// Export all non-personal skill files from this connector's Railway volume
+// so the TrueSource Client Gateway WordPress plugin can seed its database.
+//
+// Returns every file under SKILL_BASE_DIR EXCEPT personal files
+// (PERSONALITY.md, PROFILES.md, DISPATCH_RULES.json) so that generic
+// base content can be pushed to client connectors without leaking the
+// owner's personal data.
+//
+// Auth: X-Railway-Restore-Token (same token used by /restore-* endpoints)
+// Response: { files: { "relative/path": "content" }, file_count: N }
+// ---------------------------------------------------------------------------
+
+app.get("/skill-export", (req, res) => {
+  if (!SKILL_ENABLED || !SKILL_BASE_DIR) {
+    return res.status(503).json({ error: "SKILL_FILE_PATH not set. Skill volume not configured." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Configure it in Railway Variables." });
+  }
+
+  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
+  }
+
+  // Personal files that must NOT be included in base exports
+  const PERSONAL_FILES = new Set(["PERSONALITY.md", "PROFILES.md"]);
+
+  const files = {};
+
+  /**
+   * Recursively walk a directory, adding each file to the output map
+   * with a path relative to SKILL_BASE_DIR.
+   */
+  function walkDir(absDir) {
+    if (!existsSync(absDir)) return;
+    let entries;
+    try {
+      entries = readdirSync(absDir, { withFileTypes: true });
+    } catch (e) {
+      log("warn", `skill-export: cannot read dir ${absDir}: ${e.message}`);
+      return;
+    }
+    for (const entry of entries) {
+      const absPath = `${absDir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        walkDir(absPath);
+      } else if (entry.isFile()) {
+        // Derive path relative to SKILL_BASE_DIR
+        const relPath = absPath.slice(SKILL_BASE_DIR.length).replace(/^\//, "");
+        // Skip personal files, hidden files, and mode files
+        if (PERSONAL_FILES.has(entry.name)) continue;
+        if (entry.name.startsWith("."))      continue;
+        // Only export text formats (md, json, py, sh, js, ts, txt)
+        if (!/\.(md|json|py|sh|js|ts|txt)$/i.test(entry.name)) continue;
+        try {
+          files[relPath] = readFileSync(absPath, "utf8");
+        } catch (e) {
+          log("warn", `skill-export: cannot read file ${absPath}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  try {
+    walkDir(SKILL_BASE_DIR);
+    const fileCount = Object.keys(files).length;
+    log("info", `skill-export: exported ${fileCount} files from ${SKILL_BASE_DIR}`);
+    return res.json({ files, file_count: fileCount, base_dir: SKILL_BASE_DIR });
+  } catch (err) {
+    log("error", `skill-export exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.use((_req, res) => {
   res.status(404).json({
     error: "Not found",
