@@ -1815,18 +1815,17 @@ app.post("/set-modular-mode", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /skill-export  (v12.2.0)
-// Export all non-personal skill files from this connector's Railway volume
-// so the TrueSource Client Gateway WordPress plugin can seed its database.
+// GET /skill-export  (v12.2.2)
+// Export all non-personal skill files from this connector's Railway volume.
+// Paths returned are relative to the ava content directory — NO leading 'ava/'
+// prefix — so they are directly usable by the gateway's /restore-modules endpoint.
 //
-// Returns every file under SKILL_BASE_DIR EXCEPT personal files
-// (PERSONALITY.md, PROFILES.md, DISPATCH_RULES.json) so that generic
-// base content can be pushed to client connectors without leaking the
-// owner's personal data.
+// avaDir resolution (handles both common SKILL_FILE_PATH layouts):
+//   /data/skill/SKILL.md     → SKILL_BASE_DIR=/data/skill     → avaDir=/data/skill/ava
+//   /data/skill/ava/SKILL.md → SKILL_BASE_DIR=/data/skill/ava → avaDir=/data/skill/ava
 //
-// Auth: X-Railway-Restore-Token (same token used by /restore-* endpoints)
-// Response: { files: { "relative/path": "content" }, file_count: N }
-// ---------------------------------------------------------------------------
+// Auth: X-Railway-Restore-Token
+// Response: { files: { "relative/path": "content" }, file_count: N, ava_dir: string }
 
 app.get("/skill-export", (req, res) => {
   if (!SKILL_ENABLED || !SKILL_BASE_DIR) {
@@ -1841,15 +1840,21 @@ app.get("/skill-export", (req, res) => {
     return res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
   }
 
-  // Personal files that must NOT be included in base exports
-  const PERSONAL_FILES = new Set(["PERSONALITY.md", "PROFILES.md"]);
+  // Determine the ava content directory regardless of SKILL_FILE_PATH layout
+  const avaDir = SKILL_BASE_DIR.endsWith("/ava")
+    ? SKILL_BASE_DIR
+    : (SKILL_BASE_DIR + "/ava");
 
+  if (!existsSync(avaDir)) {
+    return res.status(503).json({
+      error: `ava content directory not found at ${avaDir}. Push skill files to this connector first.`,
+      ava_dir: avaDir,
+    });
+  }
+
+  const PERSONAL_FILES = new Set(["PERSONALITY.md", "PROFILES.md"]);
   const files = {};
 
-  /**
-   * Recursively walk a directory, adding each file to the output map
-   * with a path relative to SKILL_BASE_DIR.
-   */
   function walkDir(absDir) {
     if (!existsSync(absDir)) return;
     let entries;
@@ -1864,12 +1869,10 @@ app.get("/skill-export", (req, res) => {
       if (entry.isDirectory()) {
         walkDir(absPath);
       } else if (entry.isFile()) {
-        // Derive path relative to SKILL_BASE_DIR
-        const relPath = absPath.slice(SKILL_BASE_DIR.length).replace(/^\//, "");
-        // Skip personal files, hidden files, and mode files
+        // Relative to avaDir — no leading 'ava/' prefix
+        const relPath = absPath.slice(avaDir.length).replace(/^\//, "");
         if (PERSONAL_FILES.has(entry.name)) continue;
         if (entry.name.startsWith("."))      continue;
-        // Only export text formats (md, json, py, sh, js, ts, txt)
         if (!/\.(md|json|py|sh|js|ts|txt)$/i.test(entry.name)) continue;
         try {
           files[relPath] = readFileSync(absPath, "utf8");
@@ -1881,10 +1884,10 @@ app.get("/skill-export", (req, res) => {
   }
 
   try {
-    walkDir(SKILL_BASE_DIR);
+    walkDir(avaDir);
     const fileCount = Object.keys(files).length;
-    log("info", `skill-export: exported ${fileCount} files from ${SKILL_BASE_DIR}`);
-    return res.json({ files, file_count: fileCount, base_dir: SKILL_BASE_DIR });
+    log("info", `skill-export: exported ${fileCount} files from ${avaDir}`);
+    return res.json({ files, file_count: fileCount, ava_dir: avaDir });
   } catch (err) {
     log("error", `skill-export exception: ${err.message}`);
     return res.status(500).json({ error: err.message });
