@@ -37,7 +37,7 @@ import { registerProvisionRoute } from './routes/provision.js';
 import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { dirname } from "path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
