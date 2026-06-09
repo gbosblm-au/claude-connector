@@ -1,7 +1,15 @@
-// src/server-http.js  v12.0.0
+// src/server-http.js  v12.3.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
-// v10.3.0: MySQL-primary mode fully implemented. When AVA_MEMORY_WP_URL +
+// v12.3.0: Add ts_gateway_session_init MCP tool. The tool is advertised only
+// when TS_CLIENT_MODE=tenant. It calls the WP gateway /session-init endpoint,
+// validates the api_key+tenant_id pair, and returns an explicit next_steps
+// array naming skill_compile as a required non-deferrable step. This fixes the
+// regression where client sessions skipped skill_compile on initialisation
+// because the previously generated system prompt only referenced a tool that
+// did not exist, causing Claude to abort the init sequence and fall back to
+// default behaviour.
+//
 // AVA_MEMORY_WP_KEY are set, all six memory_* tools read and write directly
 // to MySQL via the WordPress REST API. No Railway SQLite layer is involved.
 // The ava_memory_backup and ava_memory_restore tools return informational
@@ -34,6 +42,11 @@ import "dotenv/config";
 // v12.0.0: Tenant authentication middleware
 import { tenantAuthMiddleware, logTenantModeStatus, isTenantMode } from './middleware/tenantAuth.js';
 import { registerProvisionRoute } from './routes/provision.js';
+// v12.3.0: Tenant session init tool
+import {
+  tsGatewaySessionInitToolDefinition,
+  handleTsGatewaySessionInit,
+} from './tools/gatewaySessionInit.js';
 import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -541,6 +554,11 @@ if (MEMORY_ENABLED) {
 // Tool registry
 // -----------------------------------------------------------------------
 const TOOLS = [
+  // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
+  // Only advertised when TS_CLIENT_MODE=tenant. Authenticates the session
+  // and returns the required next-step sequence including skill_compile.
+  ...(isTenantMode() ? [tsGatewaySessionInitToolDefinition] : []),
+
   webSearchToolDefinition,
   newsSearchToolDefinition,
   imageSearchToolDefinition,
@@ -781,6 +799,9 @@ function createMcpServer() {
     log("info", `Tool: ${name}`);
     try {
       switch (name) {
+        // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
+        case "ts_gateway_session_init": return await handleTsGatewaySessionInit(args);
+
         case "web_search":                  return await handleWebSearch(args);
         case "news_search":                 return await handleNewsSearch(args);
         case "image_search":                return await handleImageSearch(args);
