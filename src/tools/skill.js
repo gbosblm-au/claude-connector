@@ -665,7 +665,16 @@ export const skillAuditToolDefinition = {
 export async function handleSkillAudit(_args) {
   const skillPath    = process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md';
   const baseDir      = skillPath.replace(/SKILL\.md$/, '');
-  const avaDir       = baseDir + 'ava/';
+  // v12.2.x: Tenant-aware avaDir -- mirrors getModularPaths() in skill-modular.js.
+  // With TS_CLIENT_MODE=tenant, skill-modular writes core files to /data/clients/{id}/
+  // not /data/skill/ava/. The old hardcoded baseDir+'ava/' caused skill_audit to always
+  // report missing files on tenant connectors even after a successful push.
+  const clientMode  = (process.env.TS_CLIENT_MODE || 'owner').toLowerCase();
+  const tenantId    = process.env.TS_TENANT_ID || '';
+  const ownerAvaDir = baseDir + 'ava/';
+  const avaDir      = (clientMode === 'tenant' && tenantId)
+    ? `/data/clients/${tenantId}/`
+    : ownerAvaDir;
 
   // ---------------------------------------------------------------------------
   // Determine effective mode by reading the mode file first (mirrors
@@ -737,6 +746,9 @@ export async function handleSkillAudit(_args) {
     env_var:         envVarValue,
     mode_file_path:  modeFilePath,
     skill_path_base: baseDir,
+    ava_dir:         avaDir,
+    tenant_mode:     clientMode === 'tenant' && Boolean(tenantId),
+    tenant_id:       tenantId || null,
     files:           [],
     summary:         {},
   };
@@ -819,17 +831,23 @@ export async function handleSkillAudit(_args) {
   if (modularEnabled) {
     const coreExists     = existsSync(avaDir + 'CORE.md');
     const manifestExists = existsSync(avaDir + 'MANIFEST.json');
+    const isTenant       = clientMode === 'tenant' && Boolean(tenantId);
     if (!coreExists || !manifestExists) {
       result.summary.modular_readiness = 'NOT READY';
-      result.summary.modular_readiness_note =
-        'Modular mode is enabled (mode file = true) but required files are missing from Railway. ' +
-        'skill_compile will appear in the tool list but will fail when called. ' +
-        'Run Push All Module Files from WordPress (Ava Skill > Modules tab) to populate ' +
-        `${avaDir} with CORE.md, MANIFEST.json, and all specialist modules before starting a modular session.`;
+      result.summary.modular_readiness_note = isTenant
+        ? `Modular mode is enabled but required files are missing from the tenant directory ${avaDir}. ` +
+          `skill_compile will appear in the tool list but will fail when called. ` +
+          `Push All Module Files from the WordPress Gateway (Disaster Recovery > Push to Tenant) to populate ` +
+          `${avaDir} with CORE.md, MANIFEST.json, and all specialist modules. ` +
+          `Do NOT use the Ava Skill plugin Push All — that pushes to the owner connector, not this tenant connector.`
+        : `Modular mode is enabled (mode file = true) but required files are missing from Railway. ` +
+          `skill_compile will appear in the tool list but will fail when called. ` +
+          `Run Push All Module Files from WordPress (Ava Skill > Modules tab) to populate ` +
+          `${avaDir} with CORE.md, MANIFEST.json, and all specialist modules before starting a modular session.`;
     } else {
       result.summary.modular_readiness = 'READY';
       result.summary.modular_readiness_note =
-        'CORE.md and MANIFEST.json present. skill_compile should load successfully.';
+        `CORE.md and MANIFEST.json present at ${avaDir}. skill_compile should load successfully.`;
     }
   }
 

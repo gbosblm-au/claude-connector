@@ -980,12 +980,16 @@ export async function handleModulesRestoreFromWp(body) {
   const paths = getModularPaths();
   ensureModularDirs(paths);
 
+  // Diagnostic: log exactly where files will be written so any path
+  // mismatch is immediately visible in Railway logs.
+  log('info', `restore-modules: ava_dir=${paths.avaDir} tenant_mode=${paths.isTenantMode} tenant_id=${paths.tenantId || 'none'} shared_modules=${paths.sharedModulesDir}`);
+
   const files = body.files || {};
   const results = {};
 
-  for (const [relativePath, content] of Object.entries(files)) {
-    if (typeof content !== 'string') continue;
-    // Sanitise path - must be under ava/ and no ..
+  for (const [relativePath, fileContent] of Object.entries(files)) {
+    if (typeof fileContent !== 'string') continue;
+    // Sanitise path - no .. traversal, no leading slash
     const safe = relativePath.replace(/\.\./g, '').replace(/^[\/\\]/, '');
     const fullPath = paths.avaDir + safe;
 
@@ -994,15 +998,32 @@ export async function handleModulesRestoreFromWp(body) {
     if (dir) mkdirSync(dir, { recursive: true });
 
     try {
-      writeFileSync(fullPath, content, 'utf8');
-      results[relativePath] = { success: true, lines: countLines(content) };
+      writeFileSync(fullPath, fileContent, 'utf8');
+      // Post-write verification: confirm file is actually on disk
+      const verified = existsSync(fullPath);
+      const lines    = countLines(fileContent);
+      results[relativePath] = { success: true, lines, path: fullPath, verified };
+      if (!verified) {
+        log('warn', `restore-modules: WRITE SUCCEEDED but existsSync=false for ${fullPath} — volume mount issue?`);
+      } else {
+        log('info', `restore-modules: wrote ${fullPath} (${lines} lines)`);
+      }
     } catch (err) {
-      results[relativePath] = { success: false, error: err.message };
+      results[relativePath] = { success: false, error: err.message, path: fullPath };
+      log('error', `restore-modules: FAILED to write ${fullPath}: ${err.message}`);
     }
   }
 
   const successCount = Object.values(results).filter(r => r.success).length;
-  log('info', `restore-modules: restored ${successCount}/${Object.keys(results).length} files from WordPress push`);
+  const failCount    = Object.values(results).filter(r => !r.success).length;
+  log('info', `restore-modules: complete — ${successCount} written, ${failCount} failed, ava_dir=${paths.avaDir}`);
 
-  return { success: true, files_restored: successCount, results };
+  return {
+    success:       failCount === 0,
+    files_restored: successCount,
+    files_failed:   failCount,
+    ava_dir:        paths.avaDir,
+    tenant_mode:    paths.isTenantMode,
+    results,
+  };
 }
