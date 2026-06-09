@@ -1,14 +1,15 @@
-// src/server-http.js  v12.3.0
+// src/server-http.js  v12.4.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
-// v12.3.0: Add ts_gateway_session_init MCP tool. The tool is advertised only
-// when TS_CLIENT_MODE=tenant. It calls the WP gateway /session-init endpoint,
-// validates the api_key+tenant_id pair, and returns an explicit next_steps
-// array naming skill_compile as a required non-deferrable step. This fixes the
-// regression where client sessions skipped skill_compile on initialisation
-// because the previously generated system prompt only referenced a tool that
-// did not exist, causing Claude to abort the init sequence and fall back to
-// default behaviour.
+// v12.4.0: Add skill_recompile MCP tool. Mid-session delta recompile: runs the
+// full 6-layer dispatcher for a new topic query and returns only the modules
+// not already loaded in the current session (the delta). Solves the context-shift
+// problem documented in DC2026 session 2026-06-09: when a conversation topic
+// changes significantly, skill_compile cannot be re-run (session-start only) and
+// skill_load_specialist requires knowing the exact module ID. skill_recompile
+// accepts the new query, runs the dispatcher, and returns only the additional
+// content needed — keeping output small and avoiding duplication of content
+// already in the append-only context window.
 //
 // AVA_MEMORY_WP_KEY are set, all six memory_* tools read and write directly
 // to MySQL via the WordPress REST API. No Railway SQLite layer is involved.
@@ -346,10 +347,12 @@ import {
 import {
   skillCompileToolDefinition,
   skillLoadSpecialistToolDefinition,
+  skillRecompileToolDefinition,
   personalityWriteToolDefinition,
   dispatchRuleAddToolDefinition,
   handleSkillCompile,
   handleSkillLoadSpecialist,
+  handleSkillRecompile,
   handlePersonalityWrite,
   handleDispatchRuleAdd,
   handleModulesRestoreFromWp,
@@ -734,6 +737,7 @@ const TOOLS = [
     ? [
         skillCompileToolDefinition,
         skillLoadSpecialistToolDefinition,
+        skillRecompileToolDefinition,
         personalityWriteToolDefinition,
         dispatchRuleAddToolDefinition,
         moduleWriteToolDefinition,
@@ -779,13 +783,14 @@ function createMcpServer() {
     // The static TOOLS array is correct for all non-modular tools; we just replace
     // the modular section with a live isModularEnabled() check.
     const MODULAR_TOOL_NAMES = new Set([
-      "skill_compile", "skill_load_specialist", "personality_write", "dispatch_rule_add", "module_write",
+      "skill_compile", "skill_load_specialist", "skill_recompile", "personality_write", "dispatch_rule_add", "module_write",
     ]);
     const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
     const modularTools = isModularEnabled()
       ? [
           skillCompileToolDefinition,
           skillLoadSpecialistToolDefinition,
+          skillRecompileToolDefinition,
           personalityWriteToolDefinition,
           dispatchRuleAddToolDefinition,
           moduleWriteToolDefinition,
@@ -941,6 +946,7 @@ function createMcpServer() {
         // ---------- Modular Skill System (v11.0.0) ----------
         case "skill_compile":           return await handleSkillCompile(args);
         case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
+        case "skill_recompile":         return await handleSkillRecompile(args);
         case "personality_write": {
           const _personalityResult = await handlePersonalityWrite(args);
           // Non-blocking WordPress gateway backup (tenant mode only).

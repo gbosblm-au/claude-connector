@@ -1,6 +1,58 @@
 # Claude Connector - Changelog
 
-## v12.3.0 - 2026-06-09
+## v12.4.0 - 2026-06-09
+
+### Add skill_recompile MCP tool (mid-session delta recompile)
+
+**Problem:** When a conversation's topic shifts significantly mid-session, the initial
+`skill_compile` selection becomes stale. `skill_load_specialist` requires knowing the
+exact module ID. `skill_compile` cannot safely be re-called mid-session (designed for
+session-start only). The context window is append-only so prior skill content cannot
+be removed. The result: Claude operates on the wrong module selection for the new topic.
+
+**Solution:** `skill_recompile` — a mid-session delta recompiler.
+
+**Behaviour:**
+- Accepts `new_query` (required), `context_hint`, `person_name`, and `current_modules`.
+- Runs the full 6-layer dispatcher (person prior, mandatory, lexical, tag-web, adjacency,
+  budget) for the new query.
+- Computes the delta: modules selected for the new topic that are NOT in `current_modules`.
+- Returns ONLY the delta module content (never CORE — already in context) plus metadata.
+- When the delta is empty (all selected modules already loaded), returns a no-op with a note.
+- The caller appends the returned content to the active session context; it supersedes
+  conflicting guidance from earlier-loaded modules for the new topic.
+
+**Design rationale (append-only context window):**
+The fundamental constraint is that prior context cannot be purged. `skill_recompile`
+works within this constraint: it does not attempt to replace prior skill content but
+adds the correct new content for the shifted topic. The response note explicitly states
+that returned modules supersede earlier conflicting guidance for the new topic.
+
+**Changes:**
+
+`src/tools/skill-modular.js`
+- Added `skillRecompileToolDefinition` and `handleSkillRecompile` (exported).
+- Uses the shared `compileSkill()` and `personPriorLayer()` functions — no dispatcher
+  duplication.
+- Falls back to `ownerAvaDir` for module files in tenant mode when per-client path
+  is missing (handles shared module pool architecture).
+
+`src/server-http.js`
+- Imports `skillRecompileToolDefinition` and `handleSkillRecompile`.
+- Added to static TOOLS array (under `SKILL_MODULAR_ENABLED` guard).
+- Added `"skill_recompile"` to `MODULAR_TOOL_NAMES` set in ListToolsRequestSchema handler.
+- Added to dynamic modular tools list.
+- Added `case "skill_recompile"` to CallToolRequestSchema switch.
+- Version comment updated to v12.4.0.
+
+`package.json`
+- Version bumped to 12.4.0.
+
+**No new environment variables required.**
+**No Railway redeploy changes beyond the version update.**
+
+
+
 
 ### Add ts_gateway_session_init MCP tool (tenant mode)
 

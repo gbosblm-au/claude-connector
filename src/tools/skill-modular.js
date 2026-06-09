@@ -972,6 +972,175 @@ export async function handleDispatchRuleAdd(args) {
 }
 
 // ---------------------------------------------------------------------------
+// skill_recompile - mid-session delta recompile (v12.4.0)
+//
+// Recompiles the skill dispatcher for a new topic context and returns ONLY
+// the delta: modules needed for the new topic that are not already loaded.
+//
+// The context window is append-only so prior skill content cannot be removed.
+// skill_recompile returns only the new modules; the caller appends them to the
+// active session context and treats them as superseding any conflicting guidance
+// from earlier-loaded modules for the new topic.
+//
+// Differs from skill_load_specialist (single explicit module) and
+// skill_compile (full CORE + all modules at session start):
+//   - Runs the full 6-layer dispatcher for the new query
+//   - Returns only the modules NOT already in current_modules
+//   - Never returns CORE.md (already in context from session-start compile)
+//   - Always available when modular mode is active (no SKILL_MODULAR_ENABLED guard)
+// ---------------------------------------------------------------------------
+
+export const skillRecompileToolDefinition = {
+  name: 'skill_recompile',
+  description:
+    'Recompile the session skill for a new topic context. Use mid-session when the ' +
+    'conversation has shifted to territory the initial skill_compile did not anticipate. ' +
+    'Unlike skill_compile (which loads CORE + all selected modules at session start), ' +
+    'skill_recompile returns ONLY the delta: modules selected for the new topic that were ' +
+    'not loaded in the initial compile. Pass current_modules (the modules_loaded list from ' +
+    'skill_compile) to exclude already-loaded content. The returned content should be appended ' +
+    'to your active session context; it supersedes any conflicting guidance from modules loaded ' +
+    'earlier this session for the new topic. Returns empty content when all selected modules are ' +
+    'already loaded.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      new_query: {
+        type: 'string',
+        description: 'The new topic, question, or task that triggered the context shift. Used for trigger detection and lexical scoring.',
+      },
+      context_hint: {
+        type: 'string',
+        description: 'Additional context hint for module selection (e.g. keywords describing the new domain).',
+      },
+      person_name: {
+        type: 'string',
+        description: 'Person name from profile_read. Activates Layer 0 person-prior dispatch for the recompile.',
+      },
+      current_modules: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Module IDs already loaded in this session (the modules_loaded array from the initial skill_compile ' +
+          'response). These are excluded from the recompile output to avoid duplicating content already in context.',
+      },
+    },
+    required: ['new_query'],
+  },
+};
+
+export async function handleSkillRecompile(args) {
+  const paths = getModularPaths();
+
+  if (!existsSync(paths.coreFile) || !existsSync(paths.manifestFile)) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: 'CORE.md or MANIFEST.json not found. skill_compile must run successfully before skill_recompile can be used.',
+          hint: 'skill_recompile is a mid-session tool. Run skill_compile at session start first.',
+        }, null, 2),
+      }],
+      isError: true,
+    };
+  }
+
+  const newQuery       = typeof args.new_query    === 'string' ? args.new_query.trim()    : '';
+  const contextHint    = typeof args.context_hint === 'string' ? args.context_hint.trim() : '';
+  const personName     = typeof args.person_name  === 'string' ? args.person_name.trim()  : '';
+  const currentModules = Array.isArray(args.current_modules) ? args.current_modules.filter(m => typeof m === 'string') : [];
+
+  if (!newQuery) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: 'new_query is required.' }, null, 2) }],
+      isError: true,
+    };
+  }
+
+  // Layer 0: person prior (same as skill_compile)
+  const priorEnvEnabled  = process.env.AVA_PERSON_PRIOR_ENABLED !== 'false';
+  const dispatchRulesRaw = readJsonFile(paths.dispatchRulesFile, {});
+  const priorConfig      = dispatchRulesRaw.person_prior_config || {};
+  const personPrior      = (priorEnvEnabled && personName)
+    ? personPriorLayer(paths.profilesFile, personName, priorConfig)
+    : { boostSet: new Set(), priorModules: [], active: false };
+
+  let result;
+  try {
+    result = compileSkill(newQuery, contextHint, paths, personPrior);
+  } catch (err) {
+    log('error', `skill_recompile: compile error: ${err.message}`);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ error: err.message, hint: 'Check CORE.md and MANIFEST.json in ' + paths.avaDir }, null, 2),
+      }],
+      isError: true,
+    };
+  }
+
+  // Compute delta: modules selected by dispatcher that are NOT already loaded
+  const currentSet = new Set(currentModules);
+  const newModules = result.modules_loaded.filter(id => !currentSet.has(id));
+
+  if (newModules.length === 0) {
+    log('info', `skill_recompile: no new modules for query "${newQuery.slice(0, 60)}..." — all ${result.modules_loaded.length} selected modules already loaded`);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          new_modules:          [],
+          content:              '',
+          modules_count:        0,
+          all_selected_modules: result.modules_loaded,
+          conditions_detected:  result.conditions_detected,
+          note: 'All modules selected by the dispatcher for this topic are already loaded in the current session context. No additional content needed. Proceed with the current skill context.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  // Load content for delta modules only (never CORE — already in context)
+  const manifest  = readJsonFile(paths.manifestFile, { modules: [] });
+  const moduleMap = {};
+  for (const m of (manifest.modules || [])) moduleMap[m.id] = m;
+
+  const parts = [];
+  for (const id of newModules) {
+    const module = moduleMap[id];
+    if (!module) continue;
+    // Use shared modules dir for tenant mode if the per-client path is missing
+    let modulePath = paths.avaDir + module.path;
+    if (!existsSync(modulePath) && paths.isTenantMode) {
+      modulePath = paths.ownerAvaDir + module.path;
+    }
+    if (existsSync(modulePath)) {
+      parts.push('\n\n' + readFileSync(modulePath, 'utf8'));
+    } else {
+      log('warn', `skill_recompile: module file not found: ${modulePath}`);
+    }
+  }
+
+  const deltaContent = parts.join('');
+  log('info', `skill_recompile: ${newModules.length} new modules for query "${newQuery.slice(0, 60)}...": ${newModules.join(', ')}`);
+
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        new_modules:          newModules,
+        content:              deltaContent,
+        modules_count:        newModules.length,
+        all_selected_modules: result.modules_loaded,
+        conditions_detected:  result.conditions_detected,
+        line_count:           countLines(deltaContent),
+        note: `Recompile delta: ${newModules.length} new module(s) loaded for the new topic. Append this content to your active session context. These modules supersede any conflicting guidance from modules loaded earlier this session.`,
+      }, null, 2),
+    }],
+  };
+}
+
+// ---------------------------------------------------------------------------
 // WordPress push handler for modular files
 // Called by POST /restore-modules in server-http.js
 // ---------------------------------------------------------------------------
