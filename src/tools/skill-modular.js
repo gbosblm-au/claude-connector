@@ -869,6 +869,18 @@ export async function handlePersonalityWrite(args) {
   writeFileSync(paths.personalityFile, content, 'utf8');
   log('info', `personality_write: wrote observation "${label}" (${mode})`);
 
+  // Non-blocking: sync personality content to Railway gateway Postgres.
+  // Enables nightly WordPress DR backup without Anthropic token cost.
+  const _gwUrl = process.env.TS_TENANT_GATEWAY_URL;
+  const _gwKey = process.env.TS_CLIENT_API_KEY;
+  if ( _gwUrl && _gwKey ) {
+    fetch( `${ _gwUrl.replace( /\/$/, '' ) }/personality/write`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify( { api_key: _gwKey, content } ),
+    } ).catch( () => {} ); // Best effort — never blocks the tool response
+  }
+
   return {
     content: [{
       type: 'text',
