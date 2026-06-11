@@ -519,7 +519,16 @@ function compileSkill(query, contextHint, paths, personPrior = null) {
   const moduleMap = {};
   for (const m of (manifest.modules || [])) moduleMap[m.id] = m;
 
-  const parts = [core];
+  // Read PERSONALITY.md and inject immediately after CORE so observed interaction
+  // texture is active for every session. Placed before modules so personality context
+  // frames how specialist knowledge is applied.
+  const personalityContent = existsSync(paths.personalityFile)
+    ? readFileSync(paths.personalityFile, 'utf8').trim()
+    : '';
+
+  const parts = personalityContent
+    ? [core, '\n\n' + personalityContent]
+    : [core];
 
   // Load non-self-check modules
   for (const id of orderedIds) {
