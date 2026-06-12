@@ -198,6 +198,17 @@ export const config = {
   tsTenantId:           process.env.TS_TENANT_ID              || '',
 
   // ---------------------------------------------------------------------------
+  // Peer Review system (v12.5.0)
+  // ANTHROPIC_API_KEY:   Required in owner-mode deployments to run the AI peer
+  //                      exchange inside the client_checkin tool.
+  // PEER_REVIEW_MODEL:   Anthropic model for peer exchange calls.
+  //                      Default: claude-haiku-4-5-20251001 (fast, cost-efficient).
+  //                      Override with a different model string if needed.
+  // ---------------------------------------------------------------------------
+  anthropicApiKey:   process.env.ANTHROPIC_API_KEY  || '',
+  peerReviewModel:   process.env.PEER_REVIEW_MODEL   || 'claude-haiku-4-5-20251001',
+
+  // ---------------------------------------------------------------------------
   // Ava Skill Volume (v10.4.0)
   // Persistent SKILL.md storage on Railway Volume mounted at /data.
   // SKILL_FILE_PATH:    Full path to canonical SKILL.md.

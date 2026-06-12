@@ -48,6 +48,24 @@ import {
   tsGatewaySessionInitToolDefinition,
   handleTsGatewaySessionInit,
 } from './tools/gatewaySessionInit.js';
+
+// v12.5.0: Peer Review - health log tools (tenant mode) and check-in tools (owner mode)
+import {
+  healthLogWriteToolDefinition,
+  issueFlagToolDefinition,
+  peerReviewConsentToolDefinition,
+  handleHealthLogWrite,
+  handleIssueFlag,
+  handlePeerReviewConsent,
+} from './tools/healthLog.js';
+import {
+  clientRegistryUpdateToolDefinition,
+  clientCheckinToolDefinition,
+  escalationQueueReadToolDefinition,
+  handleClientRegistryUpdate,
+  handleClientCheckin,
+  handleEscalationQueueRead,
+} from './tools/clientCheckin.js';
 import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -562,6 +580,23 @@ const TOOLS = [
   // and returns the required next-step sequence including skill_compile.
   ...(isTenantMode() ? [tsGatewaySessionInitToolDefinition] : []),
 
+  // ---------- Peer Review: health log tools (v12.5.0) ----------
+  // health_log_write and issue_flag: tenant mode only (called by client Ava).
+  // peer_review_consent_set: tenant mode only (first session consent dialogue).
+  ...(isTenantMode() ? [
+    healthLogWriteToolDefinition,
+    issueFlagToolDefinition,
+    peerReviewConsentToolDefinition,
+  ] : []),
+
+  // ---------- Peer Review: check-in tools (v12.5.0) ----------
+  // client_checkin, client_registry_update, escalation_queue_read: owner mode only.
+  ...(!isTenantMode() ? [
+    clientRegistryUpdateToolDefinition,
+    clientCheckinToolDefinition,
+    escalationQueueReadToolDefinition,
+  ] : []),
+
   webSearchToolDefinition,
   newsSearchToolDefinition,
   imageSearchToolDefinition,
@@ -773,7 +808,7 @@ const TOOLS = [
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "11.5.0" },
+    { name: "claude-connector", version: "12.5.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -995,6 +1030,16 @@ function createMcpServer() {
         case "ava_memory_backup":       return await handleAvaMemoryBackup(args);
         case "ava_memory_restore":      return await handleAvaMemoryRestore(args);
         case "ava_memory_sync_status":  return await handleAvaMemorySyncStatus();
+
+        // ---------- Peer Review: health log tools (v12.5.0 - tenant mode) ----------
+        case "health_log_write":         return await handleHealthLogWrite(args);
+        case "issue_flag":               return await handleIssueFlag(args);
+        case "peer_review_consent_set":  return await handlePeerReviewConsent(args);
+
+        // ---------- Peer Review: check-in tools (v12.5.0 - owner mode) ----------
+        case "client_registry_update":  return await handleClientRegistryUpdate(args);
+        case "client_checkin":          return await handleClientCheckin(args);
+        case "escalation_queue_read":   return await handleEscalationQueueRead(args);
 
         default:
           // ---------- v10.0.0: Persistent Memory MCP ----------

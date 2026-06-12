@@ -1,4 +1,4 @@
-// src/tools/skill-modular.js  v11.3.0
+// src/tools/skill-modular.js  v12.5.1
 // Modular skill system for Ava.
 //
 // Four tools:
@@ -94,6 +94,55 @@ function countLines(content) {
   return content ? content.split('\n').length : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Patch 2: Startup personality sync  (added v12.5.1)
+//
+// Pushes the current PERSONALITY.md to Railway gateway Postgres on every
+// module load (i.e. every connector restart/redeploy).
+//
+// Why this is needed:
+//   The gateway personality route was broken before v1.3.1 of ts-gateway-service
+//   (POST /personality/write was registered as POST /write — different paths in
+//   Express). All personality_write syncs silently 404'd. Content accumulated on
+//   the Railway volume but Postgres never received it, so DR snapshots showed
+//   "Empty" even with a 50-line PERSONALITY.md.
+//
+// This catches up immediately on the next deploy and self-heals on every restart
+// thereafter so volume and Postgres never drift apart.
+//
+// Conditions:
+//   - Only runs when both TS_TENANT_GATEWAY_URL and TS_CLIENT_API_KEY are set.
+//   - Skips if PERSONALITY.md is absent or empty (new installs, client tenants).
+//   - Errors are non-fatal: a warning is logged and the module continues loading.
+// ---------------------------------------------------------------------------
+
+( async () => {
+  const _gwUrl = process.env.TS_TENANT_GATEWAY_URL;
+  const _gwKey = process.env.TS_CLIENT_API_KEY;
+  if ( !_gwUrl || !_gwKey ) return;
+
+  try {
+    const paths = getModularPaths();
+    if ( !existsSync( paths.personalityFile ) ) return;
+
+    const _content = readFileSync( paths.personalityFile, 'utf8' ).trim();
+    if ( !_content ) return;
+
+    const _res = await fetch( `${ _gwUrl.replace( /\/$/, '' ) }/personality/write`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify( { api_key: _gwKey, content: _content } ),
+    } );
+
+    if ( _res.ok ) {
+      log( 'info', `[personality-sync] Startup sync OK — pushed PERSONALITY.md to gateway Postgres (${ countLines( _content ) } lines).` );
+    } else {
+      log( 'warn', `[personality-sync] Startup sync failed — HTTP ${ _res.status } from gateway. Will retry on next personality_write call.` );
+    }
+  } catch ( _err ) {
+    log( 'warn', `[personality-sync] Startup sync error (non-fatal): ${ _err.message }` );
+  }
+} )();
 
 // ---------------------------------------------------------------------------
 // Layer 0: Person Prior (v11.3.0)
