@@ -17,6 +17,12 @@ tool returns memory_write instructions using `peer_review_registry`, and
 `client_checkin` uses `peer_review_logs` and `peer_review_escalations`. All three
 were unreachable from the memory system.
 
+#### src/middleware/tenantAuth.js
+
+Removed a trailing backslash on line 159 in `logTenantModeStatus()` that caused a
+`SyntaxError: Invalid or unexpected token` at module load time. This crashed the
+server before it could start listening, causing all Railway healthchecks to fail.
+
 #### src/tools-memory/definitions.js
 
 Updated all five tool definition `enum` arrays

@@ -156,7 +156,7 @@ export function invalidateAuthCache() {
 export function logTenantModeStatus() {
   if (CLIENT_MODE === 'tenant') {
     const keyPreview = CLIENT_API_KEY ? CLIENT_API_KEY.slice(0, 12) + '...' : '(not set)';
-    log('info', `[tenantAuth] MODE=tenant | tenant_id=${CLIENT_TENANT_ID || '(not set)'} | key=${keyPreview} | gateway=${GATEWAY_URL || '(not set)'}`);\
+    log('info', `[tenantAuth] MODE=tenant | tenant_id=${CLIENT_TENANT_ID || '(not set)'} | key=${keyPreview} | gateway=${GATEWAY_URL || '(not set)'}`);
   } else {
     log('info', '[tenantAuth] MODE=owner | tenant gateway bypass active');
   }
