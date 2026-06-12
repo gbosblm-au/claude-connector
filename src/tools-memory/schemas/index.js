@@ -12,6 +12,9 @@ import { z } from "zod";
 
 // Allowed category enum, per TDD Section 5.4.
 // "conversations" is the episodic store for per-conversation records.
+// "peer_review_registry" holds enrolled client entries for the peer review system.
+// "peer_review_logs" holds check-in result records per client per date.
+// "peer_review_escalations" holds the escalation queue for amber/red signals.
 export const CATEGORY_ENUM = [
   "projects",
   "skills",
@@ -20,6 +23,9 @@ export const CATEGORY_ENUM = [
   "facts",
   "session",
   "conversations",
+  "peer_review_registry",
+  "peer_review_logs",
+  "peer_review_escalations",
 ];
 
 export const categorySchema = z.enum(CATEGORY_ENUM);

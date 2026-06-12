@@ -1,3 +1,31 @@
+# Claude Connector v12.6.0 - Peer Review Category Fix
+
+## Release date: 2026-06-12
+
+### Bug fixes
+
+#### src/tools-memory/schemas/index.js
+
+Added three peer review categories to `CATEGORY_ENUM`:
+- `peer_review_registry` - client registry entries for the peer review system
+- `peer_review_logs` - check-in result records per client per date
+- `peer_review_escalations` - escalation queue for amber/red signals
+
+Without these entries, any `memory_write` call with these categories failed Zod
+validation, silently blocking the peer review workflow. The `client_registry_update`
+tool returns memory_write instructions using `peer_review_registry`, and
+`client_checkin` uses `peer_review_logs` and `peer_review_escalations`. All three
+were unreachable from the memory system.
+
+#### src/tools-memory/definitions.js
+
+Updated all five tool definition `enum` arrays
+(`memory_write`, `memory_read`, `memory_search`, `memory_delete`, `memory_list`)
+to include the three new categories. This ensures Claude sees the valid category
+list in the tool schema and can use them without a validation mismatch.
+
+---
+
 # Claude Connector v12.5.0 - Peer Review System
 
 ## Release date: 2026-06-12

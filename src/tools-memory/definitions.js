@@ -21,7 +21,7 @@ export const memoryWriteToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations", "peer_review_registry", "peer_review_logs", "peer_review_escalations"],
         description: "Memory bucket. Choose the most specific match.",
       },
       key: {
@@ -68,7 +68,7 @@ export const memoryReadToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations", "peer_review_registry", "peer_review_logs", "peer_review_escalations"],
       },
       key: { type: "string", maxLength: 256 },
       tags: { type: "array", items: { type: "string" } },
@@ -93,7 +93,7 @@ export const memorySearchToolDefinition = {
       },
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations", "peer_review_registry", "peer_review_logs", "peer_review_escalations"],
       },
       limit: { type: "number", minimum: 1, maximum: 50, default: 10 },
     },
@@ -111,7 +111,7 @@ export const memoryDeleteToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations", "peer_review_registry", "peer_review_logs", "peer_review_escalations"],
       },
       key: { type: "string", maxLength: 256 },
     },
@@ -130,7 +130,7 @@ export const memoryListToolDefinition = {
     properties: {
       category: {
         type: "string",
-        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations"],
+        enum: ["projects", "skills", "preferences", "contacts", "facts", "session", "conversations", "peer_review_registry", "peer_review_logs", "peer_review_escalations"],
       },
       include_value: { type: "boolean", default: false },
     },

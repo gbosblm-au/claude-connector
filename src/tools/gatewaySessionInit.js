@@ -1,30 +1,18 @@
-// src/tools/gatewaySessionInit.js  v12.3.0
+// src/tools/gatewaySessionInit.js  v12.6.0
 //
 // ts_gateway_session_init - Authenticate session with TrueSource Client Gateway.
 //
-// Called as Step 1 at session start from the client system prompt.
-// POSTs to the WordPress gateway /session-init endpoint, validates the
-// tenant API key + tenant_id pair, and returns session context plus an
-// explicit ordered list of required next steps (including skill_compile).
-//
-// This tool is always advertised in tenant-mode connectors (TS_CLIENT_MODE=tenant).
-// In owner mode it is suppressed - the owner connector does not use tenant auth.
-//
-// The response from /session-init intentionally repeats the full next-step
-// sequence so Claude sees a tool result reinforcing the system prompt instruction.
-// This is the fix for the "skipping skill_compile" regression: the gateway
-// response explicitly names skill_compile as a required non-deferrable step,
-// giving Claude two independent signals (system prompt + tool result) to act on.
+// CHANGELOG v12.6.0:
+//   - Sends device_id and device_name with every /session-init call.
+//     Gateway uses these to track and optionally restrict device access.
 
-import { log } from '../utils/logger.js';
+import { log }           from '../utils/logger.js';
+import { getDeviceId,
+         getDeviceName } from '../utils/deviceId.js';
 
 const CLIENT_MODE    = (process.env.TS_CLIENT_MODE       || 'owner').toLowerCase();
 const GATEWAY_URL    = (process.env.TS_TENANT_GATEWAY_URL || '').replace(/\/$/, '');
 const CLIENT_API_KEY = process.env.TS_CLIENT_API_KEY      || '';
-
-// ---------------------------------------------------------------------------
-// Tool definition
-// ---------------------------------------------------------------------------
 
 export const tsGatewaySessionInitToolDefinition = {
   name: 'ts_gateway_session_init',
@@ -55,13 +43,9 @@ export const tsGatewaySessionInitToolDefinition = {
   },
 };
 
-// ---------------------------------------------------------------------------
-// Handler
-// ---------------------------------------------------------------------------
-
 export async function handleTsGatewaySessionInit(args) {
-  const apiKey     = typeof args.api_key     === 'string' ? args.api_key.trim()     : '';
-  const tenantId   = typeof args.tenant_id   === 'string' ? args.tenant_id.trim()   : '';
+  const apiKey     = typeof args.api_key     === 'string' ? args.api_key.trim()                   : '';
+  const tenantId   = typeof args.tenant_id   === 'string' ? args.tenant_id.trim()                 : '';
   const gatewayUrl = typeof args.gateway_url === 'string' ? args.gateway_url.replace(/\/$/, '') : '';
 
   if (!apiKey || !tenantId || !gatewayUrl) {
@@ -87,14 +71,18 @@ export async function handleTsGatewaySessionInit(args) {
       method:  'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent':   'claude-connector/12.3.0 (TrueSource session-init)',
+        'User-Agent':   'claude-connector/12.6.0 (TrueSource session-init)',
       },
-      body: JSON.stringify({ api_key: apiKey, tenant_id: tenantId }),
-      signal: AbortSignal.timeout(10_000), // 10 second timeout
+      body: JSON.stringify({
+        api_key:     apiKey,
+        tenant_id:   tenantId,
+        device_id:   getDeviceId(),
+        device_name: getDeviceName(),
+      }),
+      signal: AbortSignal.timeout(10_000),
     });
   } catch (netErr) {
     log('warn', `[ts_gateway_session_init] network error: ${netErr.message}`);
-    // Return a degraded result rather than hard error so session can continue
     return {
       content: [{
         type: 'text',
@@ -110,16 +98,12 @@ export async function handleTsGatewaySessionInit(args) {
   }
 
   let data;
-  try {
-    data = await response.json();
-  } catch {
-    data = {};
-  }
+  try { data = await response.json(); }
+  catch { data = {}; }
 
   if (!response.ok) {
     const status  = data?.status  || 'invalid';
     const message = data?.message || `HTTP ${response.status}`;
-
     log('warn', `[ts_gateway_session_init] auth failed for tenant=${tenantId}: ${status}`);
 
     return {
@@ -129,7 +113,11 @@ export async function handleTsGatewaySessionInit(args) {
           session_authenticated: false,
           status,
           message,
-          note: status === 'suspended'
+          note: status === 'device_disabled'
+            ? 'This device has been disabled by the administrator. Contact TrueSource Consulting.'
+            : status === 'device_cap_reached'
+            ? 'The maximum number of devices for this account has been reached. Contact TrueSource Consulting.'
+            : status === 'suspended'
             ? 'This account has been suspended. Contact TrueSource Consulting to reactivate.'
             : 'Authentication failed. Verify TS_CLIENT_API_KEY and TS_TENANT_ID in the connector environment.',
         }, null, 2),
@@ -148,8 +136,6 @@ export async function handleTsGatewaySessionInit(args) {
         display_name: data.display_name || '',
         tier:         data.tier         || 'operational',
         session_id:   data.session_id   || new Date().toISOString().replace(/[-T:]/g, '').slice(0, 15),
-        // Explicit next-step sequence. Reinforces the system prompt so Claude
-        // has two independent signals that skill_compile is non-deferrable.
         next_steps: [
           'Step 2: Call memory_get_session_context with a context_hint drawn from the opening message topic.',
           'Step 3: Call profile_read to identify the person you are speaking with.',
