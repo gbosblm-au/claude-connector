@@ -2006,12 +2006,10 @@ app.post("/ti-skill-compile", async (req, res) => {
     });
   }
 
-  if (!SKILL_MODULAR_ENABLED) {
-    return res.status(503).json({
-      error: "Modular skill compilation not enabled.",
-      hint:  "Set SKILL_MODULAR_ENABLED=true in Railway Variables.",
-    });
-  }
+  // SKILL_MODULAR_ENABLED is NOT checked here. handleSkillCompile() manages
+  // its own path detection and returns a graceful error if modular files are
+  // missing. The MCP skill_compile tool works the same way -- it never gates
+  // on this flag. Removing this guard makes the HTTP endpoint consistent.
 
   if (!RAILWAY_RESTORE_TOKEN) {
     return res.status(503).json({
