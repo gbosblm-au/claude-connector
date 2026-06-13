@@ -1967,6 +1967,103 @@ app.get("/skill-export", (req, res) => {
   }
 });
 
+
+// POST /ti-skill-compile  (v12.7.0)
+// ---------------------------------------------------------------------------
+// Gateway-to-connector skill compilation endpoint for the Tenax Intelligence
+// platform. Exposes handleSkillCompile() as a direct REST call so the TI
+// gateway can fetch the compiled skill without needing an MCP client.
+//
+// Auth:    X-Railway-Restore-Token (same token as /skill-export and /restore-skill).
+// Gating: Requires SKILL_ENABLED=true AND SKILL_MODULAR_ENABLED=true.
+//         Returns 503 if either is not configured.
+//
+// Request body:
+//   { query, context_hint, person_name, session_id }
+//
+// Response 200:
+//   {
+//     skill:            string,   // Full compiled skill text (CORE + modules + personality)
+//     specialist_count: number,   // Specialist modules loaded
+//     line_count:       number,   // Total compiled lines
+//     modules_loaded:   string[], // Module names in load order
+//     session_id:       string,
+//     conditions:       string[], // Conditions detected from query
+//     person_prior_active: bool,
+//     note:             string,   // Human-readable compile summary
+//   }
+//
+// Response 503: Not configured (modular mode off or token missing)
+// Response 403: Invalid token
+// Response 500: Compile error (check MANIFEST.json and CORE.md)
+// ---------------------------------------------------------------------------
+
+app.post("/ti-skill-compile", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(503).json({
+      error: "Skill system not configured.",
+      hint:  "Set SKILL_FILE_PATH in Railway Variables.",
+    });
+  }
+
+  if (!SKILL_MODULAR_ENABLED) {
+    return res.status(503).json({
+      error: "Modular skill compilation not enabled.",
+      hint:  "Set SKILL_MODULAR_ENABLED=true in Railway Variables.",
+    });
+  }
+
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({
+      error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables.",
+      hint:  "Set RAILWAY_RESTORE_TOKEN to enable this endpoint.",
+    });
+  }
+
+  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
+  }
+
+  const {
+    query        = "",
+    context_hint = "",
+    person_name  = "",
+    session_id   = new Date().toISOString().slice(0, 10).replace(/-/g, ""),
+  } = req.body || {};
+
+  try {
+    const result = await handleSkillCompile({ query, context_hint, person_name, session_id });
+
+    if (result.isError) {
+      let parsed = {};
+      try { parsed = JSON.parse(result.content?.[0]?.text || "{}"); } catch { /* ignore */ }
+      log("error", `[ti-skill-compile] compile error: ${parsed.error || "unknown"}`);
+      return res.status(500).json({ error: parsed.error || "skill_compile failed.", hint: parsed.hint });
+    }
+
+    let parsed = {};
+    try { parsed = JSON.parse(result.content[0].text); } catch { /* ignore */ }
+
+    log("info", `[ti-skill-compile] compiled for session ${session_id}: ${parsed.specialist_count} specialists, ${parsed.line_count} lines`);
+
+    return res.json({
+      skill:               parsed.content        || "",
+      specialist_count:    parsed.specialist_count || 0,
+      line_count:          parsed.line_count       || 0,
+      modules_loaded:      parsed.modules_loaded   || [],
+      session_id:          parsed.session_id       || session_id,
+      conditions:          parsed.conditions_detected || [],
+      person_prior_active: parsed.person_prior_active || false,
+      note:                parsed.note             || "",
+    });
+
+  } catch (err) {
+    log("error", `[ti-skill-compile] exception: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.use((_req, res) => {
   res.status(404).json({
     error: "Not found",
@@ -1984,6 +2081,7 @@ app.use((_req, res) => {
       restoreScripts:        "POST /restore-scripts (X-Railway-Restore-Token required)",
       modularModeGet:        "GET /modular-mode (no auth)",
       modularModeSet:        "POST /set-modular-mode (X-Railway-Restore-Token required)",
+      tiSkillCompile:        "POST /ti-skill-compile (X-Railway-Restore-Token required)",
       linkedinCallback:      "GET /auth/linkedin/callback",
       trackOpen:             "GET /track/open?id=...",
       trackClick:            "GET /track/click?id=...&url=...",
@@ -1998,7 +2096,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v12.6.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v12.7.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
