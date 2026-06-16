@@ -1,4 +1,4 @@
-// src/server-http.js  v12.4.0
+// src/server-http.js  v12.8.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v12.4.0: Add skill_recompile MCP tool. Mid-session delta recompile: runs the
@@ -529,7 +529,7 @@ async function backupPersonalFileToGateway(fileKey, filePath) {
       method:  "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent":   "claude-connector/12.1.0 (TrueSource tenant mode)",
+        "User-Agent":   "claude-connector/12.8.0 (TrueSource tenant mode)",
       },
       body:   JSON.stringify({ api_key: TENANT_API_KEY, file_key: fileKey, content }),
       signal: AbortSignal.timeout(10_000),
@@ -804,41 +804,16 @@ const TOOLS = [
   ...(MEMORY_ENABLED ? ALL_MEMORY_TOOL_DEFINITIONS : []),
 ];
 
-// -----------------------------------------------------------------------
-// MCP Server factory
-// -----------------------------------------------------------------------
-function createMcpServer() {
-  const server = new Server(
-    { name: "claude-connector", version: "12.5.0" },
-    { capabilities: { tools: {} } }
-  );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    // Build the effective tool list at request time so that modular mode changes
-    // (written via POST /set-modular-mode) take effect without a Railway redeploy.
-    // The static TOOLS array is correct for all non-modular tools; we just replace
-    // the modular section with a live isModularEnabled() check.
-    const MODULAR_TOOL_NAMES = new Set([
-      "skill_compile", "skill_load_specialist", "skill_recompile", "personality_write", "dispatch_rule_add", "module_write",
-    ]);
-    const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
-    const modularTools = isModularEnabled()
-      ? [
-          skillCompileToolDefinition,
-          skillLoadSpecialistToolDefinition,
-          skillRecompileToolDefinition,
-          personalityWriteToolDefinition,
-          dispatchRuleAddToolDefinition,
-          moduleWriteToolDefinition,
-        ]
-      : [];
-    return { tools: [...baseTools, ...modularTools] };
-  });
+// -----------------------------------------------------------------------
+// dispatchToolCall  (v12.8.0)
+// Extracted from the MCP CallToolRequestSchema handler.
+// Used by both the MCP server and the REST /tool-call endpoint so that
+// tool handler logic lives in exactly one place.
+// Returns the raw MCP-format result { content, isError }.
+// -----------------------------------------------------------------------
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    log("info", `Tool: ${name}`);
-    try {
+async function dispatchToolCall(name, args) {
       switch (name) {
         // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
         case "ts_gateway_session_init": return await handleTsGatewaySessionInit(args);
@@ -1068,6 +1043,47 @@ function createMcpServer() {
           }
           throw new Error(`Unknown tool: "${name}"`);
       }
+}
+
+// -----------------------------------------------------------------------
+// MCP Server factory
+// -----------------------------------------------------------------------
+function createMcpServer() {
+  const server = new Server(
+    { name: "claude-connector", version: "12.8.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // Build the effective tool list at request time so that modular mode changes
+    // (written via POST /set-modular-mode) take effect without a Railway redeploy.
+    // The static TOOLS array is correct for all non-modular tools; we just replace
+    // the modular section with a live isModularEnabled() check.
+    const MODULAR_TOOL_NAMES = new Set([
+      "skill_compile", "skill_load_specialist", "skill_recompile", "personality_write", "dispatch_rule_add", "module_write",
+    ]);
+    const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
+    const modularTools = isModularEnabled()
+      ? [
+          skillCompileToolDefinition,
+          skillLoadSpecialistToolDefinition,
+          skillRecompileToolDefinition,
+          personalityWriteToolDefinition,
+          dispatchRuleAddToolDefinition,
+          moduleWriteToolDefinition,
+        ]
+      : [];
+    return { tools: [...baseTools, ...modularTools] };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    log("info", `Tool: ${name}`);
+    try {
+      // Dispatch to the central handler (defined above createMcpServer).
+      // personality_write / dispatch_rule_add / profile_write_person
+      // all include their WordPress gateway backup logic inside dispatchToolCall.
+      return await dispatchToolCall(name, args);
     } catch (err) {
       log("error", `Tool "${name}" error: ${err.message}`);
       return { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true };
@@ -1165,7 +1181,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "11.3.0",
+    version: "12.8.0",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -1834,6 +1850,114 @@ app.post("/restore-scripts", async (req, res) => {
   }
 });
 
+
+// -----------------------------------------------------------------------
+// GET /tools  (v12.8.0)
+// Returns the effective tool manifest for the current connector instance.
+// The Tenax Intelligence gateway calls this on each /stream request to
+// discover which tools are available, then registers them with the LLM.
+// Cached by the gateway (10-minute TTL per connector URL).
+//
+// Auth:    X-Railway-Restore-Token
+// Returns: { tools: [{ name, description, input_schema }], count: N }
+// -----------------------------------------------------------------------
+app.get("/tools", (req, res) => {
+  const token = (req.headers["x-railway-restore-token"] || "").trim();
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Cannot authenticate tool manifest requests." });
+  }
+  if (token !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
+  }
+
+  // Mirror the ListTools dynamic logic: swap out modular tools based on
+  // the mode file, which can be toggled without a Railway redeploy.
+  const MODULAR_TOOL_NAMES = new Set([
+    "skill_compile", "skill_load_specialist", "skill_recompile",
+    "personality_write", "dispatch_rule_add", "module_write",
+  ]);
+  const baseTools    = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
+  const modularTools = isModularEnabled()
+    ? [
+        skillCompileToolDefinition,
+        skillLoadSpecialistToolDefinition,
+        skillRecompileToolDefinition,
+        personalityWriteToolDefinition,
+        dispatchRuleAddToolDefinition,
+        moduleWriteToolDefinition,
+      ]
+    : [];
+
+  const effectiveTools = [...baseTools, ...modularTools];
+
+  // Normalise MCP inputSchema (camelCase) to Anthropic input_schema (snake_case)
+  // so the gateway can pass these directly to the Anthropic / OpenAI-compat APIs.
+  const tools = effectiveTools.map(t => ({
+    name:         t.name,
+    description:  t.description || "",
+    input_schema: t.inputSchema || t.input_schema || { type: "object", properties: {}, required: [] },
+  }));
+
+  log("info", `[/tools] manifest requested: ${tools.length} tools`);
+  return res.json({ tools, count: tools.length });
+});
+
+// -----------------------------------------------------------------------
+// POST /tool-call  (v12.8.0)
+// Executes a single named tool and returns its result as JSON.
+// The Tenax Intelligence gateway calls this when the LLM selects a tool
+// that is not handled locally by the gateway (proxied tool calls).
+//
+// Auth:    X-Railway-Restore-Token
+// Body:    { tool_name: string, tool_input: object }
+// Returns: { result: string, is_error: boolean }
+//
+// The result is always a string (the text from the MCP content block).
+// Callers should treat it as they would a raw tool result string.
+// -----------------------------------------------------------------------
+app.post("/tool-call", async (req, res) => {
+  const token = (req.headers["x-railway-restore-token"] || "").trim();
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Cannot authenticate tool-call requests." });
+  }
+  if (token !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
+  }
+
+  const { tool_name, tool_input } = req.body || {};
+
+  if (!tool_name || typeof tool_name !== "string" || !tool_name.trim()) {
+    return res.status(400).json({ error: "tool_name is required and must be a non-empty string." });
+  }
+
+  log("info", `[/tool-call] dispatching: ${tool_name}`);
+
+  try {
+    const mcpResult = await dispatchToolCall(tool_name.trim(), tool_input || {});
+
+    // Extract the primary text content from the MCP result.
+    // Most tools return a single text block; we join multiples with newlines.
+    const text = Array.isArray(mcpResult?.content)
+      ? mcpResult.content
+          .filter(b => b.type === "text")
+          .map(b => b.text || "")
+          .join("\n")
+      : JSON.stringify(mcpResult ?? "");
+
+    return res.json({
+      result:   text,
+      is_error: Boolean(mcpResult?.isError),
+    });
+
+  } catch (err) {
+    log("error", `[/tool-call] ${tool_name} error: ${err.message}`);
+    // Return 404 for unknown tools so the gateway can distinguish
+    // "tool not found" from "tool failed".
+    const statusCode = err.message.startsWith("Unknown tool") ? 404 : 500;
+    return res.status(statusCode).json({ error: err.message, is_error: true });
+  }
+});
+
 // -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
@@ -2080,6 +2204,8 @@ app.use((_req, res) => {
       modularModeGet:        "GET /modular-mode (no auth)",
       modularModeSet:        "POST /set-modular-mode (X-Railway-Restore-Token required)",
       tiSkillCompile:        "POST /ti-skill-compile (X-Railway-Restore-Token required)",
+      toolManifest:          "GET  /tools (X-Railway-Restore-Token required)",
+      toolCall:              "POST /tool-call (X-Railway-Restore-Token required)",
       linkedinCallback:      "GET /auth/linkedin/callback",
       trackOpen:             "GET /track/open?id=...",
       trackClick:            "GET /track/click?id=...&url=...",
@@ -2094,7 +2220,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v12.7.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v12.8.0 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
