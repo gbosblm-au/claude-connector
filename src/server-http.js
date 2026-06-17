@@ -1,4 +1,4 @@
-// src/server-http.js  v12.8.0
+// src/server-http.js  v12.8.1
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v12.4.0: Add skill_recompile MCP tool. Mid-session delta recompile: runs the
@@ -1050,7 +1050,7 @@ async function dispatchToolCall(name, args) {
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "12.8.0" },
+    { name: "claude-connector", version: "12.8.1" },
     { capabilities: { tools: {} } }
   );
 
@@ -1181,7 +1181,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "12.8.0",
+    version: "12.8.1",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -2220,7 +2220,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v12.8.0 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v12.8.1 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +

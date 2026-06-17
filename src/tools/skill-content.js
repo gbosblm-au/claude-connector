@@ -1,4 +1,4 @@
-// src/tools/skill-content.js  v2.0.0
+// src/tools/skill-content.js  v2.1.0
 // Content management tools for the Ava modular skill system.
 //
 // Ten tools across four content sections:
@@ -205,17 +205,26 @@ async function writeContentFile(dirPath, section, filePath, content, changeNote)
 
 export const moduleWriteToolDefinition = {
   name: 'module_write',
-  description: 'Write or overwrite a module file on the Railway volume by its relative path within modules/ ' +
+  description:
+    'Write or overwrite a module file on the Railway volume by its relative path within modules/ ' +
     '(e.g. "music-analysis/music-analysis-somatic.md" or "philosophy/new-topic.md"). ' +
     'Use this to directly edit or create modular skill files without leaving Claude. ' +
     'Does NOT automatically update MANIFEST.json — run skill_audit or update the manifest separately after creating a new module. ' +
-    'Backs up the updated file to WordPress.',
+    'Backs up the updated file to WordPress after a successful write.\n\n' +
+    'SAFETY GUARDRAIL — OVERWRITE PROTECTION:\n' +
+    'If the target file already exists, the write is BLOCKED and the existing file stats are returned. ' +
+    'To proceed with an intentional overwrite you MUST:\n' +
+    '  1. Read the existing file content (e.g. via skill_read or skill_load_specialist) so you know what you are replacing.\n' +
+    '  2. Explicitly notify Brian that you intend to overwrite this specific file and explain why.\n' +
+    '  3. Set force: true ONLY after Brian has confirmed the overwrite.\n' +
+    'New files (paths that do not yet exist) are created immediately — force: true is not required for new files.',
   inputSchema: {
     type: 'object',
     properties: {
       file:        { type: 'string', description: 'Relative path within modules/ directory, e.g. "music-analysis/music-analysis-somatic.md". Must be category/filename.md or filename.md. No leading slash.' },
-      content:     { type: 'string', description: 'Full content to write to the file. Overwrites existing content if the file exists.' },
+      content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change (used for WP backup metadata). Optional.' },
+      force:       { type: 'boolean', description: 'Set to true to confirm overwrite of an EXISTING file. Only accepted after Brian has been notified and has explicitly confirmed the overwrite. Do NOT pass true speculatively. Default: false.' },
     },
     required: ['file', 'content'],
   },
@@ -338,7 +347,7 @@ export const scriptWriteToolDefinition = {
 // ---------------------------------------------------------------------------
 
 export async function handleModuleWrite(args) {
-  const { file, content, change_note } = args;
+  const { file, content, change_note, force = false } = args;
   if (!content || typeof content !== 'string') throw new Error('content is required');
   const cleanPath  = validateContentPath(file, ['md', 'json']);
   const paths      = getContentPaths();
@@ -346,21 +355,91 @@ export async function handleModuleWrite(args) {
   const dir        = dirname(fullPath);
   const wpSkillUrl = (process.env.WP_SKILL_URL || '').replace(/\/$/, '');
   const wpSkillKey = process.env.WP_SKILL_KEY || '';
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
   const isNew = !existsSync(fullPath);
+
+  // -------------------------------------------------------------------------
+  // SAFETY GUARDRAIL: block overwrite of an existing file unless force=true.
+  //
+  // This prevents accidental truncation of established module content.
+  // Required workflow before force=true:
+  //   1. Read existing file (skill_read / skill_load_specialist).
+  //   2. Notify Brian of the intended overwrite and reason.
+  //   3. Receive explicit confirmation from Brian.
+  //   4. Then call again with force: true.
+  // -------------------------------------------------------------------------
+  if (!isNew && !force) {
+    let lineCount    = 0;
+    let sizeKb       = '0';
+    let lastModified = '';
+    try {
+      const existing = readFileSync(fullPath, 'utf8');
+      lineCount = existing.split('\n').length;
+    } catch { /* ignore read errors — stats still informative */ }
+    try {
+      const st   = statSync(fullPath);
+      sizeKb       = (st.size / 1024).toFixed(1);
+      lastModified = st.mtime.toISOString();
+    } catch { /* ignore */ }
+
+    log('warn', `[module_write] BLOCKED overwrite attempt on existing file: modules/${cleanPath} (${lineCount} lines)`);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          blocked:      true,
+          reason:       `File already exists at modules/${cleanPath} (${lineCount} lines, ${sizeKb}KB). Overwrite blocked by safety guardrail.`,
+          existing_file: {
+            path:          `modules/${cleanPath}`,
+            line_count:    lineCount,
+            size_kb:       parseFloat(sizeKb) || 0,
+            last_modified: lastModified,
+          },
+          required_action: [
+            '1. Read the existing file first so you know what you are replacing.',
+            '2. Explicitly notify Brian: state which file, how many lines you are replacing, and why.',
+            '3. Wait for Brian\'s explicit confirmation.',
+            '4. Then call module_write again with force: true.',
+          ],
+          note: 'New files (non-existing paths) are created immediately without force: true.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (!isNew) log('warn', `[module_write] Overwriting existing file (force=true confirmed): modules/${cleanPath}`);
   writeFileSync(fullPath, content, 'utf8');
+
   let wpResult = { skipped: true, reason: 'WP_SKILL_URL or WP_SKILL_KEY not configured' };
   if (wpSkillUrl && wpSkillKey) {
     try {
       const res = await fetch(`${wpSkillUrl}/modules`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey, 'User-Agent': 'claude-connector/11.5.0 (ava-module-write)' },
+        headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey, 'User-Agent': 'claude-connector/12.8.0 (ava-module-write)' },
         body: JSON.stringify({ file: cleanPath, content, change_note: change_note || '', timestamp: new Date().toISOString(), line_count: content.split('\n').length }),
       });
       wpResult = res.ok ? { ok: true } : { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 200) };
     } catch (err) { wpResult = { ok: false, error: err.message }; }
   }
-  return { content: [{ type: 'text', text: JSON.stringify({ success: true, file: cleanPath, action: isNew ? 'created' : 'updated', line_count: content.split('\n').length, path: fullPath, wp_backup: formatWpResult(wpResult), note: isNew ? 'Module file created. Remember to add an entry to MANIFEST.json if this is a new module for the dispatcher.' : 'Module file updated.' }, null, 2) }] };
+
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        success:    true,
+        file:       cleanPath,
+        action:     isNew ? 'created' : 'overwritten',
+        line_count: content.split('\n').length,
+        path:       fullPath,
+        wp_backup:  formatWpResult(wpResult),
+        note: isNew
+          ? 'Module file created. Remember to add an entry to MANIFEST.json if this is a new module for the dispatcher.'
+          : 'Module file overwritten (force=true confirmed). WordPress backup pushed.',
+      }, null, 2),
+    }],
+  };
 }
 
 export function handleArchiveList(_args) {
