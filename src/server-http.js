@@ -1,4 +1,4 @@
-// src/server-http.js  v12.8.1
+// src/server-http.js  v12.8.2
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v12.4.0: Add skill_recompile MCP tool. Mid-session delta recompile: runs the
@@ -1050,7 +1050,7 @@ async function dispatchToolCall(name, args) {
 // -----------------------------------------------------------------------
 function createMcpServer() {
   const server = new Server(
-    { name: "claude-connector", version: "12.8.1" },
+    { name: "claude-connector", version: "12.8.2" },
     { capabilities: { tools: {} } }
   );
 
@@ -2148,14 +2148,15 @@ app.post("/ti-skill-compile", async (req, res) => {
   }
 
   const {
-    query        = "",
-    context_hint = "",
-    person_name  = "",
-    session_id   = new Date().toISOString().slice(0, 10).replace(/-/g, ""),
+    query               = "",
+    context_hint        = "",
+    person_name         = "",
+    session_id          = new Date().toISOString().slice(0, 10).replace(/-/g, ""),
+    module_access_level = "full",
   } = req.body || {};
 
   try {
-    const result = await handleSkillCompile({ query, context_hint, person_name, session_id });
+    const result = await handleSkillCompile({ query, context_hint, person_name, session_id, module_access_level });
 
     if (result.isError) {
       let parsed = {};
@@ -2220,7 +2221,7 @@ app.use((_req, res) => {
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v12.8.1 on http://${HOST}:${PORT}`);
+  log("info", `claude-connector v12.8.2 on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +

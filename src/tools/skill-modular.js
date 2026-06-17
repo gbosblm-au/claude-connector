@@ -483,7 +483,7 @@ function applyLearnedLinkages(dispatchRules, query, candidates) {
   return additions;
 }
 
-function compileSkill(query, contextHint, paths, personPrior = null) {
+function compileSkill(query, contextHint, paths, personPrior = null, moduleAccessLevel = 'full') {
   const manifest = readJsonFile(paths.manifestFile, { modules: [], mandatory_for_triggers: {}, tag_web: {}, budget: {} });
   const dispatchRules = readJsonFile(paths.dispatchRulesFile, { layer0_mandatory: { rules: [] }, learned_linkages: { rules: [] } });
 
@@ -556,7 +556,61 @@ function compileSkill(query, contextHint, paths, personPrior = null) {
 
   // Layer 6 - budget enforcement (prior-boosted = tier-2 protected)
   const allCandidates = Object.keys(candidateMap);
-  const survivingIds = layer5Budget(manifest, allCandidates, mandatorySet, highConfidenceSet, activePriorSet);
+  let survivingIds = layer5Budget(manifest, allCandidates, mandatorySet, highConfidenceSet, activePriorSet);
+
+  // -----------------------------------------------------------------------
+  // Module Access Level Filter  (injected after budget, before load)
+  // Enforces per-user module permissions set by the Tenax gateway.
+  //
+  //   full       — no filter, all dispatched modules are available
+  //   standard   — blocks architectural/developer modules (code-integrity,
+  //                code-syntax, skill-creator) while keeping all other
+  //                specialist and mandatory modules
+  //   restricted — only IFA/Ava-intrinsic modules: philosophy, alignment,
+  //                self-governance, frontier, existential, voice, writing,
+  //                reading, humour, meta, anti-patterns, tutor
+  //
+  // The selfCheckId is always exempt from filtering (appended separately).
+  // -----------------------------------------------------------------------
+  if (moduleAccessLevel !== 'full') {
+    const STANDARD_BLOCKED_PREFIXES = [
+      'modules/code-integrity/',
+      'modules/code-syntax/',
+      'modules/skill-creator/',
+      'modules/appforge/',
+    ];
+    const RESTRICTED_ALLOWED_PREFIXES = [
+      'modules/philosophy/',
+      'modules/alignment/',
+      'modules/self-governance/',
+      'modules/frontier/',
+      'modules/existential/',
+      'modules/voice/',
+      'modules/writing/',
+      'modules/reading/',
+      'modules/humour/',
+      'modules/meta/',
+      'modules/anti-patterns/',
+      'modules/tutor/',
+      'modules/ifa-arc/',
+    ];
+    const selfCheckId = 'meta-self-check';
+    survivingIds = survivingIds.filter(id => {
+      if (id === selfCheckId) return true; // never filter self-check
+      const module = moduleMap[id];
+      if (!module || !module.path) return true; // no path info — keep
+      const p = module.path.toLowerCase();
+      if (moduleAccessLevel === 'standard') {
+        return !STANDARD_BLOCKED_PREFIXES.some(prefix => p.startsWith(prefix));
+      }
+      if (moduleAccessLevel === 'restricted') {
+        return RESTRICTED_ALLOWED_PREFIXES.some(prefix => p.startsWith(prefix));
+      }
+      return true;
+    });
+    log('info', `skill-modular: module access filter (${moduleAccessLevel}): ${survivingIds.length} modules after filter`);
+  }
+
 
   // Separate meta-self-check (always last)
   const selfCheckId = 'meta-self-check';
@@ -648,6 +702,10 @@ export const skillCompileToolDefinition = {
       session_id: {
         type: 'string',
         description: 'Session identifier for dispatch log. Format: YYYY-MM-DD_HHMMSS.',
+      },
+      module_access_level: {
+        type: 'string',
+        description: 'Access tier for the requesting user: "full" (all modules), "standard" (excludes architectural/developer modules such as code-integrity and code-syntax), or "restricted" (only IFA/Ava-intrinsic categories: philosophy, alignment, self-governance, frontier, existential, voice, writing, tutor, etc.). Injected by the Tenax gateway based on the authenticated user\'s module_access_level setting. Defaults to "full" when omitted.',
       },
     },
     required: ['query'],
@@ -762,10 +820,11 @@ export async function handleSkillCompile(args) {
     };
   }
 
-  const query       = typeof args.query        === 'string' ? args.query.trim()        : '';
-  const contextHint = typeof args.context_hint  === 'string' ? args.context_hint.trim()  : '';
-  const personName  = typeof args.person_name   === 'string' ? args.person_name.trim()   : '';
-  const sessionId   = typeof args.session_id    === 'string' ? args.session_id            : new Date().toISOString().slice(0, 10);
+  const query            = typeof args.query               === 'string' ? args.query.trim()               : '';
+  const contextHint      = typeof args.context_hint         === 'string' ? args.context_hint.trim()         : '';
+  const personName       = typeof args.person_name          === 'string' ? args.person_name.trim()          : '';
+  const sessionId        = typeof args.session_id           === 'string' ? args.session_id                  : new Date().toISOString().slice(0, 10);
+  const moduleAccessLevel = typeof args.module_access_level === 'string' ? args.module_access_level.trim()  : 'full';
 
   // Layer 0: Person Prior - module frequency prior from PROFILES.md.
   // Gated by AVA_PERSON_PRIOR_ENABLED env var (defaults to true).
@@ -779,7 +838,7 @@ export async function handleSkillCompile(args) {
   if (!priorEnvEnabled) log('info', 'skill_compile: AVA_PERSON_PRIOR_ENABLED=false - Layer 0 skipped');
 
   try {
-    const result = compileSkill(query, contextHint, paths, personPrior);
+    const result = compileSkill(query, contextHint, paths, personPrior, moduleAccessLevel);
 
     const priorNote = personPrior.active
       ? `Person prior (${personName}): ${result.person_prior_modules?.length || 0}/${personPrior.priorModules.length} prior modules loaded${result.person_prior_overridden ? ' [overridden]' : ''}.`
