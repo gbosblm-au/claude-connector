@@ -150,7 +150,7 @@ export async function handleScriptExecute( toolInput ) {
   let result;
 
   try {
-    result = spawnSync( 'python3', cmdArgs, {
+    result = spawnSync( '/mise/shims/python3', cmdArgs, {
       cwd:       SCRIPTS_BASE,
       timeout:   maxTimeout * 1000,
       maxBuffer: 50 * 1024 * 1024,   // 50 MB stdout/stderr ceiling
