@@ -1975,7 +1975,7 @@ app.get( '/download/:filename', ( req, res ) => {
 
   const filename    = req.params.filename;
 const safeName = basename( filename );
-const filePath = pathJoin( '/data/skill/ava/archive', safeName );
+const filePath = pathJoin( '/data/skill/archive', safeName );
 
   if ( ! existsSync( filePath ) ) {
     return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
