@@ -1963,7 +1963,39 @@ app.post("/tool-call", async (req, res) => {
     return res.status(statusCode).json({ error: err.message, is_error: true });
   }
 });
+// GET /download/:filename
+// Serves a file from the script execute output directory.
+// Files are written there by script_execute with return_files.
+// Auth: X-Railway-Restore-Token
+app.get( '/download/:filename', ( req, res ) => {
+  const token = ( req.headers[ 'x-railway-restore-token' ] || '' ).trim();
+  if ( ! RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN ) {
+    return res.status( 401 ).json( { error: 'Invalid token.' } );
+  }
 
+  const filename    = req.params.filename;
+  const safeName    = path.basename( filename ); // prevent traversal
+  const filePath    = path.join( '/data/skill/ava/archive', safeName );
+
+  if ( ! existsSync( filePath ) ) {
+    return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
+  }
+
+  const ext      = path.extname( safeName ).toLowerCase();
+  const mimeMap  = {
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.pdf':  'application/pdf',
+    '.csv':  'text/csv',
+    '.txt':  'text/plain',
+    '.html': 'text/html',
+    '.json': 'application/json',
+  };
+
+  res.setHeader( 'Content-Type', mimeMap[ ext ] || 'application/octet-stream' );
+  res.setHeader( 'Content-Disposition', `attachment; filename="${ safeName }"` );
+  res.sendFile( filePath );
+} );
 // -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
