@@ -150,7 +150,12 @@ export async function handleScriptExecute( toolInput ) {
   let result;
 
   try {
-    result = spawnSync( '/mise/installs/python/3.11.15/bin/python3', cmdArgs, {
+    // Resolve python3 location dynamically (mise-managed on Railway)
+const PYTHON_BIN = existsSync('/mise/shims/python3')
+  ? '/mise/shims/python3'
+  : 'python3';
+
+result = spawnSync( PYTHON_BIN, cmdArgs, {
       cwd:       SCRIPTS_BASE,
       timeout:   maxTimeout * 1000,
       maxBuffer: 50 * 1024 * 1024,
