@@ -71,7 +71,7 @@ import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
-import { dirname, join as pathJoin } from "path";
+import { dirname, join as pathJoin, basename, extname, resolve as pathResolve } from "path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -1974,14 +1974,14 @@ app.get( '/download/:filename', ( req, res ) => {
   }
 
   const filename    = req.params.filename;
-  const safeName    = path.basename( filename ); // prevent traversal
-  const filePath    = path.join( '/data/skill/ava/archive', safeName );
+const safeName = basename( filename );
+const filePath = pathJoin( '/data/skill/ava/archive', safeName );
 
   if ( ! existsSync( filePath ) ) {
     return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
   }
 
-  const ext      = path.extname( safeName ).toLowerCase();
+ const ext = extname( safeName ).toLowerCase();
   const mimeMap  = {
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
