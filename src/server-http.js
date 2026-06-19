@@ -2233,7 +2233,6 @@ app.post("/ti-skill-check-scope", async (req, res) => {
     const MAX_NEW_PER_CHECK = 3;
     const lower = conversation_text.toLowerCase();
 
-    // Score each unloaded module against conversation text
     const candidates = [];
     for (const [moduleId, entry] of Object.entries(modules)) {
       if (loadedSet.has(moduleId) || ALWAYS_LOADED.has(moduleId)) continue;
@@ -2262,40 +2261,25 @@ app.post("/ti-skill-check-scope", async (req, res) => {
     const modulesDir    = pathJoin(SKILL_BASE_DIR, "modules");
 
     for (const { moduleId, score, entry } of selected) {
-      const candidates_path = [
+      const paths = [
         pathJoin(modulesDir, moduleId + ".md"),
         pathJoin(SKILL_BASE_DIR, moduleId + ".md"),
       ];
       let content = null;
-      for (const p of candidates_path) {
+      for (const p of paths) {
         if (existsSync(p)) { content = readFileSync(p, "utf8"); break; }
       }
       if (!content) { log("warn", `[ti-skill-check-scope] Module file not found: ${moduleId}`); continue; }
 
       newModules.push(moduleId);
       triggerMatches[moduleId] = { score: Math.round(score * 100) / 100, triggers: (entry.dispatch_triggers || entry.triggers || []).slice(0, 5) };
-      const body = content.replace(/^---[\s\S]*?---\s*
-/m, "").trim();
-      chunks.push(`### Module: ${moduleId}
-
-${body}`);
+      const body = content.replace(/^---[\s\S]*?---[\s]*?\n/m, "").trim();
+      chunks.push(`### Module: ${moduleId}\n\n${body}`);
     }
 
+    const sep = "\n\n---\n\n";
     const deltaContent = chunks.length
-      ? `
-
----
-
-## Mid-Session Specialist Modules
-
-${chunks.join("
-
----
-
-")}
-
----
-`
+      ? `\n\n---\n\n## Mid-Session Specialist Modules\n\n${chunks.join(sep)}\n\n---\n`
       : null;
 
     log("info", `[ti-skill-check-scope] session=${session_id || "?"} new=${newModules.join(",") || "none"}`);
@@ -2314,6 +2298,7 @@ ${chunks.join("
     });
   }
 });
+
 
 app.use((_req, res) => {
   res.status(404).json({
