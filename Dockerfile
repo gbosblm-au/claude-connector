@@ -32,7 +32,6 @@ USER root
 RUN apk add --no-cache python3 py3-pip && \
     pip3 install --break-system-packages python-docx openpyxl Pillow jinja2 && \
     rm -rf /root/.cache/pip
-USER mcp
 
 # Create data directory and schedule store mount point with correct ownership
 RUN mkdir -p /app/data /data && chown -R mcp:mcp /app /data
