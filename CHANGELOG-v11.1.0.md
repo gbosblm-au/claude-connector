@@ -54,3 +54,4 @@ is not surfacing as a tool, the cause is one of:
 3. The modular files (CORE.md, MANIFEST.json, modules/) are not yet on the volume.
 Set the variable, trigger a Railway redeploy, and confirm the startup log shows
 "Modular skill: ENABLED".
+
