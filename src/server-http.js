@@ -1964,9 +1964,9 @@ app.post("/tool-call", async (req, res) => {
   }
 });
 // GET /download/:filename
-// Serves a file from the script execute output directory.
+// Serves a file from the archive directory on the connector volume.
 // Files are written there by script_execute with return_files.
-// Auth: X-Railway-Restore-Token
+// Auth: X-Railway-Restore-Token (header) or ?token= (query param)
 app.get( '/download/:filename', ( req, res ) => {
   const token = ( req.headers[ 'x-railway-restore-token' ] || req.query.token || '' ).trim();
   if ( ! RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN ) {
@@ -1992,9 +1992,16 @@ app.get( '/download/:filename', ( req, res ) => {
     '.json': 'application/json',
   };
 
-  res.setHeader( 'Content-Type', mimeMap[ ext ] || 'application/octet-stream' );
-  res.setHeader( 'Content-Disposition', `attachment; filename="${ safeName }"` );
-  res.sendFile( filePath );
+  try {
+    const fileBuffer = readFileSync( filePath );
+    res.setHeader( 'Content-Type', mimeMap[ ext ] || 'application/octet-stream' );
+    res.setHeader( 'Content-Disposition', `attachment; filename="${ safeName }"` );
+    res.setHeader( 'Content-Length', fileBuffer.length );
+    return res.send( fileBuffer );
+  } catch ( err ) {
+    console.error( '[download] Error reading file:', err.message );
+    return res.status( 500 ).json( { error: err.message } );
+  }
 } );
 // -----------------------------------------------------------------------
 // 404
