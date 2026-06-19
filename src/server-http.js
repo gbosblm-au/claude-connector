@@ -71,7 +71,7 @@ import { createServer } from "http";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
-import { dirname } from "path";
+import { dirname, join as pathJoin } from "path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -409,6 +409,10 @@ import {
   handleReferenceRestoreFromWp,
   handleScriptRestoreFromWp,
 } from "./tools/skill-content.js";
+import {
+  handleScriptExecute,
+  TOOL_DEFINITION as scriptExecuteToolDefinition,
+} from "./tools/script-execute.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -763,6 +767,7 @@ const TOOLS = [
         scriptListToolDefinition,
         scriptReadToolDefinition,
         scriptWriteToolDefinition,
+        scriptExecuteToolDefinition,
       ]
     : []),
 
@@ -989,6 +994,7 @@ async function dispatchToolCall(name, args) {
         case "script_list":             return handleScriptList(args);
         case "script_read":             return handleScriptRead(args);
         case "script_write":            return await handleScriptWrite(args);
+        case "script_execute":          return await handleScriptExecute(args);
 
         // ---------- Ava User Profiles (v10.8.0) ----------
         case "profile_read":           return await handleProfileRead(args);
@@ -2184,6 +2190,128 @@ app.post("/ti-skill-compile", async (req, res) => {
   } catch (err) {
     log("error", `[ti-skill-compile] exception: ${err.message}`);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /ti-skill-check-scope  (v12.9.0)
+// Mid-session skill scope check. Called by the Tenax gateway at turns 2, 5, and 10
+// to detect whether the conversation has entered territory requiring specialist
+// modules not loaded at initial compile time. Returns delta module content only.
+// Auth: X-Railway-Restore-Token (same as /ti-skill-compile).
+app.post("/ti-skill-check-scope", async (req, res) => {
+  if (!SKILL_ENABLED) {
+    return res.status(503).json({ error: "Skill system not configured.", hint: "Set SKILL_FILE_PATH in Railway Variables." });
+  }
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set.", hint: "Set RAILWAY_RESTORE_TOKEN to enable this endpoint." });
+  }
+  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
+  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
+  }
+
+  const { conversation_text, loaded_modules = [], session_id } = req.body || {};
+  if (!conversation_text || typeof conversation_text !== "string") {
+    return res.status(400).json({ error: "conversation_text is required." });
+  }
+
+  try {
+    const manifestPath = SKILL_BASE_DIR ? pathJoin(SKILL_BASE_DIR, "MANIFEST.json") : null;
+    if (!manifestPath || !existsSync(manifestPath)) {
+      return res.json({ new_modules: [], modules_loaded: loaded_modules, delta_content: null, checked_at: new Date().toISOString() });
+    }
+
+    let manifest;
+    try { manifest = JSON.parse(readFileSync(manifestPath, "utf8")); } catch {
+      return res.json({ new_modules: [], modules_loaded: loaded_modules, delta_content: null, checked_at: new Date().toISOString() });
+    }
+
+    const modules   = manifest.modules || {};
+    const loadedSet = new Set(loaded_modules);
+    const ALWAYS_LOADED = new Set(["meta-trigger-recognition", "meta-dispatcher-routing", "meta-self-check", "meta-llm-environment", "meta-deepseek-counterpull", "meta-perplexity-counterpull"]);
+    const SCORE_THRESHOLD   = 0.3;
+    const MAX_NEW_PER_CHECK = 3;
+    const lower = conversation_text.toLowerCase();
+
+    // Score each unloaded module against conversation text
+    const candidates = [];
+    for (const [moduleId, entry] of Object.entries(modules)) {
+      if (loadedSet.has(moduleId) || ALWAYS_LOADED.has(moduleId)) continue;
+      const triggers = entry.dispatch_triggers || entry.triggers || [];
+      if (!triggers.length) continue;
+      let matchCount = 0;
+      for (const t of triggers) {
+        const tl = String(t).toLowerCase().trim();
+        if (!tl) continue;
+        if (lower.includes(tl)) { matchCount += 1.0; continue; }
+        const words = tl.split(/\s+/).filter(w => w.length > 3);
+        if (words.length) {
+          const matched = words.filter(w => lower.includes(w)).length;
+          if (matched > 0) matchCount += (matched / words.length) * 0.7;
+        }
+      }
+      const score = Math.min(matchCount / Math.max(triggers.length, 1), 1.0);
+      if (score >= SCORE_THRESHOLD) candidates.push({ moduleId, score, entry });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    const selected = candidates.slice(0, MAX_NEW_PER_CHECK);
+
+    const newModules    = [];
+    const triggerMatches = {};
+    const chunks        = [];
+    const modulesDir    = pathJoin(SKILL_BASE_DIR, "modules");
+
+    for (const { moduleId, score, entry } of selected) {
+      const candidates_path = [
+        pathJoin(modulesDir, moduleId + ".md"),
+        pathJoin(SKILL_BASE_DIR, moduleId + ".md"),
+      ];
+      let content = null;
+      for (const p of candidates_path) {
+        if (existsSync(p)) { content = readFileSync(p, "utf8"); break; }
+      }
+      if (!content) { log("warn", `[ti-skill-check-scope] Module file not found: ${moduleId}`); continue; }
+
+      newModules.push(moduleId);
+      triggerMatches[moduleId] = { score: Math.round(score * 100) / 100, triggers: (entry.dispatch_triggers || entry.triggers || []).slice(0, 5) };
+      const body = content.replace(/^---[\s\S]*?---\s*
+/m, "").trim();
+      chunks.push(`### Module: ${moduleId}
+
+${body}`);
+    }
+
+    const deltaContent = chunks.length
+      ? `
+
+---
+
+## Mid-Session Specialist Modules
+
+${chunks.join("
+
+---
+
+")}
+
+---
+`
+      : null;
+
+    log("info", `[ti-skill-check-scope] session=${session_id || "?"} new=${newModules.join(",") || "none"}`);
+    return res.json({
+      new_modules:     newModules,
+      modules_loaded:  [...loaded_modules, ...newModules],
+      delta_content:   deltaContent,
+      trigger_matches: Object.keys(triggerMatches).length ? triggerMatches : undefined,
+      checked_at:      new Date().toISOString(),
+    });
+
+  } catch (err) {
+    log("error", `[ti-skill-check-scope] exception: ${err.message}`);
+    return res.status(500).json({
+      error: err.message, new_modules: [], modules_loaded: loaded_modules, delta_content: null, checked_at: new Date().toISOString(),
+    });
   }
 });
 
