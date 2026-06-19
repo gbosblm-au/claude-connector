@@ -1968,7 +1968,7 @@ app.post("/tool-call", async (req, res) => {
 // Files are written there by script_execute with return_files.
 // Auth: X-Railway-Restore-Token
 app.get( '/download/:filename', ( req, res ) => {
-  const token = ( req.headers[ 'x-railway-restore-token' ] || '' ).trim();
+  const token = ( req.headers[ 'x-railway-restore-token' ] || req.query.token || '' ).trim();
   if ( ! RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN ) {
     return res.status( 401 ).json( { error: 'Invalid token.' } );
   }
