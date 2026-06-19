@@ -150,12 +150,22 @@ export async function handleScriptExecute( toolInput ) {
   let result;
 
   try {
-    result = spawnSync( '/mise/shims/python3', cmdArgs, {
+    result = spawnSync( '/mise/installs/python/3.11.15/bin/python3', cmdArgs, {
       cwd:       SCRIPTS_BASE,
       timeout:   maxTimeout * 1000,
-      maxBuffer: 50 * 1024 * 1024,   // 50 MB stdout/stderr ceiling
+      maxBuffer: 50 * 1024 * 1024,
       env:       { ...process.env, PYTHONUNBUFFERED: '1' },
     } );
+
+    // ✨ NEW: check for spawnSync-level errors (e.g. ENOENT)
+    if ( result.error ) {
+      return {
+        error:             result.error.message || String( result.error ),
+        return_code:       -2,
+        execution_time_ms: Date.now() - start,
+        stderr:            `spawnSync failed: ${ result.error.code || 'unknown' } — binary not found or not executable`,
+      };
+    }
 
     const stdout   = result.stdout?.toString()  || '';
     const stderr   = result.stderr?.toString()  || '';
