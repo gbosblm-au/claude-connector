@@ -68,6 +68,7 @@ import {
   handleEscalationQueueRead,
 } from './tools/clientCheckin.js';
 import { createServer } from "http";
+import { execSync } from "child_process";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
@@ -420,6 +421,10 @@ const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
 // Restore token gates POST /restore-skill (push-from-WordPress back to Railway volume).
 // Must match RAILWAY_RESTORE_TOKEN configured in the ts-ava-skill WordPress plugin Settings tab.
 const RAILWAY_RESTORE_TOKEN = process.env.RAILWAY_RESTORE_TOKEN || "";
+// Document download token - lighter weight token used by the download and
+// preview endpoints so the UI can hardcode it into URLs without exposing
+// the primary RAILWAY_RESTORE_TOKEN.
+const DOCUMENT_DOWNLOAD_TOKEN = process.env.DOCUMENT_DOWNLOAD_TOKEN || "";
 // Memory is enabled when either MySQL-primary (WP) or SQLite (legacy) is configured.
 const MEMORY_AUTH_TOKEN = process.env.MEMORY_AUTH_TOKEN || "";
 let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN) || Boolean(config.avaMemoryWpUrl && config.avaMemoryWpKey);
@@ -1964,24 +1969,31 @@ app.post("/tool-call", async (req, res) => {
   }
 });
 // GET /download/:filename
-// Serves a file from the archive directory on the connector volume.
-// Files are written there by script_execute with return_files.
-// Auth: X-Railway-Restore-Token (header) or ?token= (query param)
+// Serves a file from /data/downloads/ directory.
+// Auth: DOCUMENT_DOWNLOAD_TOKEN (query param preferred) or RAILWAY_RESTORE_TOKEN.
 app.get( '/download/:filename', ( req, res ) => {
-  const token = ( req.headers[ 'x-railway-restore-token' ] || req.query.token || '' ).trim();
-  if ( ! RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN ) {
-    return res.status( 401 ).json( { error: 'Invalid token.' } );
+  const token = ( req.query.token || req.headers[ 'x-railway-restore-token' ] || '' ).trim();
+  const validToken1 = DOCUMENT_DOWNLOAD_TOKEN;
+  const validToken2 = RAILWAY_RESTORE_TOKEN;
+
+  if ( !validToken1 && !validToken2 ) {
+    return res.status( 503 ).json( { error: 'No download token configured. Set DOCUMENT_DOWNLOAD_TOKEN in Railway Variables.' } );
+  }
+
+  const tokenOk = ( validToken1 && token === validToken1 ) || ( validToken2 && token === validToken2 );
+  if ( !tokenOk ) {
+    return res.status( 401 ).json( { error: 'Invalid or missing token.' } );
   }
 
   const filename    = req.params.filename;
-const safeName = basename( filename );
-const filePath = pathJoin( '/data/downloads', safeName );
+  const safeName    = basename( filename );
+  const filePath    = pathJoin( '/data/downloads', safeName );
 
   if ( ! existsSync( filePath ) ) {
     return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
   }
 
- const ext = extname( safeName ).toLowerCase();
+  const ext = extname( safeName ).toLowerCase();
   const mimeMap  = {
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -1990,6 +2002,7 @@ const filePath = pathJoin( '/data/downloads', safeName );
     '.txt':  'text/plain',
     '.html': 'text/html',
     '.json': 'application/json',
+    '.md':   'text/markdown',
   };
 
   try {
@@ -2002,6 +2015,153 @@ const filePath = pathJoin( '/data/downloads', safeName );
     console.error( '[download] Error reading file:', err.message );
     return res.status( 500 ).json( { error: err.message } );
   }
+} );
+// GET /preview/:filename
+// Renders a styled HTML preview of a .docx file using preview_extract.py,
+// with an embedded download button carrying the DOCUMENT_DOWNLOAD_TOKEN.
+// Auth: DOCUMENT_DOWNLOAD_TOKEN or RAILWAY_RESTORE_TOKEN (query param).
+app.get( '/preview/:filename', async ( req, res ) => {
+  const token = ( req.query.token || '' ).trim();
+  const validToken1 = DOCUMENT_DOWNLOAD_TOKEN;
+  const validToken2 = RAILWAY_RESTORE_TOKEN;
+
+  if ( !validToken1 && !validToken2 ) {
+    return res.status( 503 ).json( { error: 'No download token configured.' } );
+  }
+
+  const tokenOk = ( validToken1 && token === validToken1 ) || ( validToken2 && token === validToken2 );
+  if ( !tokenOk ) {
+    return res.status( 401 ).json( { error: 'Invalid or missing token.' } );
+  }
+
+  const filename = req.params.filename;
+  const safeName = basename( filename );
+  const filePath = pathJoin( '/data/downloads', safeName );
+
+  if ( ! existsSync( filePath ) ) {
+    return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
+  }
+
+  // Only .docx files get the structured preview; others get a download page
+  const ext = extname( safeName ).toLowerCase();
+
+  if ( ext !== '.docx' ) {
+    // Non-docx: serve a simple download page
+    return res.send( `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>${ safeName }</title>
+<style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}
+a{display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-size:16px}
+a:hover{background:#1d4ed8}</style>
+</head>
+<body><h2>${ safeName }</h2>
+<p>This file type cannot be previewed in the browser.</p>
+<a href="/download/${ safeName }?token=${ encodeURIComponent(token) }">Download File</a>
+</body></html>` );
+  }
+
+ // Run preview_extract.py to get structured content
+  let extracted;
+  try {
+    const stdout = execSync(
+      `python3 /data/skill/ava/scripts/preview_extract.py "${ filePath }"`,
+      { timeout: 15000, encoding: 'utf-8' }
+    );
+    extracted = JSON.parse( stdout );
+  } catch ( err ) {
+    console.error( '[preview] extract error:', err.message );
+    // Fallback: serve raw download page
+    return res.send( `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>${ safeName }</title>
+<style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}
+a{display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-size:16px}
+a:hover{background:#1d4ed8}</style>
+</head>
+<body><h2>${ safeName }</h2>
+<p>Preview not available for this document.</p>
+<a href="/download/${ safeName }?token=${ encodeURIComponent(token) }">Download File</a>
+</body></html>` );
+  }
+
+  // Build the preview HTML
+  const downloadUrl = `/download/${ safeName }?token=${ encodeURIComponent(token) }`;
+
+  let bodyHtml = '';
+  for ( const sec of extracted.sections || [] ) {
+    if ( sec.type === 'heading' ) {
+      const tag = `h${ Math.min( sec.level + 1, 4 ) }`;
+      bodyHtml += `<${ tag }>${ sec.text }</${ tag }>\n`;
+    } else if ( sec.type === 'text' ) {
+      bodyHtml += `<p>${ sec.text }</p>\n`;
+    } else if ( sec.type === 'table' ) {
+      bodyHtml += '<table>\n';
+      if ( sec.headers && sec.headers.length ) {
+        bodyHtml += '  <thead><tr>' + sec.headers.map( h => `<th>${ h }</th>` ).join( '' ) + '</tr></thead>\n';
+      }
+      if ( sec.rows && sec.rows.length ) {
+        bodyHtml += '  <tbody>\n';
+        for ( const row of sec.rows ) {
+          bodyHtml += '    <tr>' + row.map( c => `<td>${ c }</td>` ).join( '' ) + '</tr>\n';
+        }
+        bodyHtml += '  </tbody>\n';
+      }
+      bodyHtml += '</table>\n';
+    }
+  }
+
+  const pageTitle = extracted.title || safeName;
+
+  return res.send( `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${ pageTitle } - Preview</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f8f9fa; color: #333; }
+    .toolbar { position: sticky; top: 0; z-index: 100; background: #fff; border-bottom: 1px solid #e0e0e0; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .toolbar-title { font-size: 14px; color: #666; }
+    .toolbar-title strong { color: #333; }
+    .btn-download { display: inline-flex; align-items: center; gap: 8px; background: #2563eb; color: #fff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 500; transition: background 0.15s; }
+    .btn-download:hover { background: #1d4ed8; }
+    .btn-download svg { width: 18px; height: 18px; fill: currentColor; }
+    .container { max-width: 800px; margin: 0 auto; padding: 40px 24px; }
+    .doc-header { margin-bottom: 32px; }
+    .doc-header h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; color: #111; }
+    .doc-header .meta { font-size: 14px; color: #888; }
+    .doc-body h2 { font-size: 20px; font-weight: 600; margin-top: 28px; margin-bottom: 12px; color: #1a1a1a; }
+    .doc-body h3 { font-size: 17px; font-weight: 600; margin-top: 22px; margin-bottom: 10px; color: #2a2a2a; }
+    .doc-body h4 { font-size: 15px; font-weight: 600; margin-top: 18px; margin-bottom: 8px; color: #333; }
+    .doc-body p { font-size: 15px; line-height: 1.7; margin-bottom: 14px; color: #444; }
+    .doc-body table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+    .doc-body th { background: #f0f2f5; font-weight: 600; text-align: left; padding: 10px 12px; border: 1px solid #ddd; }
+    .doc-body td { padding: 9px 12px; border: 1px solid #ddd; }
+    .doc-body tr:nth-child(even) { background: #fafbfc; }
+    .footer-bar { text-align: center; padding: 20px; color: #999; font-size: 12px; border-top: 1px solid #eee; margin-top: 32px; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div class="toolbar-title">Document: <strong>${ safeName }</strong></div>
+    <a class="btn-download" href="${ downloadUrl }">
+      <svg viewBox="0 0 20 20"><path d="M10 1a1 1 0 0 1 1 1v9.586l2.293-2.293a1 1 0 0 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L9 11.586V2a1 1 0 0 1 1-1zM3 16a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1H3z"/></svg>
+      Download
+    </a>
+  </div>
+  <div class="container">
+    <div class="doc-header">
+      <h1>${ extracted.title || safeName }</h1>
+      ${ extracted.author ? `<div class="meta">${ extracted.author }${ extracted.date ? ' | ' + extracted.date : '' }</div>` : '' }
+    </div>
+    <div class="doc-body">
+      ${ bodyHtml }
+    </div>
+  </div>
+  <div class="footer-bar">Generated by Tenax Intelligence Platform</div>
+</body>
+</html>` );
 } );
 // -----------------------------------------------------------------------
 // 404
@@ -2363,6 +2523,7 @@ app.use((_req, res) => {
       trackOpen:             "GET /track/open?id=...",
       trackClick:            "GET /track/click?id=...&url=...",
       upload:                "POST /upload/connections",
+      previewDownload:       "GET /preview/:filename?token=...",
       webhook:               "POST /webhook",
     },
   });
