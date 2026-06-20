@@ -30,7 +30,7 @@ COPY package.json ./
 # Install Python and document generation dependencies
 USER root
 RUN apk add --no-cache python3 py3-pip py3-cairo && \
-    pip3 install --break-system-packages python-docx openpyxl Pillow jinja2 cairosvg && \
+    pip3 install --break-system-packages python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx && \
     rm -rf /root/.cache/pip
 
 # Create data directory and schedule store mount point with correct ownership
