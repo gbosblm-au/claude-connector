@@ -2084,28 +2084,104 @@ a:hover{background:#1d4ed8}</style>
 </body></html>` );
   }
 
-  // Build the preview HTML
-  const downloadUrl = `/download/${ safeName }?token=${ encodeURIComponent(token) }`;
+  // ── Build absolute download URL so it works inside an iframe ────────────────
+  // When the preview is displayed in an iframe, relative /download/ URLs resolve
+  // against the connector origin, not the parent Tenax UI origin.
+  const connectorBase = ( process.env.CONNECTOR_URL || '' ).replace( /\/$/, '' );
+  const downloadUrl   = connectorBase
+    ? `${ connectorBase }/download/${ safeName }?token=${ encodeURIComponent( token ) }`
+    : `/download/${ safeName }?token=${ encodeURIComponent( token ) }`;
 
+  // ── Simple HTML entity escaper (local scope — avoids collision with any global) ──
+  function escHtml( s ) {
+    return String( s || '' )
+      .replace( /&/g,  '&amp;'  )
+      .replace( /</g,  '&lt;'   )
+      .replace( />/g,  '&gt;'   )
+      .replace( /"/g,  '&quot;' );
+  }
+
+  // ── Render a single run with inline styles extracted from the docx ────────
+  function renderRun( run ) {
+    if ( !run || !run.text ) return '';
+    const fmt = run.fmt || {};
+    let style = '';
+    if ( fmt.font )                  style += `font-family:'${ String( fmt.font ).replace( /'/g, "\\'" ) }',serif;`;
+    if ( fmt.size )                  style += `font-size:${ fmt.size }pt;`;
+    if ( fmt.color )                 style += `color:${ fmt.color };`;
+    if ( fmt.bold )                  style += 'font-weight:700;';
+    if ( fmt.italic )                style += 'font-style:italic;';
+    if ( fmt.underline )             style += 'text-decoration:underline;';
+    if ( fmt.strike )                style += 'text-decoration:line-through;';
+    if ( fmt.highlight )             style += `background:${ fmt.highlight };`;
+    if ( fmt.v_align === 'super' )   style += 'vertical-align:super;font-size:0.75em;';
+    if ( fmt.v_align === 'sub' )     style += 'vertical-align:sub;font-size:0.75em;';
+    const escaped = escHtml( run.text );
+    return style ? `<span style="${ style }">${ escaped }</span>` : escaped;
+  }
+
+  // ── Render an array of runs into HTML ─────────────────────────────────────
+  function renderRuns( runs ) {
+    if ( !runs || !runs.length ) return '';
+    return runs.map( r => renderRun( r ) ).join( '' );
+  }
+
+  // ── Build document body HTML from rich extracted sections ─────────────────
   let bodyHtml = '';
+
   for ( const sec of extracted.sections || [] ) {
+
     if ( sec.type === 'heading' ) {
-      const tag = `h${ Math.min( sec.level + 1, 4 ) }`;
-      bodyHtml += `<${ tag }>${ sec.text }</${ tag }>\n`;
-    } else if ( sec.type === 'text' ) {
-      bodyHtml += `<p>${ sec.text }</p>\n`;
+      const tag       = `h${ Math.min( ( sec.level || 0 ) + 1, 4 ) }`;
+      const alignSt   = sec.alignment ? `text-align:${ sec.alignment };` : '';
+      const content   = sec.runs && sec.runs.length
+        ? renderRuns( sec.runs )
+        : escHtml( sec.text || '' );
+      bodyHtml += `<${ tag } style="${ alignSt }">${ content }</${ tag }>\n`;
+
+    } else if ( sec.type === 'text' || sec.type === 'list_item' ) {
+      const alignSt   = sec.alignment ? `text-align:${ sec.alignment };` : '';
+      const marginSt  = sec.list_level != null
+        ? `margin-left:${ ( sec.list_level + 1 ) * 20 }px;`
+        : '';
+      const content   = sec.runs && sec.runs.length
+        ? renderRuns( sec.runs )
+        : escHtml( sec.text || '' );
+      bodyHtml += `<p style="${ alignSt }${ marginSt }">${ content }</p>\n`;
+
     } else if ( sec.type === 'table' ) {
       bodyHtml += '<table>\n';
+
+      // Header row — uses cell objects with optional bg_color and runs
       if ( sec.headers && sec.headers.length ) {
-        bodyHtml += '  <thead><tr>' + sec.headers.map( h => `<th>${ h }</th>` ).join( '' ) + '</tr></thead>\n';
+        bodyHtml += '  <thead><tr>\n';
+        for ( const cell of sec.headers ) {
+          const bgSt      = cell && cell.bg_color ? `background:${ cell.bg_color };` : '';
+          const cellHtml  = cell && cell.runs && cell.runs.length
+            ? renderRuns( cell.runs )
+            : escHtml( ( cell && cell.text ) || String( cell || '' ) );
+          bodyHtml += `    <th style="${ bgSt }">${ cellHtml }</th>\n`;
+        }
+        bodyHtml += '  </tr></thead>\n';
       }
+
+      // Data rows — each cell may be an object with bg_color/runs or a plain string
       if ( sec.rows && sec.rows.length ) {
         bodyHtml += '  <tbody>\n';
         for ( const row of sec.rows ) {
-          bodyHtml += '    <tr>' + row.map( c => `<td>${ c }</td>` ).join( '' ) + '</tr>\n';
+          bodyHtml += '    <tr>\n';
+          for ( const cell of row ) {
+            const bgSt      = cell && cell.bg_color ? `background:${ cell.bg_color };` : '';
+            const cellHtml  = cell && cell.runs && cell.runs.length
+              ? renderRuns( cell.runs )
+              : escHtml( ( cell && cell.text ) || String( cell || '' ) );
+            bodyHtml += `      <td style="${ bgSt }">${ cellHtml }</td>\n`;
+          }
+          bodyHtml += '    </tr>\n';
         }
         bodyHtml += '  </tbody>\n';
       }
+
       bodyHtml += '</table>\n';
     }
   }
@@ -2205,7 +2281,7 @@ a:hover{background:#1d4ed8}</style>
 <body>
   <div class="toolbar">
     <div class="toolbar-title">Document: <strong>${ safeName }</strong></div>
-    <a class="btn-download" href="${ downloadUrl }">
+    <a class="btn-download" href="${ downloadUrl }" target="_parent" rel="noopener">
       <svg viewBox="0 0 20 20"><path d="M10 1a1 1 0 0 1 1 1v9.586l2.293-2.293a1 1 0 0 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L9 11.586V2a1 1 0 0 1 1-1zM3 16a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1H3z"/></svg>
       Download
     </a>
