@@ -1178,6 +1178,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Accept");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Content-Security-Policy", "frame-ancestors *;");  // allow iframe in Tenax UI
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
@@ -2017,11 +2018,13 @@ app.get( '/download/:filename', ( req, res ) => {
   }
 } );
 // GET /preview/:filename
-// Renders a styled HTML preview of a .docx file using preview_extract.py,
-// with an embedded download button carrying the DOCUMENT_DOWNLOAD_TOKEN.
+// Serves a styled HTML preview of a document.
+// If filename ends with .html, serves it directly as-is.
+// If filename ends with .docx, serves the matching .html file (generated alongside the docx).
+// Fallback: uses preview_extract.py for legacy docx-only files.
 // Auth: DOCUMENT_DOWNLOAD_TOKEN or RAILWAY_RESTORE_TOKEN (query param).
 app.get( '/preview/:filename', async ( req, res ) => {
-  const token = ( req.query.token || '' ).trim();
+  const token      = ( req.query.token || '' ).trim();
   const validToken1 = DOCUMENT_DOWNLOAD_TOKEN;
   const validToken2 = RAILWAY_RESTORE_TOKEN;
 
@@ -2036,268 +2039,81 @@ app.get( '/preview/:filename', async ( req, res ) => {
 
   const filename = req.params.filename;
   const safeName = basename( filename );
-  const filePath = pathJoin( '/data/downloads', safeName );
+  const ext      = extname( safeName ).toLowerCase();
+  const dlDir    = '/data/downloads';
 
-  if ( ! existsSync( filePath ) ) {
-    return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
+  // Auto-create downloads directory if missing
+  if ( !existsSync( dlDir ) ) mkdirSync( dlDir, { recursive: true } );
+
+  // ── Serve .html files directly (generated alongside the docx) ──────────────
+  if ( ext === '.html' ) {
+    const filePath = pathJoin( dlDir, safeName );
+    if ( !existsSync( filePath ) ) {
+      return res.status( 404 ).json( { error: `Preview not found: ${ safeName }` } );
+    }
+    res.setHeader( 'Content-Type', 'text/html; charset=utf-8' );
+    return res.send( readFileSync( filePath, 'utf-8' ) );
   }
 
-  // Only .docx files get the structured preview; others get a download page
-  const ext = extname( safeName ).toLowerCase();
+  // ── For .docx: look for a matching .html first (fast path) ─────────────────
+  if ( ext === '.docx' ) {
+    const htmlName = safeName.replace( /\.docx$/i, '.html' );
+    const htmlPath = pathJoin( dlDir, htmlName );
+    if ( existsSync( htmlPath ) ) {
+      res.setHeader( 'Content-Type', 'text/html; charset=utf-8' );
+      return res.send( readFileSync( htmlPath, 'utf-8' ) );
+    }
 
-  if ( ext !== '.docx' ) {
-    // Non-docx: serve a simple download page
-    return res.send( `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>${ safeName }</title>
-<style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}
-a{display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-size:16px}
-a:hover{background:#1d4ed8}</style>
-</head>
-<body><h2>${ safeName }</h2>
-<p>This file type cannot be previewed in the browser.</p>
-<a href="/download/${ safeName }?token=${ encodeURIComponent(token) }">Download File</a>
-</body></html>` );
-  }
+    // Fallback: run preview_extract.py for legacy .docx with no paired .html
+    const docxPath = pathJoin( dlDir, safeName );
+    if ( !existsSync( docxPath ) ) {
+      return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
+    }
 
- // Run preview_extract.py to get structured content
-  let extracted;
-  try {
-    const stdout = execSync(
-      `python3 /data/skill/ava/scripts/preview_extract.py "${ filePath }"`,
-      { timeout: 15000, encoding: 'utf-8' }
-    );
-    extracted = JSON.parse( stdout );
-  } catch ( err ) {
-    console.error( '[preview] extract error:', err.message );
-    // Fallback: serve raw download page
-    return res.send( `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>${ safeName }</title>
-<style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}
-a{display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-size:16px}
-a:hover{background:#1d4ed8}</style>
-</head>
-<body><h2>${ safeName }</h2>
-<p>Preview not available for this document.</p>
-<a href="/download/${ safeName }?token=${ encodeURIComponent(token) }">Download File</a>
-</body></html>` );
-  }
+    let extracted;
+    try {
+      const stdout = execSync(
+        `python3 /data/skill/ava/scripts/preview_extract.py "${ docxPath }"`,
+        { timeout: 15000, encoding: 'utf-8' }
+      );
+      extracted = JSON.parse( stdout );
+    } catch ( err ) {
+      console.error( '[preview] extract error:', err.message );
+      const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title></head><body style="font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center"><h2>${ esc(safeName) }</h2><p>Preview not available.</p><a href="/download/${ encodeURIComponent(safeName) }?token=${ encodeURIComponent(token) }" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Download File</a></body></html>` );
+    }
 
-  // ── Build absolute download URL so it works inside an iframe ────────────────
-  // When the preview is displayed in an iframe, relative /download/ URLs resolve
-  // against the connector origin, not the parent Tenax UI origin.
-  const connectorBase = ( process.env.CONNECTOR_URL || '' ).replace( /\/$/, '' );
-  const downloadUrl   = connectorBase
-    ? `${ connectorBase }/download/${ safeName }?token=${ encodeURIComponent( token ) }`
-    : `/download/${ safeName }?token=${ encodeURIComponent( token ) }`;
-
-  // ── Simple HTML entity escaper (local scope — avoids collision with any global) ──
-  function escHtml( s ) {
-    return String( s || '' )
-      .replace( /&/g,  '&amp;'  )
-      .replace( /</g,  '&lt;'   )
-      .replace( />/g,  '&gt;'   )
-      .replace( /"/g,  '&quot;' );
-  }
-
-  // ── Render a single run with inline styles extracted from the docx ────────
-  function renderRun( run ) {
-    if ( !run || !run.text ) return '';
-    const fmt = run.fmt || {};
-    let style = '';
-    if ( fmt.font )                  style += `font-family:'${ String( fmt.font ).replace( /'/g, "\\'" ) }',serif;`;
-    if ( fmt.size )                  style += `font-size:${ fmt.size }pt;`;
-    if ( fmt.color )                 style += `color:${ fmt.color };`;
-    if ( fmt.bold )                  style += 'font-weight:700;';
-    if ( fmt.italic )                style += 'font-style:italic;';
-    if ( fmt.underline )             style += 'text-decoration:underline;';
-    if ( fmt.strike )                style += 'text-decoration:line-through;';
-    if ( fmt.highlight )             style += `background:${ fmt.highlight };`;
-    if ( fmt.v_align === 'super' )   style += 'vertical-align:super;font-size:0.75em;';
-    if ( fmt.v_align === 'sub' )     style += 'vertical-align:sub;font-size:0.75em;';
-    const escaped = escHtml( run.text );
-    return style ? `<span style="${ style }">${ escaped }</span>` : escaped;
-  }
-
-  // ── Render an array of runs into HTML ─────────────────────────────────────
-  function renderRuns( runs ) {
-    if ( !runs || !runs.length ) return '';
-    return runs.map( r => renderRun( r ) ).join( '' );
-  }
-
-  // ── Build document body HTML from rich extracted sections ─────────────────
-  let bodyHtml = '';
-
-  for ( const sec of extracted.sections || [] ) {
-
-    if ( sec.type === 'heading' ) {
-      const tag       = `h${ Math.min( ( sec.level || 0 ) + 1, 4 ) }`;
-      const alignSt   = sec.alignment ? `text-align:${ sec.alignment };` : '';
-      const content   = sec.runs && sec.runs.length
-        ? renderRuns( sec.runs )
-        : escHtml( sec.text || '' );
-      bodyHtml += `<${ tag } style="${ alignSt }">${ content }</${ tag }>\n`;
-
-    } else if ( sec.type === 'text' || sec.type === 'list_item' ) {
-      const alignSt   = sec.alignment ? `text-align:${ sec.alignment };` : '';
-      const marginSt  = sec.list_level != null
-        ? `margin-left:${ ( sec.list_level + 1 ) * 20 }px;`
-        : '';
-      const content   = sec.runs && sec.runs.length
-        ? renderRuns( sec.runs )
-        : escHtml( sec.text || '' );
-      bodyHtml += `<p style="${ alignSt }${ marginSt }">${ content }</p>\n`;
-
-    } else if ( sec.type === 'table' ) {
-      bodyHtml += '<table>\n';
-
-      // Header row — uses cell objects with optional bg_color and runs
-      if ( sec.headers && sec.headers.length ) {
-        bodyHtml += '  <thead><tr>\n';
-        for ( const cell of sec.headers ) {
-          const bgSt      = cell && cell.bg_color ? `background:${ cell.bg_color };` : '';
-          const cellHtml  = cell && cell.runs && cell.runs.length
-            ? renderRuns( cell.runs )
-            : escHtml( ( cell && cell.text ) || String( cell || '' ) );
-          bodyHtml += `    <th style="${ bgSt }">${ cellHtml }</th>\n`;
+    const downloadUrl = `/download/${ safeName }?token=${ encodeURIComponent( token ) }`;
+    const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    let bodyHtml = '';
+    for ( const sec of extracted.sections || [] ) {
+      if ( sec.type === 'heading' ) {
+        const tag = `h${ Math.min( ( sec.level || 0 ) + 1, 4 ) }`;
+        bodyHtml += `<${ tag }>${ esc( sec.text ) }</${ tag }>\n`;
+      } else if ( sec.type === 'text' ) {
+        bodyHtml += `<p>${ esc( sec.text ) }</p>\n`;
+      } else if ( sec.type === 'table' ) {
+        bodyHtml += '<table>\n';
+        if ( sec.headers && sec.headers.length ) {
+          bodyHtml += '  <thead><tr>' + sec.headers.map( h => `<th>${ esc( typeof h === 'object' ? (h.text||'') : h ) }</th>` ).join('') + '</tr></thead>\n';
         }
-        bodyHtml += '  </tr></thead>\n';
-      }
-
-      // Data rows — each cell may be an object with bg_color/runs or a plain string
-      if ( sec.rows && sec.rows.length ) {
-        bodyHtml += '  <tbody>\n';
-        for ( const row of sec.rows ) {
-          bodyHtml += '    <tr>\n';
-          for ( const cell of row ) {
-            const bgSt      = cell && cell.bg_color ? `background:${ cell.bg_color };` : '';
-            const cellHtml  = cell && cell.runs && cell.runs.length
-              ? renderRuns( cell.runs )
-              : escHtml( ( cell && cell.text ) || String( cell || '' ) );
-            bodyHtml += `      <td style="${ bgSt }">${ cellHtml }</td>\n`;
+        if ( sec.rows && sec.rows.length ) {
+          bodyHtml += '  <tbody>\n';
+          for ( const row of sec.rows ) {
+            bodyHtml += '    <tr>' + row.map( c => `<td>${ esc( typeof c === 'object' ? (c.text||'') : c ) }</td>` ).join('') + '</tr>\n';
           }
-          bodyHtml += '    </tr>\n';
+          bodyHtml += '  </tbody>\n';
         }
-        bodyHtml += '  </tbody>\n';
+        bodyHtml += '</table>\n';
       }
-
-      bodyHtml += '</table>\n';
     }
+
+    return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${ esc( extracted.title || safeName ) }</title><style>body{font-family:Calibri,Georgia,serif;background:#e8e8e4;padding:24px 16px}div.doc-body{background:#fff;max-width:820px;margin:0 auto;padding:40px 48px;box-shadow:0 2px 12px rgba(0,0,0,.12)}h2{font-size:14pt;margin:18pt 0 6pt;color:#222}p{font-size:11pt;line-height:1.55;margin-bottom:8pt;color:#1a1a1a}table{border-collapse:collapse;width:100%;margin:14pt 0;font-size:10.5pt}th{background:#f0f0f0;padding:6pt 8pt;border:1px solid #c8c8c8;text-align:left}td{padding:5pt 8pt;border:1px solid #c8c8c8}tr:nth-child(even) td{background:#f7f7f7}</style></head><body><div class="doc-body">${ bodyHtml }<p style="margin-top:24px"><a href="${ downloadUrl }" target="_parent" style="display:inline-block;background:#4A9080;color:#fff;padding:10px 20px;text-decoration:none;border-radius:5px;">Download Original (.docx)</a></p></div></body></html>` );
   }
 
-  const pageTitle = extracted.title || safeName;
-
-  const theme = req.query.theme || 'tenax';
-  return res.send( `<!DOCTYPE html>
-<html lang="en" data-theme="${ theme }">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${ pageTitle } - Preview</title>
-  <style>
-    /* ── THEME VARIABLES (from Tenax UI) ── */
-    :root {
-      --bg:             #0B1614;
-      --bg-surface:     #0F1C19;
-      --bg-elevated:    #132420;
-      --border:         #172820;
-      --text-primary:   #A8D8C8;
-      --text-secondary: #3A6058;
-      --text-muted:     #2A4A42;
-      --accent:         #4A9080;
-      --accent-mid:     #66B09A;
-      --accent-light:   #8EC8B2;
-    }
-    [data-theme="ocean"] {
-      --bg:#080D18; --bg-surface:#0C1222; --bg-elevated:#101828; --border:#141E32;
-      --text-primary:#A8C8EC; --text-secondary:#3A5878; --text-muted:#283A50;
-      --accent:#3874B0; --accent-mid:#508CC8; --accent-light:#70A8E4;
-    }
-    [data-theme="slate"] {
-      --bg:#111214; --bg-surface:#171820; --bg-elevated:#1C1D26; --border:#1E2030;
-      --text-primary:#E8D8B0; --text-secondary:#806848; --text-muted:#504030;
-      --accent:#B08828; --accent-mid:#C89838; --accent-light:#E0A848;
-    }
-    [data-theme="light"] {
-      --bg:#F4F4F0; --bg-surface:#FFFFFF; --bg-elevated:#EEEEEA; --border:#D4D4CC;
-      --text-primary:#1A2826; --text-secondary:#486058; --text-muted:#90A898;
-      --accent:#287868; --accent-mid:#389080; --accent-light:#48A898;
-    }
-    [data-theme="dusk"] {
-      --bg:#0D0B16; --bg-surface:#12101C; --bg-elevated:#171424; --border:#1C182C;
-      --text-primary:#C8B8E8; --text-secondary:#584878; --text-muted:#382858;
-      --accent:#7038C0; --accent-mid:#8850D8; --accent-light:#A068F0;
-    }
-    [data-theme="paper"] {
-      --bg:#F8F4EC; --bg-surface:#FDFAF4; --bg-elevated:#F2EDE2; --border:#D8CFC0;
-      --text-primary:#2A1E10; --text-secondary:#7A6040; --text-muted:#B09878;
-      --accent:#8A4E28; --accent-mid:#A06038; --accent-light:#BA7848;
-    }
-    [data-theme="sage"] {
-      --bg:#EEF2EC; --bg-surface:#F8FAF7; --bg-elevated:#E8EEE6; --border:#C8D2C6;
-      --text-primary:#1C2C1C; --text-secondary:#4A6248; --text-muted:#8A9E88;
-      --accent:#2E6A3E; --accent-mid:#3E8050; --accent-light:#509860;
-    }
-    [data-theme="nordic"] {
-      --bg:#F0F3F7; --bg-surface:#FAFBFD; --bg-elevated:#E8EDF3; --border:#C8CFD8;
-      --text-primary:#18223A; --text-secondary:#4A5E7A; --text-muted:#8898B0;
-      --accent:#2E50A0; --accent-mid:#3E68B8; --accent-light:#5080D0;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    /* Page canvas uses a neutral document background, not the Tenax theme dark colour */
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #e8e8e4; color: #222; }
-    /* ── Toolbar: theme colours so it matches the Tenax UI chrome ── */
-    .toolbar { position: sticky; top: 0; z-index: 100; background: var(--bg-elevated, #132420); border-bottom: 1px solid var(--border, #172820); padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 4px rgba(0,0,0,0.18); }
-    .toolbar-title { font-size: 13px; color: var(--text-secondary, #3A6058); }
-    .toolbar-title strong { color: var(--text-primary, #A8D8C8); font-weight: 500; }
-    .btn-download { display: inline-flex; align-items: center; gap: 8px; background: var(--accent, #4A9080); color: #fff; padding: 8px 18px; border-radius: 5px; text-decoration: none; font-size: 13px; font-weight: 500; transition: background 0.15s; }
-    .btn-download:hover { background: var(--accent-mid, #66B09A); }
-    .btn-download svg { width: 16px; height: 16px; fill: currentColor; }
-    /* ── Document container: centres the white page on the canvas ── */
-    .container { max-width: 860px; margin: 0 auto; padding: 28px 20px 48px; }
-    /* ── Document header (title + meta) ── */
-    .doc-header { margin-bottom: 0; }
-    .doc-header h1 { font-family: 'Calibri', 'Georgia', 'Times New Roman', serif; font-size: 24px; font-weight: 700; color: #111; margin-bottom: 4px; }
-    .doc-header .meta { font-size: 11px; color: #888; margin-bottom: 0; }
-    /* ── Document body: white page, serif typography, black text ── */
-    .doc-body { background: #ffffff; padding: 48px 56px; box-shadow: 0 2px 12px rgba(0,0,0,0.14); border-radius: 2px; margin-top: 0; }
-    .doc-body, .doc-body p, .doc-body li, .doc-body td, .doc-body th, .doc-body span {
-      font-family: 'Calibri', 'Georgia', 'Times New Roman', serif;
-      color: #1a1a1a;
-    }
-    .doc-body h2 { font-family: 'Calibri', 'Georgia', serif; font-size: 17px; font-weight: 700; margin-top: 26px; margin-bottom: 10px; color: #111; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
-    .doc-body h3 { font-family: 'Calibri', 'Georgia', serif; font-size: 15px; font-weight: 600; margin-top: 20px; margin-bottom: 8px; color: #222; }
-    .doc-body h4 { font-family: 'Calibri', 'Georgia', serif; font-size: 13px; font-weight: 600; margin-top: 16px; margin-bottom: 6px; color: #333; }
-    .doc-body p { font-size: 11.5pt; line-height: 1.6; margin-bottom: 10px; color: #1a1a1a; }
-    .doc-body table { border-collapse: collapse; width: 100%; margin: 18px 0; font-size: 10.5pt; }
-    .doc-body th { background: #f0f0f0; font-weight: 600; text-align: left; padding: 8px 10px; border: 1px solid #c8c8c8; color: #333; font-size: 10pt; }
-    .doc-body td { padding: 7px 10px; border: 1px solid #c8c8c8; color: #1a1a1a; }
-    .doc-body tr:nth-child(even) td { background: #f7f7f7; }
-    /* ── Footer: theme-tinted, not part of the white document page ── */
-    .footer-bar { text-align: center; padding: 18px; color: var(--text-muted, #888); font-size: 11px; margin-top: 0; font-family: -apple-system, sans-serif; }
-  </style>
-</head>
-<body>
-  <div class="toolbar">
-    <div class="toolbar-title">Document: <strong>${ safeName }</strong></div>
-    <a class="btn-download" href="${ downloadUrl }" target="_parent" rel="noopener">
-      <svg viewBox="0 0 20 20"><path d="M10 1a1 1 0 0 1 1 1v9.586l2.293-2.293a1 1 0 0 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L9 11.586V2a1 1 0 0 1 1-1zM3 16a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1H3z"/></svg>
-      Download
-    </a>
-  </div>
-  <div class="container">
-    <div class="doc-header">
-      <h1>${ extracted.title || safeName }</h1>
-      ${ extracted.author ? `<div class="meta">${ extracted.author }${ extracted.date ? ' | ' + extracted.date : '' }</div>` : '' }
-    </div>
-    <div class="doc-body">
-      ${ bodyHtml }
-    </div>
-  </div>
-  <div class="footer-bar">Generated by Tenax Intelligence Platform</div>
-</body>
-</html>` );
+  // ── Non-docx: serve a simple download page ──────────────────────────────────
+  const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}a{display:inline-block;color:#fff;padding:12px 24px;background:#2563eb;text-decoration:none;border-radius:6px}</style></head><body><h2>${ esc(safeName) }</h2><p>This file type cannot be previewed.</p><a href="/download/${ encodeURIComponent(safeName) }?token=${ encodeURIComponent(token) }" target="_parent">Download File</a></body></html>` );
 } );
 // -----------------------------------------------------------------------
 // 404
