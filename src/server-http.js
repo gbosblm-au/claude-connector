@@ -2169,26 +2169,37 @@ a:hover{background:#1d4ed8}</style>
       --accent:#2E50A0; --accent-mid:#3E68B8; --accent-light:#5080D0;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: var(--bg); color: var(--text-primary); }
-    .toolbar { position: sticky; top: 0; z-index: 100; background: var(--bg-elevated); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-    .toolbar-title { font-size: 14px; color: var(--text-secondary); }
-    .toolbar-title strong { color: var(--text-primary); }
-    .btn-download { display: inline-flex; align-items: center; gap: 8px; background: var(--accent); color: #fff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 500; transition: background 0.15s; }
-    .btn-download:hover { background: var(--accent-mid); }
-    .btn-download svg { width: 18px; height: 18px; fill: currentColor; }
-    .container { max-width: 800px; margin: 0 auto; padding: 40px 24px; }
-    .doc-header { margin-bottom: 32px; }
-    .doc-header h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; color: var(--text-primary); }
-    .doc-header .meta { font-size: 14px; color: var(--text-secondary); }
-    .doc-body h2 { font-size: 20px; font-weight: 600; margin-top: 28px; margin-bottom: 12px; color: var(--text-primary); }
-    .doc-body h3 { font-size: 17px; font-weight: 600; margin-top: 22px; margin-bottom: 10px; color: var(--text-primary); }
-    .doc-body h4 { font-size: 15px; font-weight: 600; margin-top: 18px; margin-bottom: 8px; color: var(--text-primary); }
-    .doc-body p { font-size: 15px; line-height: 1.7; margin-bottom: 14px; color: var(--text-primary); opacity: 0.85; }
-    .doc-body table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
-    .doc-body th { background: var(--bg-elevated); font-weight: 600; text-align: left; padding: 10px 12px; border: 1px solid var(--border); color: var(--accent-light); }
-    .doc-body td { padding: 9px 12px; border: 1px solid var(--border); color: var(--text-primary); opacity: 0.85; }
-    .doc-body tr:nth-child(even) td { background: var(--bg-surface); }
-    .footer-bar { text-align: center; padding: 20px; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border); margin-top: 32px; }
+    /* Page canvas uses a neutral document background, not the Tenax theme dark colour */
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #e8e8e4; color: #222; }
+    /* ── Toolbar: theme colours so it matches the Tenax UI chrome ── */
+    .toolbar { position: sticky; top: 0; z-index: 100; background: var(--bg-elevated, #132420); border-bottom: 1px solid var(--border, #172820); padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 4px rgba(0,0,0,0.18); }
+    .toolbar-title { font-size: 13px; color: var(--text-secondary, #3A6058); }
+    .toolbar-title strong { color: var(--text-primary, #A8D8C8); font-weight: 500; }
+    .btn-download { display: inline-flex; align-items: center; gap: 8px; background: var(--accent, #4A9080); color: #fff; padding: 8px 18px; border-radius: 5px; text-decoration: none; font-size: 13px; font-weight: 500; transition: background 0.15s; }
+    .btn-download:hover { background: var(--accent-mid, #66B09A); }
+    .btn-download svg { width: 16px; height: 16px; fill: currentColor; }
+    /* ── Document container: centres the white page on the canvas ── */
+    .container { max-width: 860px; margin: 0 auto; padding: 28px 20px 48px; }
+    /* ── Document header (title + meta) ── */
+    .doc-header { margin-bottom: 0; }
+    .doc-header h1 { font-family: 'Calibri', 'Georgia', 'Times New Roman', serif; font-size: 24px; font-weight: 700; color: #111; margin-bottom: 4px; }
+    .doc-header .meta { font-size: 11px; color: #888; margin-bottom: 0; }
+    /* ── Document body: white page, serif typography, black text ── */
+    .doc-body { background: #ffffff; padding: 48px 56px; box-shadow: 0 2px 12px rgba(0,0,0,0.14); border-radius: 2px; margin-top: 0; }
+    .doc-body, .doc-body p, .doc-body li, .doc-body td, .doc-body th, .doc-body span {
+      font-family: 'Calibri', 'Georgia', 'Times New Roman', serif;
+      color: #1a1a1a;
+    }
+    .doc-body h2 { font-family: 'Calibri', 'Georgia', serif; font-size: 17px; font-weight: 700; margin-top: 26px; margin-bottom: 10px; color: #111; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+    .doc-body h3 { font-family: 'Calibri', 'Georgia', serif; font-size: 15px; font-weight: 600; margin-top: 20px; margin-bottom: 8px; color: #222; }
+    .doc-body h4 { font-family: 'Calibri', 'Georgia', serif; font-size: 13px; font-weight: 600; margin-top: 16px; margin-bottom: 6px; color: #333; }
+    .doc-body p { font-size: 11.5pt; line-height: 1.6; margin-bottom: 10px; color: #1a1a1a; }
+    .doc-body table { border-collapse: collapse; width: 100%; margin: 18px 0; font-size: 10.5pt; }
+    .doc-body th { background: #f0f0f0; font-weight: 600; text-align: left; padding: 8px 10px; border: 1px solid #c8c8c8; color: #333; font-size: 10pt; }
+    .doc-body td { padding: 7px 10px; border: 1px solid #c8c8c8; color: #1a1a1a; }
+    .doc-body tr:nth-child(even) td { background: #f7f7f7; }
+    /* ── Footer: theme-tinted, not part of the white document page ── */
+    .footer-bar { text-align: center; padding: 18px; color: var(--text-muted, #888); font-size: 11px; margin-top: 0; font-family: -apple-system, sans-serif; }
   </style>
 </head>
 <body>
