@@ -2112,34 +2112,83 @@ a:hover{background:#1d4ed8}</style>
 
   const pageTitle = extracted.title || safeName;
 
+  const theme = req.query.theme || 'tenax';
   return res.send( `<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="${ theme }">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${ pageTitle } - Preview</title>
   <style>
+    /* ── THEME VARIABLES (from Tenax UI) ── */
+    :root {
+      --bg:             #0B1614;
+      --bg-surface:     #0F1C19;
+      --bg-elevated:    #132420;
+      --border:         #172820;
+      --text-primary:   #A8D8C8;
+      --text-secondary: #3A6058;
+      --text-muted:     #2A4A42;
+      --accent:         #4A9080;
+      --accent-mid:     #66B09A;
+      --accent-light:   #8EC8B2;
+    }
+    [data-theme="ocean"] {
+      --bg:#080D18; --bg-surface:#0C1222; --bg-elevated:#101828; --border:#141E32;
+      --text-primary:#A8C8EC; --text-secondary:#3A5878; --text-muted:#283A50;
+      --accent:#3874B0; --accent-mid:#508CC8; --accent-light:#70A8E4;
+    }
+    [data-theme="slate"] {
+      --bg:#111214; --bg-surface:#171820; --bg-elevated:#1C1D26; --border:#1E2030;
+      --text-primary:#E8D8B0; --text-secondary:#806848; --text-muted:#504030;
+      --accent:#B08828; --accent-mid:#C89838; --accent-light:#E0A848;
+    }
+    [data-theme="light"] {
+      --bg:#F4F4F0; --bg-surface:#FFFFFF; --bg-elevated:#EEEEEA; --border:#D4D4CC;
+      --text-primary:#1A2826; --text-secondary:#486058; --text-muted:#90A898;
+      --accent:#287868; --accent-mid:#389080; --accent-light:#48A898;
+    }
+    [data-theme="dusk"] {
+      --bg:#0D0B16; --bg-surface:#12101C; --bg-elevated:#171424; --border:#1C182C;
+      --text-primary:#C8B8E8; --text-secondary:#584878; --text-muted:#382858;
+      --accent:#7038C0; --accent-mid:#8850D8; --accent-light:#A068F0;
+    }
+    [data-theme="paper"] {
+      --bg:#F8F4EC; --bg-surface:#FDFAF4; --bg-elevated:#F2EDE2; --border:#D8CFC0;
+      --text-primary:#2A1E10; --text-secondary:#7A6040; --text-muted:#B09878;
+      --accent:#8A4E28; --accent-mid:#A06038; --accent-light:#BA7848;
+    }
+    [data-theme="sage"] {
+      --bg:#EEF2EC; --bg-surface:#F8FAF7; --bg-elevated:#E8EEE6; --border:#C8D2C6;
+      --text-primary:#1C2C1C; --text-secondary:#4A6248; --text-muted:#8A9E88;
+      --accent:#2E6A3E; --accent-mid:#3E8050; --accent-light:#509860;
+    }
+    [data-theme="nordic"] {
+      --bg:#F0F3F7; --bg-surface:#FAFBFD; --bg-elevated:#E8EDF3; --border:#C8CFD8;
+      --text-primary:#18223A; --text-secondary:#4A5E7A; --text-muted:#8898B0;
+      --accent:#2E50A0; --accent-mid:#3E68B8; --accent-light:#5080D0;
+    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f8f9fa; color: #333; }
-    .toolbar { position: sticky; top: 0; z-index: 100; background: #fff; border-bottom: 1px solid #e0e0e0; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-    .toolbar-title { font-size: 14px; color: #666; }
-    .toolbar-title strong { color: #333; }
-    .btn-download { display: inline-flex; align-items: center; gap: 8px; background: #2563eb; color: #fff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 500; transition: background 0.15s; }
-    .btn-download:hover { background: #1d4ed8; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: var(--bg); color: var(--text-primary); }
+    .toolbar { position: sticky; top: 0; z-index: 100; background: var(--bg-elevated); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .toolbar-title { font-size: 14px; color: var(--text-secondary); }
+    .toolbar-title strong { color: var(--text-primary); }
+    .btn-download { display: inline-flex; align-items: center; gap: 8px; background: var(--accent); color: #fff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 500; transition: background 0.15s; }
+    .btn-download:hover { background: var(--accent-mid); }
     .btn-download svg { width: 18px; height: 18px; fill: currentColor; }
     .container { max-width: 800px; margin: 0 auto; padding: 40px 24px; }
     .doc-header { margin-bottom: 32px; }
-    .doc-header h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; color: #111; }
-    .doc-header .meta { font-size: 14px; color: #888; }
-    .doc-body h2 { font-size: 20px; font-weight: 600; margin-top: 28px; margin-bottom: 12px; color: #1a1a1a; }
-    .doc-body h3 { font-size: 17px; font-weight: 600; margin-top: 22px; margin-bottom: 10px; color: #2a2a2a; }
-    .doc-body h4 { font-size: 15px; font-weight: 600; margin-top: 18px; margin-bottom: 8px; color: #333; }
-    .doc-body p { font-size: 15px; line-height: 1.7; margin-bottom: 14px; color: #444; }
+    .doc-header h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; color: var(--text-primary); }
+    .doc-header .meta { font-size: 14px; color: var(--text-secondary); }
+    .doc-body h2 { font-size: 20px; font-weight: 600; margin-top: 28px; margin-bottom: 12px; color: var(--text-primary); }
+    .doc-body h3 { font-size: 17px; font-weight: 600; margin-top: 22px; margin-bottom: 10px; color: var(--text-primary); }
+    .doc-body h4 { font-size: 15px; font-weight: 600; margin-top: 18px; margin-bottom: 8px; color: var(--text-primary); }
+    .doc-body p { font-size: 15px; line-height: 1.7; margin-bottom: 14px; color: var(--text-primary); opacity: 0.85; }
     .doc-body table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
-    .doc-body th { background: #f0f2f5; font-weight: 600; text-align: left; padding: 10px 12px; border: 1px solid #ddd; }
-    .doc-body td { padding: 9px 12px; border: 1px solid #ddd; }
-    .doc-body tr:nth-child(even) { background: #fafbfc; }
-    .footer-bar { text-align: center; padding: 20px; color: #999; font-size: 12px; border-top: 1px solid #eee; margin-top: 32px; }
+    .doc-body th { background: var(--bg-elevated); font-weight: 600; text-align: left; padding: 10px 12px; border: 1px solid var(--border); color: var(--accent-light); }
+    .doc-body td { padding: 9px 12px; border: 1px solid var(--border); color: var(--text-primary); opacity: 0.85; }
+    .doc-body tr:nth-child(even) td { background: var(--bg-surface); }
+    .footer-bar { text-align: center; padding: 20px; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border); margin-top: 32px; }
   </style>
 </head>
 <body>
