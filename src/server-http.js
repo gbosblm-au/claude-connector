@@ -2135,42 +2135,23 @@ app.get( '/preview/:filename', async ( req, res ) => {
   return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}a{display:inline-block;color:#fff;padding:12px 24px;background:#2563eb;text-decoration:none;border-radius:6px}</style></head><body><h2>${ esc(safeName) }</h2><p>This file type cannot be previewed.</p><a href="/download/${ encodeURIComponent(safeName) }?token=${ encodeURIComponent(token) }" target="_parent">Download File</a></body></html>` );
 } );
 
-// ── Binary file upload endpoint ──────────────────────────────────────────
-// Receives .docx binaries from the frontend upload handler and saves them
-// to /data/uploads/ for the docx editing pipeline. Non-blocking — the text
-// extraction in the UI continues regardless.
-// ────────────────────────────────────────────────────────────────────────
-
-import multer from 'multer';
-
-const uploadStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
+// ── Binary file upload endpoint (base64, no multer needed) ──────────────
+app.post('/api/upload-binary', (req, res) => {
+  const { filename, data } = req.body || {};
+  if (!filename || !data) {
+    return res.status(400).json({ error: 'filename and base64 data required.' });
+  }
+  try {
     const dir = '/data/uploads';
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o755 });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, basename(file.originalname));
-  },
-});
-
-const uploadMiddleware = multer({
-  storage: uploadStorage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
-}).single('file');
-
-app.post('/api/upload-binary', (req, res) => {
-  uploadMiddleware(req, res, (err) => {
-    if (err) {
-      log('error', `upload-binary error: ${err.message}`);
-      return res.status(500).json({ error: err.message });
-    }
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file provided.' });
-    }
-    log('info', `upload-binary: saved ${req.file.filename} (${req.file.size} bytes)`);
-    return res.json({ success: true, filename: req.file.filename, size: req.file.size });
-  });
+    const buf = Buffer.from(data, 'base64');
+    writeFileSync(pathJoin(dir, basename(filename)), buf);
+    log('info', `upload-binary: saved ${filename} (${buf.length} bytes)`);
+    return res.json({ success: true, filename, size: buf.length });
+  } catch (err) {
+    log('error', `upload-binary write error: ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // -----------------------------------------------------------------------
