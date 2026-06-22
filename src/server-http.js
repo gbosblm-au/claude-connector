@@ -1059,7 +1059,13 @@ async function dispatchToolCall(name, args) {
 // -----------------------------------------------------------------------
 // MCP Server factory
 // -----------------------------------------------------------------------
-function createMcpServer() {
+const SYSTEM_WRITE_TOOLS = new Set([
+  'skill_write', 'skill_write_addition', 'skill_merge_additions', 'skill_rollback',
+  'module_write', 'script_write', 'archive_write', 'reference_write',
+  'dispatch_rule_add',
+]);
+
+function createMcpServer(tenantContext) {
   const server = new Server(
     { name: "claude-connector", version: "12.8.2" },
     { capabilities: { tools: {} } }
@@ -1084,7 +1090,15 @@ function createMcpServer() {
           moduleWriteToolDefinition,
         ]
       : [];
-    return { tools: [...baseTools, ...modularTools] };
+    const allTools = [...baseTools, ...modularTools];
+
+    // v13.0.0: Tenant tool filtering — non-Brian tenants cannot modify system files.
+    // System-write tools are blocked. Memory/personality/profile writes pass through.
+   const tenantId = tenantContext?.tenantId || null;
+    if (tenantId && tenantId !== 'ava') {
+      return { tools: allTools.filter(t => !SYSTEM_WRITE_TOOLS.has(t.name)) };
+    }
+    return { tools: allTools };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1426,7 +1440,7 @@ app.all("/mcp", tenantAuthMiddleware, async (req, res) => {
     }
     if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
-      const server = createMcpServer();
+      const server = createMcpServer(req.tenantContext || null);
       transport.onclose = () => {
         if (transport.sessionId) { delete streamableSessions[transport.sessionId]; }
       };
@@ -1458,7 +1472,7 @@ app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   sseSessions[transport.sessionId] = transport;
   res.on("close", () => { delete sseSessions[transport.sessionId]; });
-  await createMcpServer().connect(transport);
+  await createMcpServer(null).connect(transport);
 });
 
 app.post("/messages", async (req, res) => {
@@ -1900,17 +1914,22 @@ app.get("/tools", (req, res) => {
       ]
     : [];
 
-  const effectiveTools = [...baseTools, ...modularTools];
+ const effectiveTools = [...baseTools, ...modularTools];
+
+  // Optional per-tenant filtering via X-Tenant-ID header
+  const tenantId = req.headers['x-tenant-id'] || '';
+  const filteredTools = (tenantId && tenantId !== 'ava')
+    ? effectiveTools.filter(t => !SYSTEM_WRITE_TOOLS.has(t.name))
+    : effectiveTools;
 
   // Normalise MCP inputSchema (camelCase) to Anthropic input_schema (snake_case)
-  // so the gateway can pass these directly to the Anthropic / OpenAI-compat APIs.
-  const tools = effectiveTools.map(t => ({
+  const tools = filteredTools.map(t => ({
     name:         t.name,
     description:  t.description || "",
     input_schema: t.inputSchema || t.input_schema || { type: "object", properties: {}, required: [] },
   }));
 
-  log("info", `[/tools] manifest requested: ${tools.length} tools`);
+  log("info", `[/tools] manifest requested: ${tools.length} tools (tenant: ${tenantId || 'default'})`);
   return res.json({ tools, count: tools.length });
 });
 
@@ -2115,6 +2134,45 @@ app.get( '/preview/:filename', async ( req, res ) => {
   const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}a{display:inline-block;color:#fff;padding:12px 24px;background:#2563eb;text-decoration:none;border-radius:6px}</style></head><body><h2>${ esc(safeName) }</h2><p>This file type cannot be previewed.</p><a href="/download/${ encodeURIComponent(safeName) }?token=${ encodeURIComponent(token) }" target="_parent">Download File</a></body></html>` );
 } );
+
+// ── Binary file upload endpoint ──────────────────────────────────────────
+// Receives .docx binaries from the frontend upload handler and saves them
+// to /data/uploads/ for the docx editing pipeline. Non-blocking — the text
+// extraction in the UI continues regardless.
+// ────────────────────────────────────────────────────────────────────────
+
+import multer from 'multer';
+
+const uploadStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = '/data/uploads';
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o755 });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, basename(file.originalname));
+  },
+});
+
+const uploadMiddleware = multer({
+  storage: uploadStorage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+}).single('file');
+
+app.post('/api/upload-binary', (req, res) => {
+  uploadMiddleware(req, res, (err) => {
+    if (err) {
+      log('error', `upload-binary error: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file provided.' });
+    }
+    log('info', `upload-binary: saved ${req.file.filename} (${req.file.size} bytes)`);
+    return res.json({ success: true, filename: req.file.filename, size: req.file.size });
+  });
+});
+
 // -----------------------------------------------------------------------
 // 404
 // -----------------------------------------------------------------------
