@@ -2153,6 +2153,32 @@ app.post('/api/upload-binary', (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+// GET /tools — tool manifest for Tenax gateway discovery (v2.4.4+)
+app.get('/tools', async (req, res) => {
+  const MODULAR_TOOL_NAMES = new Set([
+    "skill_compile", "skill_load_specialist", "skill_recompile",
+    "personality_write", "dispatch_rule_add", "module_write",
+  ]);
+  const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
+  const modularTools = isModularEnabled()
+    ? [
+        skillCompileToolDefinition,
+        skillLoadSpecialistToolDefinition,
+        skillRecompileToolDefinition,
+        personalityWriteToolDefinition,
+        dispatchRuleAddToolDefinition,
+        moduleWriteToolDefinition,
+      ]
+    : [];
+  const allTools = [...baseTools, ...modularTools];
+
+  // Apply tenant write-tool filtering (same as MCP handler)
+  const tenantId = req.headers['x-tenant-id'] || null;
+  if (tenantId && tenantId !== 'ava') {
+    return res.json({ tools: allTools.filter(t => !SYSTEM_WRITE_TOOLS.has(t.name)) });
+  }
+  return res.json({ tools: allTools });
+});
 
 // -----------------------------------------------------------------------
 // 404
