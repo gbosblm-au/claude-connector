@@ -71,7 +71,7 @@ import { createServer } from "http";
 import { execSync } from "child_process";
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { dirname, join as pathJoin, basename, extname, resolve as pathResolve } from "path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -1635,7 +1635,7 @@ app.get('/api/upload', (_req, res) => {
       .map(f => {
         const fp = pathJoin(USER_DATA_UPLOAD_DIR, f);
         try {
-          const stat = require('fs').statSync(fp);
+          const stat = statSync(fp);
           const metaPath = fp + '.meta.json';
           let meta = {};
           if (existsSync(metaPath)) {
