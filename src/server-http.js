@@ -1662,7 +1662,6 @@ app.get('/api/upload', (_req, res) => {
 });
 
 
-
 // -----------------------------------------------------------------------
 // POST /restore-skill
 // Receives a canonical SKILL.md push from the WordPress admin "Push to Railway"
