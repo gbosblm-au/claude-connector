@@ -1555,7 +1555,110 @@ app.post("/upload/connections", async (req, res) => {
     res.status(500).json({ error: `Write failed: ${err.message}` });
   }
 });
+// -----------------------------------------------------------------------
+// POST /api/upload
+// Receives a file (base64) from the Tenax chat UI and saves it to the
+// persistent volume at /mnt/user-data/uploads/ so the document renderer
+// and other tools can reference it by filepath.
+// Body: { filename, content_base64, mime_type?, ttl_hours? }
+// Returns: { success, filepath, filename, size, mime_type, expires_at }
+// -----------------------------------------------------------------------
+const USER_DATA_UPLOAD_DIR = process.env.USER_DATA_UPLOAD_DIR || '/mnt/user-data/uploads/';
+const MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '10485760', 10); // 10MB default
+const DEFAULT_TTL_HOURS = 24;
 
+function ensureUploadDir() {
+  if (!existsSync(USER_DATA_UPLOAD_DIR)) {
+    mkdirSync(USER_DATA_UPLOAD_DIR, { recursive: true, mode: 0o755 });
+  }
+}
+
+app.post('/api/upload', async (req, res) => {
+  try {
+    ensureUploadDir();
+    const { filename, content_base64, mime_type, ttl_hours } = req.body || {};
+
+    if (!filename || !content_base64) {
+      return res.status(400).json({ error: 'filename and content_base64 are required' });
+    }
+
+    const ext = extname(filename).toLowerCase();
+    const allowed = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.pdf', '.docx', '.txt', '.md', '.json', '.csv', '.html'];
+    if (!allowed.includes(ext)) {
+      return res.status(400).json({ error: `Extension '${ext}' not allowed. Allowed: ${allowed.join(', ')}` });
+    }
+
+    const buffer = Buffer.from(content_base64, 'base64');
+    if (buffer.length > MAX_UPLOAD_SIZE) {
+      return res.status(413).json({ error: `File too large (${buffer.length} bytes). Max: ${Math.round(MAX_UPLOAD_SIZE / 1048576)}MB` });
+    }
+
+    const ttl = ttl_hours || DEFAULT_TTL_HOURS;
+    const timestamp = Date.now();
+    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const storedName = `${timestamp}_${safeName}`;
+    const filepath = pathJoin(USER_DATA_UPLOAD_DIR, storedName);
+
+    writeFileSync(filepath, buffer);
+
+    const meta = {
+      original_name: filename,
+      mime_type: mime_type || 'application/octet-stream',
+      size: buffer.length,
+      created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + ttl * 60 * 60 * 1000).toISOString(),
+      ttl_hours: ttl,
+    };
+    writeFileSync(filepath + '.meta.json', JSON.stringify(meta, null, 2));
+
+    log('info', `upload: ${filename} -> ${filepath} (${buffer.length} bytes)`);
+    res.json({
+      success: true,
+      filepath,
+      filename: storedName,
+      size: buffer.length,
+      mime_type: mime_type || 'application/octet-stream',
+      expires_at: meta.expires_at,
+    });
+  } catch (err) {
+    log('error', `upload error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/upload — list uploaded files
+app.get('/api/upload', (_req, res) => {
+  try {
+    ensureUploadDir();
+    const files = readdirSync(USER_DATA_UPLOAD_DIR)
+      .filter(f => !f.endsWith('.meta.json'))
+      .map(f => {
+        const fp = pathJoin(USER_DATA_UPLOAD_DIR, f);
+        try {
+          const stat = require('fs').statSync(fp);
+          const metaPath = fp + '.meta.json';
+          let meta = {};
+          if (existsSync(metaPath)) {
+            try { meta = JSON.parse(readFileSync(metaPath, 'utf8')); } catch (_) {}
+          }
+          return {
+            filename: f,
+            path: fp,
+            size: stat.size,
+            created_at: meta.created_at || stat.birthtime,
+            expires_at: meta.expires_at || null,
+            mime_type: meta.mime_type || null,
+            original_name: meta.original_name || f,
+          };
+        } catch (_) { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    res.json({ files, count: files.length, upload_dir: USER_DATA_UPLOAD_DIR });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // -----------------------------------------------------------------------
 // POST /restore-skill
 // Receives a canonical SKILL.md push from the WordPress admin "Push to Railway"
