@@ -1563,7 +1563,7 @@ app.post("/upload/connections", async (req, res) => {
 // Body: { filename, content_base64, mime_type?, ttl_hours? }
 // Returns: { success, filepath, filename, size, mime_type, expires_at }
 // -----------------------------------------------------------------------
-const USER_DATA_UPLOAD_DIR = process.env.USER_DATA_UPLOAD_DIR || '/mnt/user-data/uploads/';
+const USER_DATA_UPLOAD_DIR = process.env.USER_DATA_UPLOAD_DIR || '/data/uploads/';
 const MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '10485760', 10); // 10MB default
 const DEFAULT_TTL_HOURS = 24;
 
