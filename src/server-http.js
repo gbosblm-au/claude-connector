@@ -1556,7 +1556,7 @@ app.post("/upload/connections", async (req, res) => {
   }
 });
 // -----------------------------------------------------------------------
-// POST /api/upload
+// POST /data/upload
 // Receives a file (base64) from the Tenax chat UI and saves it to the
 // persistent volume at /mnt/user-data/uploads/ so the document renderer
 // and other tools can reference it by filepath.
@@ -1573,7 +1573,7 @@ function ensureUploadDir() {
   }
 }
 
-app.post('/api/upload', async (req, res) => {
+app.post('/data/upload', async (req, res) => {
   try {
     ensureUploadDir();
     const { filename, content_base64, mime_type, ttl_hours } = req.body || {};
@@ -1627,8 +1627,8 @@ app.post('/api/upload', async (req, res) => {
 
 });
 
-// GET /api/upload — list uploaded files
-app.get('/api/upload', (_req, res) => {
+// GET /data/upload — list uploaded files
+app.get('/data/upload', (_req, res) => {
   try {
     ensureUploadDir();
     const files = readdirSync(USER_DATA_UPLOAD_DIR)
@@ -2242,7 +2242,7 @@ app.get( '/preview/:filename', async ( req, res ) => {
 } );
 
 // ── Binary file upload endpoint (base64, no multer needed) ──────────────
-app.post('/api/upload-binary', (req, res) => {
+app.post('/data/upload-binary', (req, res) => {
   const { filename, data } = req.body || {};
   if (!filename || !data) {
     return res.status(400).json({ error: 'filename and base64 data required.' });
