@@ -38,6 +38,14 @@
 //              + tools: email_get_tracking, email_tracking_summary
 //   - SCOPE-05 Scheduling: cron-driven in-process scheduler started at boot
 //              + tools: email_schedule, email_schedule_cancel, email_schedule_list
+// -----------------------------------------------------------------------
+// GET /api/config.js — connector self-discovery
+// Returns a tiny JS snippet that sets window.__TI_CONFIG with the
+// connector's public URL, derived from Railway's RAILWAY_PUBLIC_DOMAIN.
+// The Tenax chat HTML loads this as <script src="/api/config.js"></script>
+// so the frontend always knows where to POST files, regardless of deployment.
+// -----------------------------------------------------------------------
+
 
 import "dotenv/config";
 // v12.0.0: Tenant authentication middleware
@@ -1196,7 +1204,14 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
-
+app.get('/api/config.js', (_req, res) => {
+  const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN || 'claude-connector-production.up.railway.app';
+  const protocol = process.env.RAILWAY_PUBLIC_DOMAIN ? 'https' : 'http';
+  const connectorUrl = `${protocol}://${publicDomain}`;
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Cache-Control', 'no-cache, max-age=60');
+  res.send(`window.__TI_CONFIG = window.__TI_CONFIG || { connectorUrl: "${connectorUrl}" };\n`);
+});
 // -----------------------------------------------------------------------
 // Health
 // -----------------------------------------------------------------------
