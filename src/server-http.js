@@ -2298,7 +2298,6 @@ app.get('/tools', async (req, res) => {
 // so toggling takes effect at the start of the next Claude session without
 // a Railway redeploy. The file overrides SKILL_MODULAR_ENABLED env var when present.
 // ---------------------------------------------------------------------------
-
 app.get("/modular-mode", (_req, res) => {
   if (!SKILL_ENABLED) {
     return res.status(503).json({ error: "Skill volume not configured (SKILL_FILE_PATH not set)." });
