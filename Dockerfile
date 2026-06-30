@@ -32,7 +32,7 @@ USER root
 # 1. Install system dependencies, base fonts, emoji support, and download Raleway
 RUN apk add --no-cache python3 py3-pip py3-cairo pango gdk-pixbuf libffi fontconfig ttf-dejavu font-noto-emoji wget && \
     mkdir -p /usr/share/fonts/custom && \
-    wget -q -O /usr/share/fonts/custom/Raleway-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/raleway/static/Raleway-Regular.ttf" && \
+    wget -q -U "Mozilla/5.0" -O /usr/share/fonts/custom/Raleway-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/raleway/Raleway-Regular.ttf" && \
     fc-cache -f
 
 # 2. Install Python packages (keep your existing ones + weasyprint)
