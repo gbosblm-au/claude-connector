@@ -30,7 +30,7 @@ COPY package.json ./
 # Install Python and document generation dependencies
 USER root
 # 1. Install system dependencies, base fonts, emoji support, and download Raleway
-RUN apk add --no-cache python3 py3-pip py3-cairo pango gdk-pixbuf libffi fontconfig ttf-dejavu noto-fonts-emoji wget && \
+RUN apk add --no-cache python3 py3-pip py3-cairo pango gdk-pixbuf libffi fontconfig ttf-dejavu font-noto-emoji wget && \
     mkdir -p /usr/share/fonts/custom && \
     wget -q -O /usr/share/fonts/custom/Raleway-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/raleway/static/Raleway-Regular.ttf" && \
     fc-cache -f
