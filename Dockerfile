@@ -29,8 +29,14 @@ COPY package.json ./
 
 # Install Python and document generation dependencies
 USER root
-RUN apk add --no-cache python3 py3-pip py3-cairo pango gdk-pixbuf libffi && \
-    pip3 install --break-system-packages python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint && \
+# 1. Install system dependencies, base fonts, emoji support, and download Raleway
+RUN apk add --no-cache python3 py3-pip py3-cairo pango gdk-pixbuf libffi fontconfig ttf-dejavu noto-fonts-emoji wget && \
+    mkdir -p /usr/share/fonts/custom && \
+    wget -q -O /usr/share/fonts/custom/Raleway-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/raleway/static/Raleway-Regular.ttf" && \
+    fc-cache -f
+
+# 2. Install Python packages (keep your existing ones + weasyprint)
+RUN pip3 install --break-system-packages python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint && \
     rm -rf /root/.cache/pip
 
 # Create data directory and schedule store mount point with correct ownership
