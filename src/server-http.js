@@ -77,6 +77,7 @@ import {
 } from './tools/clientCheckin.js';
 import { createServer } from "http";
 import { execSync } from "child_process";
+import { registerExportRoute } from './routes/export.js';
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
@@ -2702,6 +2703,7 @@ httpServer.listen(PORT, HOST, () => {
     logTenantModeStatus();
     if ( isTenantMode() ) initDevice();
     registerProvisionRoute(app);
+    registerExportRoute(app);
   log("info", `Modular skill: env_var=${process.env.SKILL_MODULAR_ENABLED || "not set"} | effective=${isModularEnabled() ? "ENABLED" : "disabled"} | runtime toggle: GET /modular-mode, POST /set-modular-mode`);
   log("info", `Person-aware dispatch: AVA_PERSON_PRIOR_ENABLED=${process.env.AVA_PERSON_PRIOR_ENABLED || "not set (defaults true)"}`);
   log("info", `Module restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-modules, /restore-personality, /restore-dispatch-rules)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
