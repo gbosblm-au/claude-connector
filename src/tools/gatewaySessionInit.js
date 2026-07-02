@@ -17,7 +17,7 @@ const CLIENT_API_KEY = process.env.TS_CLIENT_API_KEY      || '';
 export const tsGatewaySessionInitToolDefinition = {
   name: 'ts_gateway_session_init',
   description:
-    'Authenticate this session with TrueSource infrastructure. Call as the very first step ' +
+    'Authenticate this session with Tenax infrastructure. Call as the very first step ' +
     'at session start, before any other tool. Validates the tenant API key, confirms the ' +
     'account is active, and returns the required next steps for this session including ' +
     'memory_get_session_context, profile_read, and skill_compile. ' +
@@ -127,20 +127,25 @@ export async function handleTsGatewaySessionInit(args) {
 
   log('info', `[ts_gateway_session_init] authenticated tenant=${data.tenant_id} tier=${data.tier}`);
 
+  const userId = data.user_id || null;
+  const assistantName = data.assistant_name || 'Aria';
+
   return {
     content: [{
       type: 'text',
       text: JSON.stringify({
         session_authenticated: true,
-        tenant_id:    data.tenant_id    || tenantId,
-        display_name: data.display_name || '',
-        tier:         data.tier         || 'operational',
-        session_id:   data.session_id   || new Date().toISOString().replace(/[-T:]/g, '').slice(0, 15),
+        tenant_id:      data.tenant_id      || tenantId,
+        display_name:   data.display_name   || '',
+        tier:           data.tier           || 'operational',
+        user_id:        userId,
+        assistant_name: assistantName,
+        session_id:     data.session_id     || new Date().toISOString().replace(/[-T:]/g, '').slice(0, 15),
         next_steps: [
           'Step 2: Call memory_get_session_context with a context_hint drawn from the opening message topic.',
           'Step 3: Call profile_read to identify the person you are speaking with.',
           'Step 4: Call skill_compile with query=opening_message, context_hint from Step 2, person_name from Step 3. This is required and non-deferrable. Do not respond to the user before skill_compile has completed.',
-          'Step 5: Check memory for the established assistant name (category: "identity", key: "assistant_name"). If none, follow the first-session naming protocol.',
+          'Step 5: The assistant name for this user is provided above as "assistant_name". If the user requests a name change, use memory_write with category="identity" and key="assistant_name_{user_id}" (e.g. "assistant_name_42") to store the new name. This ensures each user has their own assistant name.',
           'Step 6: Operate under the compiled skill guidelines for the full session.',
         ],
         skill_compile_required: true,
