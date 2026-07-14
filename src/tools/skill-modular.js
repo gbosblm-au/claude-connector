@@ -63,6 +63,7 @@ function getModularPaths() {
     coreFile:          avaDir + 'CORE.md',
     personalityFile:   avaDir + 'PERSONALITY.md',
     manifestFile:      avaDir + 'MANIFEST.json',
+    manifestAppendFile: avaDir + 'MANIFEST_APPEND.json',
     dispatchRulesFile: avaDir + 'DISPATCH_RULES.json',
     modulesDir:        sharedModulesDir,
     archiveDir:        avaDir + 'archive/',
@@ -484,7 +485,36 @@ function applyLearnedLinkages(dispatchRules, query, candidates) {
 }
 
 function compileSkill(query, contextHint, paths, personPrior = null, moduleAccessLevel = 'full') {
-  const manifest = readJsonFile(paths.manifestFile, { modules: [], mandatory_for_triggers: {}, tag_web: {}, budget: {} });
+  // Read main manifest
+let manifest = readJsonFile(paths.manifestFile, { modules: [], mandatory_for_triggers: {}, tag_web: {}, budget: {} });
+
+// --- MANIFEST_APPEND merge ---
+const appendManifest = readJsonFile(paths.manifestAppendFile, null);
+if (appendManifest && appendManifest.modules && Array.isArray(appendManifest.modules)) {
+  const existingIds = new Set((manifest.modules || []).map(m => m.id));
+  const newModules = appendManifest.modules.filter(m => !existingIds.has(m.id));
+  if (newModules.length > 0) {
+    manifest.modules = [...(manifest.modules || []), ...newModules];
+    log('info', `compileSkill: MANIFEST_APPEND merged ${newModules.length} new modules: ${newModules.map(m => m.id).join(', ')}`);
+  }
+  // Merge mandatory_for_triggers (append only, never override)
+  if (appendManifest.mandatory_for_triggers) {
+    for (const [trigger, moduleIds] of Object.entries(appendManifest.mandatory_for_triggers)) {
+      const existing = manifest.mandatory_for_triggers[trigger] || [];
+      manifest.mandatory_for_triggers[trigger] = [...new Set([...existing, ...moduleIds])];
+    }
+  }
+  // Merge tag_web (add new tags, don't override existing)
+  if (appendManifest.tag_web) {
+    for (const [tag, keywords] of Object.entries(appendManifest.tag_web)) {
+      if (!manifest.tag_web[tag]) {
+        manifest.tag_web[tag] = keywords;
+      }
+    }
+  }
+}
+// --- End MANIFEST_APPEND merge ---
+
   const dispatchRules = readJsonFile(paths.dispatchRulesFile, { layer0_mandatory: { rules: [] }, learned_linkages: { rules: [] } });
 
   // Read CORE
