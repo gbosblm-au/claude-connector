@@ -291,12 +291,13 @@ export const skillWriteToolDefinition = {
     'Do NOT use for incremental PF Session A additions or book log entries — ' +
     'use skill_write_addition (avoids transmitting 600+ lines per entry). ' +
     'Canonical writes archive the prior version, increment version counter, update manifests, push WP backup.',
-  inputSchema: {
+    inputSchema: {
     type: 'object',
     properties: {
       content:        { type: 'string',  description: 'Full new file content.' },
       change_summary: { type: 'string',  description: 'Max 200 characters. What changed and why.' },
       pending:        { type: 'boolean', description: 'If true, writes to SKILL_PENDING.md instead. Default false.' },
+      target:         { type: 'string',  description: 'Write target. "skill" (default) or "manifest_append" to write MANIFEST_APPEND.json directly.' },
     },
     required: ['content', 'change_summary'],
   },
@@ -441,12 +442,50 @@ export async function handleSkillRead(args) {
 
 export async function handleSkillWrite(args) {
   const paths         = getSkillPaths();
-  const { versionDir, filePath, pendingPath } = paths;
+  const { filePath, versionDir, pendingPath } = paths;
   const content       = typeof args.content === 'string' ? args.content : '';
   const changeSummary = (args.change_summary || '').slice(0, 200);
   const pending       = args.pending === true;
+  const target        = (args.target || 'skill').trim();
 
   ensureDirs(filePath, versionDir);
+
+  // --- MANIFEST_APPEND write target ---
+  if (target === 'manifest_append') {
+    const manifestAppendPath = (process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md')
+      .replace(/SKILL\.md$/, 'ava/MANIFEST_APPEND.json');
+
+    writeFileSync(manifestAppendPath, content, 'utf8');
+
+    // Non-blocking WordPress backup
+    const wpSkillUrl = process.env.WP_SKILL_URL || '';
+    const wpSkillKey = process.env.WP_SKILL_KEY || '';
+    if (wpSkillUrl && wpSkillKey) {
+      fetch(`${wpSkillUrl.replace(/\/$/, '')}/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey },
+        body: JSON.stringify({
+          content,
+          version_id: 'manifest_append',
+          line_count: countLines(content),
+          change_summary: 'MANIFEST_APPEND update: ' + changeSummary,
+          timestamp: new Date().toISOString(),
+        }),
+      }).catch(() => {});
+    }
+
+    log('info', `skill_write: MANIFEST_APPEND updated (${countLines(content)} lines) - ${changeSummary}`);
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        success: true,
+        target: 'manifest_append',
+        line_count: countLines(content),
+        change_summary: changeSummary,
+        note: 'MANIFEST_APPEND.json written directly to Railway volume.',
+      }, null, 2) }],
+    };
+  }
+  // --- End MANIFEST_APPEND write ---
 
   if (pending) {
     writeFileSync(pendingPath, content, 'utf8');

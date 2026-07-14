@@ -505,6 +505,7 @@ if (appendManifest && appendManifest.modules && Array.isArray(appendManifest.mod
     }
   }
   // Merge tag_web (add new tags, don't override existing)
+  
   if (appendManifest.tag_web) {
     for (const [tag, keywords] of Object.entries(appendManifest.tag_web)) {
       if (!manifest.tag_web[tag]) {
