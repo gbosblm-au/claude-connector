@@ -36,7 +36,8 @@ RUN apk add --no-cache python3 py3-pip py3-cairo pango gdk-pixbuf libffi fontcon
     fc-cache -f
 
 # 2. Install Python packages (keep your existing ones + weasyprint)
-RUN pip3 install --break-system-packages --retries 5 --timeout 120 python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint && \
+RUN pip3 install --break-system-packages --retries 5 --timeout 120 \
+    python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint PyMuPDF && \
     rm -rf /root/.cache/pip
 
 # Create data directory and schedule store mount point with correct ownership

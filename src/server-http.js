@@ -339,6 +339,16 @@ import { startScheduler } from "./utils/scheduler.js";
 
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
+// Neural Core (v12.10.0): keeps ava_brain_data.json current and records what
+// each compile loaded. Observability only - it can never fail a tool call.
+import {
+  onToolCompleted as brainScanOnToolCompleted,
+  runBrainScan,
+  bootScanIfMissing,
+  writeToolCatalog,
+  getBrainScanPaths,
+  setBrainScanLogger,
+} from "./tools/brain-scan-trigger.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
 import { getLinkedInCredentials } from "./utils/credentialStore.js";
 import { config } from "./config.js";
@@ -832,7 +842,50 @@ const TOOLS = [
 // Returns the raw MCP-format result { content, isError }.
 // -----------------------------------------------------------------------
 
+/**
+ * Every tool this connector can expose, deduplicated by name. (v12.11.0)
+ *
+ * This is the tool *surface*, not a live capability list: it deliberately does
+ * not apply the modular-mode, tenant or SYSTEM_WRITE filters that ListTools and
+ * GET /tools apply, because its consumer is the Neural Core catalogue, which
+ * describes what exists rather than what this session may call. Written to the
+ * volume at boot so the scanner never has to ask the network what tools exist.
+ *
+ * @returns {Array<{name: string, description: string}>}
+ */
+function buildEffectiveToolList() {
+  const modularDefinitions = [
+    skillCompileToolDefinition,
+    skillLoadSpecialistToolDefinition,
+    skillRecompileToolDefinition,
+    personalityWriteToolDefinition,
+    dispatchRuleAddToolDefinition,
+    moduleWriteToolDefinition,
+  ];
+
+  const byName = new Map();
+  for (const tool of [...TOOLS, ...modularDefinitions]) {
+    if (tool && typeof tool.name === "string" && tool.name && !byName.has(tool.name)) {
+      byName.set(tool.name, tool);
+    }
+  }
+  return [...byName.values()];
+}
+
 async function dispatchToolCall(name, args) {
+  const result = await dispatchToolCallCore(name, args);
+  // Fire-and-forget: the hook has its own try/catch, and this one is the
+  // belt to its braces. A Neural Core problem must never surface as a tool
+  // failure to the caller.
+  try {
+    brainScanOnToolCompleted(name, args, result);
+  } catch (hookErr) {
+    log("warn", `brain_scan hook error after ${name}: ${hookErr.message}`);
+  }
+  return result;
+}
+
+async function dispatchToolCallCore(name, args) {
       switch (name) {
         // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
         case "ts_gateway_session_init": return await handleTsGatewaySessionInit(args);
@@ -2355,6 +2408,98 @@ app.post("/set-modular-mode", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /brain-data  (v12.10.0)
+// Serve the architecture scan written by brain_scan.py.
+//
+// The Neural Core visualiser in the Tenax gateway reads this through a
+// server-side proxy, so the token never reaches a browser.
+//
+// Auth:     X-Railway-Restore-Token (header or ?token=)
+// Query:    ?rescan=1  run brain_scan.py first and wait for it
+// Response: the raw ava_brain_data.json payload
+//
+// The gateway also has a fallback path via GET /download/ava_brain_data.json,
+// which brain_scan.py mirrors into /data/downloads. This endpoint is the
+// preferred one: it reads the canonical file, sets a real content type, and
+// can trigger a scan when the volume has never been scanned.
+// ---------------------------------------------------------------------------
+
+app.get("/brain-data", async (req, res) => {
+  const token = (req.query.token || req.headers["x-railway-restore-token"] || "").toString().trim();
+  if (!RAILWAY_RESTORE_TOKEN) {
+    return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Cannot authenticate brain-data requests." });
+  }
+  if (token !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
+  }
+
+  const paths = getBrainScanPaths();
+  const wantsRescan = ["1", "true", "yes"].includes(String(req.query.rescan || "").toLowerCase());
+
+  try {
+    if (wantsRescan || !existsSync(paths.dataPath)) {
+      if (!paths.scannerPresent) {
+        return res.status(404).json({
+          error: "brain_scan.py is not deployed to " + paths.scriptsDir + ".",
+          hint: "Upload brain_scan.py and brain_tools_catalog.json to the scripts directory, then retry.",
+        });
+      }
+      log("info", `[/brain-data] running scanner (${wantsRescan ? "rescan requested" : "no scan on disk"})`);
+      const ok = await runBrainScan({ force: wantsRescan });
+      if (!ok && !existsSync(paths.dataPath)) {
+        return res.status(503).json({
+          error: "brain_scan.py did not produce " + paths.dataPath + ".",
+          hint: "Run script_execute on brain_scan.py to see its stderr.",
+        });
+      }
+    }
+
+    if (!existsSync(paths.dataPath)) {
+      return res.status(404).json({ error: "No architecture scan on this volume yet.", path: paths.dataPath });
+    }
+
+    const body = readFileSync(paths.dataPath, "utf8");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    return res.status(200).send(body);
+  } catch (err) {
+    log("error", `[/brain-data] ${err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /brain-data/status  (v12.10.0)
+// Diagnostics: is the scanner deployed, has it ever run, is one running now.
+// ---------------------------------------------------------------------------
+
+app.get("/brain-data/status", (req, res) => {
+  const token = (req.query.token || req.headers["x-railway-restore-token"] || "").toString().trim();
+  if (!RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN) {
+    return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
+  }
+  const paths = getBrainScanPaths();
+  let scanTimestamp = null;
+  let nodeCount = 0;
+  try {
+    if (existsSync(paths.dataPath)) {
+      const parsed = JSON.parse(readFileSync(paths.dataPath, "utf8"));
+      scanTimestamp = parsed.timestamp || null;
+      nodeCount = Array.isArray(parsed.nodes) ? parsed.nodes.length : 0;
+    }
+  } catch (err) {
+    log("warn", `[/brain-data/status] cannot read scan: ${err.message}`);
+  }
+  return res.json({
+    ...paths,
+    dataPresent: existsSync(paths.dataPath),
+    lastCompilePresent: existsSync(paths.lastCompilePath),
+    scanTimestamp,
+    nodeCount,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /skill-export  (v12.2.2)
 // Export all non-personal skill files from this connector's Railway volume.
 // Paths returned are relative to the ava content directory — NO leading 'ava/'
@@ -2716,6 +2861,42 @@ httpServer.listen(PORT, HOST, () => {
     startScheduler();
   } catch (err) {
     log("error", `Scheduler boot failed: ${err.message}`);
+  }
+
+  // ── Neural Core scanner (v12.11.0) ──────────────────────────────────────
+  // Two jobs at boot: publish this connector's tool registry to the volume so
+  // the scanner never has to ask the network what tools exist, and run a scan
+  // only if there is none to serve.
+  //
+  // There is no periodic rescan. Every path that changes the volume goes
+  // through a tool, and every one of those tools schedules its own rescan, so a
+  // timer could only ever confirm what the hooks already knew.
+  try {
+    setBrainScanLogger(log);
+    const brainPaths = getBrainScanPaths();
+    log("info", `Neural Core scanner: ${
+      !brainPaths.enabled ? "disabled (BRAIN_SCAN_ENABLED=false)"
+        : brainPaths.scannerPresent ? `ENABLED (${brainPaths.scannerPath}) — GET /brain-data`
+        : `not deployed (expected at ${brainPaths.scannerPath})`
+    }`);
+
+    if (brainPaths.enabled) {
+      // The catalogue is written even when the scanner is not deployed yet, so
+      // it is already in place the moment someone uploads brain_scan.py.
+      writeToolCatalog(buildEffectiveToolList());
+
+      if (brainPaths.scannerPresent) {
+        // Deferred so a scan cannot compete with startup for the CPU.
+        const bootTimer = setTimeout(() => {
+          bootScanIfMissing().catch((err) => {
+            log("warn", `brain_scan: boot scan failed: ${err.message}`);
+          });
+        }, 15000);
+        if (typeof bootTimer.unref === "function") bootTimer.unref();
+      }
+    }
+  } catch (err) {
+    log("error", `Neural Core scanner boot failed: ${err.message}`);
   }
 });
 
