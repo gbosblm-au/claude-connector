@@ -80,7 +80,7 @@ import { execSync } from "child_process";
 import { registerExportRoute } from './routes/export.js';
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "fs";
 import { dirname, join as pathJoin, basename, extname, resolve as pathResolve } from "path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -1636,11 +1636,327 @@ const USER_DATA_UPLOAD_DIR = process.env.USER_DATA_UPLOAD_DIR || '/data/uploads/
 const MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '10485760', 10); // 10MB default
 const DEFAULT_TTL_HOURS = 24;
 
+// ---------------------------------------------------------------------------
+// Upload extension policy  (v12.12.0)
+//
+// The previous allowlist was:
+//   ['.png','.jpg','.jpeg','.gif','.svg','.webp','.bmp','.pdf','.docx',
+//    '.txt','.md','.json','.csv','.html']
+//
+// It omitted .pptx, .xlsx and .zip. That is why PPTX uploads silently failed:
+// 05-attachments.js has always POSTed the .pptx binary here, and this endpoint
+// has always answered 400 'Extension not allowed'. The client discards the
+// error (`return data.success ? data.filepath : ''`), so nothing surfaced.
+//
+// The policy is now allowlist-first with an explicit denylist on top, so that
+// broadening the allowlist can never accidentally admit an executable.
+// ---------------------------------------------------------------------------
+
+/** Documents and office formats the render/edit script suite can operate on. */
+const UPLOAD_EXT_DOCUMENTS = [
+  '.pdf',
+  '.docx', '.doc', '.dotx',
+  '.xlsx', '.xls', '.xlsm', '.xltx',
+  '.pptx', '.ppt', '.potx',
+  '.odt', '.ods', '.odp',
+  '.rtf', '.epub',
+];
+
+/** Raster and vector images. */
+const UPLOAD_EXT_IMAGES = [
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg',
+  '.tif', '.tiff', '.avif', '.heic', '.ico',
+];
+
+/** Plain text, markup and structured data. */
+const UPLOAD_EXT_TEXT = [
+  '.txt', '.md', '.markdown', '.json', '.jsonl', '.csv', '.tsv',
+  '.xml', '.yaml', '.yml', '.html', '.htm', '.log', '.ini', '.toml', '.env',
+];
+
+/** Source files. Inert here: script_execute only runs from the scripts dir. */
+const UPLOAD_EXT_CODE = [
+  '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.php', '.rb', '.go',
+  '.rs', '.java', '.kt', '.swift', '.c', '.h', '.cpp', '.hpp', '.cs',
+  '.sh', '.bash', '.zsh', '.sql', '.css', '.scss', '.less', '.vue', '.svelte',
+];
+
+/** Compressed archives. Stored as opaque blobs; never auto-extracted here. */
+const UPLOAD_EXT_ARCHIVES = [
+  '.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar',
+  '.apk', '.ipa',
+];
+
+const UPLOAD_ALLOWED_EXTS = new Set([
+  ...UPLOAD_EXT_DOCUMENTS,
+  ...UPLOAD_EXT_IMAGES,
+  ...UPLOAD_EXT_TEXT,
+  ...UPLOAD_EXT_CODE,
+  ...UPLOAD_EXT_ARCHIVES,
+]);
+
+/**
+ * Denied unconditionally, even if some future edit adds them above.
+ *
+ * Nothing in this container executes files from the upload directory, so these
+ * are not an active threat today. They are refused anyway: the upload volume is
+ * mounted into the same filesystem the script suite reads from, and an
+ * allowlist that quietly accumulates entries is exactly how a staging directory
+ * turns into a delivery mechanism. Cheap to refuse now, expensive to discover later.
+ */
+const UPLOAD_DENIED_EXTS = new Set([
+  '.exe', '.dll', '.so', '.dylib', '.bin', '.msi', '.app', '.deb', '.rpm',
+  '.bat', '.cmd', '.com', '.scr', '.ps1', '.vbs', '.jar', '.war',
+]);
+
+/**
+ * Decides whether an uploaded filename may be stored.
+ *
+ * @param  {string} ext  Lower-cased extension including the dot.
+ * @return {{ ok: boolean, reason?: string }}
+ */
+function uploadExtensionAllowed(ext) {
+  if (!ext) {
+    return { ok: false, reason: 'Files must have an extension.' };
+  }
+  if (UPLOAD_DENIED_EXTS.has(ext)) {
+    return { ok: false, reason: `Extension '${ext}' is not accepted (executable content).` };
+  }
+  if (!UPLOAD_ALLOWED_EXTS.has(ext)) {
+    return { ok: false, reason: `Extension '${ext}' is not supported.` };
+  }
+  return { ok: true };
+}
+
 function ensureUploadDir() {
   if (!existsSync(USER_DATA_UPLOAD_DIR)) {
     mkdirSync(USER_DATA_UPLOAD_DIR, { recursive: true, mode: 0o755 });
   }
 }
+
+// ---------------------------------------------------------------------------
+// Upload retention sweeper  (v12.12.0)
+//
+// WHY THIS IS NEW CODE RATHER THAN A FIX
+//
+// The upload handler has always written an `expires_at` timestamp into
+// <file>.meta.json. Nothing has ever read it. There was no sweeper, no cron, no
+// cleanup on boot: every file ever uploaded through the chat UI is still on the
+// volume. The retention policy was documented in the metadata and enforced
+// nowhere.
+//
+// This implements it. A file is removed once it is past its expires_at, along
+// with its sidecar metadata.
+//
+// Design notes:
+//
+//  - Orphans (a file with no .meta.json, e.g. written by /data/upload-binary
+//    or restored from a snapshot) fall back to mtime + the default TTL rather
+//    than living forever or being deleted immediately on the next sweep.
+//
+//  - Unparseable metadata is treated as an orphan, not as a reason to skip the
+//    file. A corrupt sidecar must not grant immortality.
+//
+//  - Every unlink is bounds-checked against the upload directory. The names
+//    come from readdir so they cannot traverse, but the check costs nothing and
+//    means a future caller passing a name in cannot turn this into an arbitrary
+//    delete.
+//
+//  - The interval is unref'd. A non-unref'd timer prevents the process from
+//    exiting on SIGTERM, which gets the container SIGKILLed on redeploy and
+//    severs in-flight connections. That exact bug was found in the gateway's
+//    rate limiter; it is not being reintroduced here.
+// ---------------------------------------------------------------------------
+
+const UPLOAD_MAX_TTL_HOURS   = parseInt(process.env.UPLOAD_MAX_TTL_HOURS   || '24', 10);
+const UPLOAD_SWEEP_INTERVAL_MS = parseInt(process.env.UPLOAD_SWEEP_INTERVAL_MS || String(15 * 60 * 1000), 10);
+const UPLOAD_SWEEP_ENABLED   = (process.env.UPLOAD_SWEEP_ENABLED || 'true').toLowerCase() !== 'false';
+
+/**
+ * Resolves the expiry instant for one stored upload.
+ *
+ * @param  {string} filePath  Absolute path to the stored file.
+ * @param  {string} metaPath  Absolute path to its .meta.json sidecar.
+ * @return {number|null} Epoch ms at which the file expires, or null if undecidable.
+ */
+function resolveUploadExpiry(filePath, metaPath, defaultTtlHours = DEFAULT_TTL_HOURS) {
+  if (existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+      const when = Date.parse(meta.expires_at);
+      if (!Number.isNaN(when)) return when;
+    } catch (_) {
+      // Corrupt sidecar: fall through to the mtime rule below.
+    }
+  }
+  // Orphan or corrupt metadata: age the file from its mtime using the default
+  // TTL, so it is still reclaimed eventually.
+  try {
+    return statSync(filePath).mtimeMs + defaultTtlHours * 3600_000;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Deletes a path only if it genuinely sits inside the upload directory.
+ *
+ * @param  {string} target
+ * @return {boolean} true when the file was removed.
+ */
+function safeUnlinkUpload(target, rootDir) {
+  const root = pathResolve(rootDir);
+  const full = pathResolve(target);
+  if (full !== root && !full.startsWith(root + '/')) {
+    log('error', `sweep: refusing to delete outside upload dir: ${full}`);
+    return false;
+  }
+  try {
+    unlinkSync(full);
+    return true;
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      log('warn', `sweep: could not delete ${full}: ${err.message}`);
+    }
+    return false;
+  }
+}
+
+/**
+ * Removes every file in `dir` whose retention window has elapsed.
+ *
+ * Generic over the directory so the same reaper serves two very different
+ * retention policies without a second copy of the logic:
+ *
+ *   /data/uploads    24 hours   - staging for files the user just attached
+ *   /data/downloads  14 days    - generated artefacts the user may come back to
+ *
+ * The two differ only in TTL and in what must never be touched. Downloads holds
+ * ava_brain_data.json, which is not a generated artefact at all: it is the
+ * Neural Core's architecture scan, read by the visualisation on every load.
+ * Ageing it out would silently break that view a fortnight after deploy, which
+ * is exactly the kind of failure nobody connects back to a cleanup job. It is
+ * protected by name.
+ *
+ * Safe to call at any time; never throws.
+ *
+ * @param  {object}   opts
+ * @param  {string}   opts.dir             Directory to sweep.
+ * @param  {number}   opts.ttlHours        Fallback TTL for files with no usable sidecar.
+ * @param  {Set<string>} [opts.protected]  Basenames that must never be deleted.
+ * @param  {string}   [opts.label]         Tag used in log lines.
+ * @return {{ scanned: number, removed: number, bytes: number, errors: number, skipped: number }}
+ */
+function sweepExpiredFiles({ dir, ttlHours, protected: protectedNames = new Set(), label = 'sweep' }) {
+  const stats = { scanned: 0, removed: 0, bytes: 0, errors: 0, skipped: 0 };
+  const now = Date.now();
+
+  let entries;
+  try {
+    if (!existsSync(dir)) return stats;
+    entries = readdirSync(dir);
+  } catch (err) {
+    log('error', `${label}: cannot read ${dir}: ${err.message}`);
+    stats.errors++;
+    return stats;
+  }
+
+  for (const name of entries) {
+    if (name.endsWith('.meta.json')) continue;   // handled with its parent
+
+    if (protectedNames.has(name)) {
+      stats.skipped++;
+      continue;
+    }
+
+    const filePath = pathJoin(dir, name);
+    const metaPath = filePath + '.meta.json';
+    stats.scanned++;
+
+    try {
+      // Directories are not artefacts; never recurse or unlink them.
+      let st;
+      try { st = statSync(filePath); } catch (_) { continue; }
+      if (st.isDirectory()) { stats.skipped++; continue; }
+
+      const expiresAt = resolveUploadExpiry(filePath, metaPath, ttlHours);
+      if (expiresAt === null || now < expiresAt) continue;
+
+      const size = st.size;
+      if (safeUnlinkUpload(filePath, dir)) {
+        stats.removed++;
+        stats.bytes += size;
+        if (existsSync(metaPath)) safeUnlinkUpload(metaPath, dir);
+      }
+    } catch (err) {
+      stats.errors++;
+      log('warn', `${label}: error handling ${name}: ${err.message}`);
+    }
+  }
+
+  if (stats.removed > 0) {
+    log('info',
+      `${label}: removed ${stats.removed} expired file(s), ` +
+      `${(stats.bytes / 1048576).toFixed(2)} MB reclaimed ` +
+      `(${stats.scanned} scanned, ${stats.skipped} protected)`);
+  }
+  return stats;
+}
+
+// --- Retention policies -----------------------------------------------------
+
+const DOWNLOADS_DIR            = process.env.DOWNLOADS_DIR || '/data/downloads/';
+const DOWNLOADS_TTL_HOURS      = parseInt(process.env.DOWNLOADS_TTL_HOURS || String(14 * 24), 10);
+
+/**
+ * Files under /data/downloads that must survive the reaper.
+ *
+ * ava_brain_data.json is the Neural Core architecture scan. 20-neural-core.js
+ * fetches it on every render of that view. It lives in downloads for delivery
+ * reasons, not because it is a disposable artefact.
+ */
+const DOWNLOADS_PROTECTED = new Set(
+  (process.env.DOWNLOADS_PROTECTED || 'ava_brain_data.json')
+    .split(',').map(s => s.trim()).filter(Boolean)
+);
+
+/** Sweeps /data/uploads on the 24h staging policy. */
+function sweepExpiredUploads() {
+  return sweepExpiredFiles({
+    dir:      USER_DATA_UPLOAD_DIR,
+    ttlHours: DEFAULT_TTL_HOURS,
+    label:    'sweep/uploads',
+  });
+}
+
+/** Sweeps /data/downloads on the 14d artefact policy. */
+function sweepExpiredDownloads() {
+  return sweepExpiredFiles({
+    dir:       DOWNLOADS_DIR,
+    ttlHours:  DOWNLOADS_TTL_HOURS,
+    protected: DOWNLOADS_PROTECTED,
+    label:     'sweep/downloads',
+  });
+}
+
+/** Runs both retention policies. */
+function sweepAllRetention() {
+  sweepExpiredUploads();
+  sweepExpiredDownloads();
+}
+
+if (UPLOAD_SWEEP_ENABLED) {
+  // Reclaim anything that expired while the process was down, then keep sweeping.
+  sweepAllRetention();
+  const _retentionTimer = setInterval(sweepAllRetention, UPLOAD_SWEEP_INTERVAL_MS);
+  if (typeof _retentionTimer.unref === 'function') _retentionTimer.unref();
+  log('info',
+    `retention sweeper active: uploads ${DEFAULT_TTL_HOURS}h, ` +
+    `downloads ${Math.round(DOWNLOADS_TTL_HOURS / 24)}d ` +
+    `(protected: ${[...DOWNLOADS_PROTECTED].join(', ') || 'none'}), ` +
+    `interval ${Math.round(UPLOAD_SWEEP_INTERVAL_MS / 60000)}min`);
+}
+
 
 app.post('/data/upload', async (req, res) => {
   try {
@@ -1652,17 +1968,39 @@ app.post('/data/upload', async (req, res) => {
     }
 
     const ext = extname(filename).toLowerCase();
-    const allowed = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.pdf', '.docx', '.txt', '.md', '.json', '.csv', '.html'];
-    if (!allowed.includes(ext)) {
-      return res.status(400).json({ error: `Extension '${ext}' not allowed. Allowed: ${allowed.join(', ')}` });
+    const extCheck = uploadExtensionAllowed(ext);
+    if (!extCheck.ok) {
+      // v12.12.0: answer with success:false so the client can distinguish a
+      // policy refusal from a transport failure. The old shape returned only
+      // { error } and the client's `data.success ? ... : ''` silently mapped
+      // every refusal to an empty filepath.
+      return res.status(400).json({
+        success: false,
+        error: extCheck.reason,
+        error_kind: 'extension_not_allowed',
+        extension: ext,
+      });
     }
 
     const buffer = Buffer.from(content_base64, 'base64');
     if (buffer.length > MAX_UPLOAD_SIZE) {
-      return res.status(413).json({ error: `File too large (${buffer.length} bytes). Max: ${Math.round(MAX_UPLOAD_SIZE / 1048576)}MB` });
+      return res.status(413).json({
+        success: false,
+        error: `File too large (${buffer.length} bytes). Max: ${Math.round(MAX_UPLOAD_SIZE / 1048576)}MB`,
+        error_kind: 'too_large',
+        size: buffer.length,
+        max_size: MAX_UPLOAD_SIZE,
+      });
     }
 
-    const ttl = ttl_hours || DEFAULT_TTL_HOURS;
+    // Clamp the TTL rather than trusting the caller. The chat UI historically
+    // sent ttl_hours: 1, which expired a file an hour into a session that might
+    // still be working on it. Callers may shorten within reason but not extend
+    // past the retention ceiling.
+    const requestedTtl = Number(ttl_hours);
+    const ttl = (Number.isFinite(requestedTtl) && requestedTtl > 0)
+      ? Math.min(requestedTtl, UPLOAD_MAX_TTL_HOURS)
+      : DEFAULT_TTL_HOURS;
     const timestamp = Date.now();
     const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
     const storedName = `${timestamp}_${safeName}`;
