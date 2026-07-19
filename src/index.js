@@ -124,6 +124,18 @@ import {
   handleNudgeAction,
 } from "./tools/nudgeTools.js";
 
+// Socratic Tutor Mode (Phase 4)
+import {
+  studentModelObserveToolDefinition,
+  handleStudentModelObserve,
+  studentModelRelateToolDefinition,
+  handleStudentModelRelate,
+  socraticSeamQuestionToolDefinition,
+  handleSocraticSeamQuestion,
+  studentModelReadToolDefinition,
+  handleStudentModelRead,
+} from "./tools/socraticTools.js";
+
 // SCOPE-01 / SCOPE-03 / SCOPE-04 / SCOPE-05 -- TrueSource outreach email
 import {
   emailSendToolDefinition,
@@ -293,6 +305,11 @@ const TOOLS = [
   nudgeAnalyzeToolDefinition,
   nudgeCheckToolDefinition,
   nudgeActionToolDefinition,
+  // Socratic Tutor Mode (Phase 4)
+  studentModelObserveToolDefinition,
+  studentModelRelateToolDefinition,
+  socraticSeamQuestionToolDefinition,
+  studentModelReadToolDefinition,
   // TrueSource outreach email
   emailSendToolDefinition,
   emailGetConfigToolDefinition,
@@ -437,6 +454,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "nudge_analyze":                return await handleNudgeAnalyze(args);
       case "nudge_check":                  return await handleNudgeCheck(args);
       case "nudge_action":                 return await handleNudgeAction(args);
+      case "student_model_observe":        return await handleStudentModelObserve(args);
+      case "student_model_relate":         return await handleStudentModelRelate(args);
+      case "socratic_seam_question":       return await handleSocraticSeamQuestion(args);
+      case "student_model_read":           return await handleStudentModelRead(args);
       // SCOPE-01 / SCOPE-03 email
       case "email_send":                   return await handleEmailSend(args);
       case "email_get_config":             return await handleEmailGetConfig(args);

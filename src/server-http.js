@@ -223,6 +223,18 @@ import {
   handleNudgeAction,
 } from "./tools/nudgeTools.js";
 
+// Socratic Tutor Mode (Phase 4)
+import {
+  studentModelObserveToolDefinition,
+  handleStudentModelObserve,
+  studentModelRelateToolDefinition,
+  handleStudentModelRelate,
+  socraticSeamQuestionToolDefinition,
+  handleSocraticSeamQuestion,
+  studentModelReadToolDefinition,
+  handleStudentModelRead,
+} from "./tools/socraticTools.js";
+
 // ---------- TrueSource outreach direct send (SCOPE-01/03/04/05) ----------
 import {
   emailSendToolDefinition,
@@ -714,6 +726,12 @@ const TOOLS = [
   nudgeCheckToolDefinition,
   nudgeActionToolDefinition,
 
+  // ---------- Socratic Tutor Mode (Phase 4) ----------
+  studentModelObserveToolDefinition,
+  studentModelRelateToolDefinition,
+  socraticSeamQuestionToolDefinition,
+  studentModelReadToolDefinition,
+
   // ---------- TrueSource outreach direct send ----------
   emailSendToolDefinition,
   emailGetConfigToolDefinition,
@@ -993,6 +1011,10 @@ async function dispatchToolCallCore(name, args) {
         case "nudge_analyze":                return await handleNudgeAnalyze(args);
         case "nudge_check":                  return await handleNudgeCheck(args);
         case "nudge_action":                 return await handleNudgeAction(args);
+        case "student_model_observe":        return await handleStudentModelObserve(args);
+        case "student_model_relate":         return await handleStudentModelRelate(args);
+        case "socratic_seam_question":       return await handleSocraticSeamQuestion(args);
+        case "student_model_read":           return await handleStudentModelRead(args);
 
         // ---------- TrueSource outreach direct send ----------
         case "email_send":                   return await handleEmailSend(args);

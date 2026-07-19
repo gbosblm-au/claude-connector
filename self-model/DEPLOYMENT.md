@@ -194,3 +194,58 @@ nudge_action { "nudge_id": "<id from nudge_check>", "action": "dismiss" }
 
 Two dismissals of the same category permanently opt it out. An empty
 `nudge_check` (no nudge) is the expected, common case - quiet is the default.
+
+---
+
+# Self-Model (Phase 4) - Socratic Tutor Mode
+
+Phase 4 adds a Socratic tutor built on the Phase 1 database and Phase 2 state
+vector. Connector >= 12.16.0, gateway >= 2.13.0, client >= 5.18.0.
+
+## 1. Connector code (automatic with deploy)
+
+Ships in v12.16.0. The `student_model` table is created at boot. New tools:
+`student_model_observe`, `student_model_relate`, `socratic_seam_question`,
+`student_model_read`.
+
+## 2. Volume assets (add the Phase 4 scripts and modules)
+
+```
+/data/skill/ava/scripts/student_model.py
+/data/skill/ava/scripts/seam_detection.py
+/data/skill/ava/scripts/question_generation.py
+/data/skill/ava/modules/self-model/socratic-tutor-architecture.md
+/data/skill/ava/modules/self-model/socratic-question-dispatch.md
+/data/skill/ava/MANIFEST_APPEND.json   (now nine self-model modules)
+```
+
+## 3. Gateway and client
+
+- gateway-service v2.13.0: injects `[TUTOR_MODE: socratic]` when the client sends
+  `X-Tenax-Tutor-Mode: socratic`. No new configuration.
+- ts-client-gateway v5.18.0: Settings toggle (Appearance) + silence pipeline. New
+  `src/js/20c-socratic.js` and `src/css/18-socratic.css` are picked up
+  automatically; no build step.
+
+## 4. Using it
+
+- Turn on Socratic mode in Settings > Appearance. The client sends the header;
+  the gateway injects the marker; the assistant uses the Socratic modules.
+- Record understanding with `student_model_observe` (signal:
+  mastered|confident|partial|unsure|struggled|incorrect or 0..1; source explicit
+  when the recipient confirms). Mark relations with `student_model_relate`.
+- Ask `socratic_seam_question` for the next question. If it returns none, teach
+  normally - do not force a seam question.
+
+## 5. Smoke test
+
+```
+student_model_observe { "concept": "functors", "signal": "mastered", "source": "explicit" }
+student_model_observe { "concept": "monads", "signal": "struggled" }
+student_model_relate  { "concept": "monads", "adjacent_to": "functors" }
+socratic_seam_question {}
+```
+
+The last call should return an activation question connecting functors to monads.
+Confidence estimates carry an uncertainty interval and decay when stale; calibrate
+with explicit confirmations rather than trusting inferred reads too far.

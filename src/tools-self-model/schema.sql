@@ -156,3 +156,27 @@ CREATE TABLE IF NOT EXISTS nudge_optouts (
   opted_out        INTEGER NOT NULL DEFAULT 0,       -- 0 = active, 1 = permanently off
   updated_at       TEXT    NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- student_model : cross-session map of what the recipient understands, keyed by
+--                 concept (Phase 4: Socratic Tutor Mode). Confidence is stored
+--                 with an uncertainty interval; low-confidence estimates decay
+--                 faster (Bayesian-style updating in student_model.py). seam_scores
+--                 is a JSON object of {seam_type: score} plus optional relational
+--                 hints (e.g. conflicts_with, adjacent_to) used by seam detection.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS student_model (
+  concept          TEXT    PRIMARY KEY,
+  confidence       REAL    NOT NULL DEFAULT 0.0,     -- point estimate 0..1
+  confidence_lower REAL    NOT NULL DEFAULT 0.0,     -- lower bound of interval
+  confidence_upper REAL    NOT NULL DEFAULT 1.0,     -- upper bound of interval
+  observations     INTEGER NOT NULL DEFAULT 0,       -- evidence count (Bayesian n)
+  source           TEXT    NOT NULL DEFAULT 'inferred', -- inferred | explicit
+  domain           TEXT    DEFAULT NULL,             -- optional grouping
+  seam_scores      TEXT    DEFAULT NULL,             -- JSON {seam_type: score, ...}
+  first_seen       TEXT    NOT NULL,                 -- ISO-8601 UTC
+  last_updated     TEXT    NOT NULL                  -- ISO-8601 UTC
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_model_confidence ON student_model(confidence);
+CREATE INDEX IF NOT EXISTS idx_student_model_domain     ON student_model(domain);
