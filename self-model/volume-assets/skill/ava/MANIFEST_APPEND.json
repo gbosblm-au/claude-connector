@@ -101,11 +101,81 @@
         "weak_co_load": ["self-model-architecture"]
       },
       "requires": ["state-vector-schema"]
+    },
+    {
+      "id": "background-awareness",
+      "path": "modules/self-model/background-awareness.md",
+      "always_load": false,
+      "triggers": {
+        "keywords": ["nudge", "nudges", "pattern", "patterns", "initiative", "notice", "noticed", "proactive", "observation"],
+        "phrases": [
+          "background awareness",
+          "pattern analysis",
+          "anything you noticed",
+          "anything worth flagging",
+          "what patterns",
+          "session close analysis",
+          "proactive suggestion"
+        ],
+        "regex": ["nudge", "pattern[- ]analy"],
+        "subjects": ["initiative", "background-awareness"]
+      },
+      "adjacency": {
+        "co_load": ["nudge-dispatch", "silence-respect"],
+        "weak_co_load": ["self-model-architecture"]
+      },
+      "requires": ["self-model-architecture"]
+    },
+    {
+      "id": "nudge-dispatch",
+      "path": "modules/self-model/nudge-dispatch.md",
+      "always_load": false,
+      "triggers": {
+        "keywords": ["nudge", "dismiss", "snooze", "surface", "show"],
+        "phrases": [
+          "nudge dispatch",
+          "show me",
+          "snooze",
+          "dismiss the nudge",
+          "surface a nudge",
+          "how to deliver"
+        ],
+        "regex": ["nudge[- ]dispatch", "show me|snooze|dismiss"],
+        "subjects": ["initiative", "background-awareness"]
+      },
+      "adjacency": {
+        "co_load": ["background-awareness", "silence-respect"],
+        "weak_co_load": []
+      },
+      "requires": ["background-awareness"]
+    },
+    {
+      "id": "silence-respect",
+      "path": "modules/self-model/silence-respect.md",
+      "always_load": false,
+      "triggers": {
+        "keywords": ["silence", "quiet", "nudge", "restraint"],
+        "phrases": [
+          "silence respect",
+          "quiet is the default",
+          "when not to nudge",
+          "should i say something",
+          "nothing to surface"
+        ],
+        "regex": ["silence[- ]respect"],
+        "subjects": ["initiative", "background-awareness"]
+      },
+      "adjacency": {
+        "co_load": ["background-awareness", "nudge-dispatch"],
+        "weak_co_load": []
+      },
+      "requires": ["background-awareness"]
     }
   ],
   "mandatory_for_triggers": {},
   "tag_web": {
     "self-model": ["self-model", "self_model_query", "module_activations", "tool_usage", "introspection"],
-    "sustained-self": ["state vector", "session state", "cross-session", "curiosity", "continuity", "self_state_read", "self_state_write"]
+    "sustained-self": ["state vector", "session state", "cross-session", "curiosity", "continuity", "self_state_read", "self_state_write"],
+    "initiative": ["nudge", "nudge_check", "nudge_analyze", "nudge_action", "pattern", "proactive", "background awareness", "silence"]
   }
 }

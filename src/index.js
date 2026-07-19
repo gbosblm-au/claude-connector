@@ -114,6 +114,16 @@ import {
   handleSelfStateRead,
 } from "./tools/selfState.js";
 
+// Initiative and Background Awareness (Phase 3)
+import {
+  nudgeAnalyzeToolDefinition,
+  handleNudgeAnalyze,
+  nudgeCheckToolDefinition,
+  handleNudgeCheck,
+  nudgeActionToolDefinition,
+  handleNudgeAction,
+} from "./tools/nudgeTools.js";
+
 // SCOPE-01 / SCOPE-03 / SCOPE-04 / SCOPE-05 -- TrueSource outreach email
 import {
   emailSendToolDefinition,
@@ -279,6 +289,10 @@ const TOOLS = [
   // Sustained Self Across Sessions (Phase 2)
   selfStateWriteToolDefinition,
   selfStateReadToolDefinition,
+  // Initiative and Background Awareness (Phase 3)
+  nudgeAnalyzeToolDefinition,
+  nudgeCheckToolDefinition,
+  nudgeActionToolDefinition,
   // TrueSource outreach email
   emailSendToolDefinition,
   emailGetConfigToolDefinition,
@@ -420,6 +434,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "self_model_query":             return await handleSelfModelQuery(args);
       case "self_state_write":             return await handleSelfStateWrite(args);
       case "self_state_read":              return await handleSelfStateRead(args);
+      case "nudge_analyze":                return await handleNudgeAnalyze(args);
+      case "nudge_check":                  return await handleNudgeCheck(args);
+      case "nudge_action":                 return await handleNudgeAction(args);
       // SCOPE-01 / SCOPE-03 email
       case "email_send":                   return await handleEmailSend(args);
       case "email_get_config":             return await handleEmailGetConfig(args);

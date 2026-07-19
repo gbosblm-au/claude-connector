@@ -139,3 +139,58 @@ self_state_read  { "format": "block" }
 
 `self_state_read` returning `[SESSION_STATE]\nNo prior session state...` means no
 vector has been written yet; that is expected before the first `self_state_write`.
+
+---
+
+# Self-Model (Phase 3) - Initiative and Background Awareness
+
+Phase 3 adds proactive nudges. It spans all three services: `claude-connector`
+(>= 12.15.0) detects/scores/stores and serves nudges; `gateway-service`
+(>= 2.12.0) delivers them; `ts-client-gateway` (>= 5.17.0) renders the panel.
+
+## 1. Connector code (automatic with deploy)
+
+Ships in v12.15.0. The `nudges` and `nudge_optouts` tables are created at boot by
+the idempotent schema. New tools: `nudge_analyze`, `nudge_check`, `nudge_action`.
+`nudge_analyze` runs the Python pipeline from `SCRIPTS_DIR` (default
+`/data/skill/ava/scripts`).
+
+## 2. Volume assets (add the Phase 3 scripts and modules)
+
+```
+/data/skill/ava/scripts/pattern_analyzer.py
+/data/skill/ava/scripts/nudge_prioritizer.py
+/data/skill/ava/modules/self-model/background-awareness.md
+/data/skill/ava/modules/self-model/nudge-dispatch.md
+/data/skill/ava/modules/self-model/silence-respect.md
+/data/skill/ava/MANIFEST_APPEND.json   (now seven self-model modules)
+```
+
+## 3. Gateway and client code
+
+- `gateway-service` v2.12.0: emits an SSE `nudge` event at session open and
+  exposes `POST /ti-chat/nudge-action`. No new configuration.
+- `ts-client-gateway` v5.17.0: renders the nudge panel. New `src/js/20b-nudge.js`
+  and `src/css/17-nudge.css` are picked up automatically by the serve-time
+  concatenation; no build step.
+
+## 4. Session protocol
+
+- At session close, the assistant calls `nudge_analyze` (described in the
+  `background-awareness` module). Ensure the CORE session-close protocol prompts
+  for it. Alternatively, schedule it after every session close.
+- At session open, delivery is automatic (the gateway calls `nudge_check`).
+
+## 5. Smoke test
+
+Run `nudge_analyze` after some history exists, then open a new session. If a
+pattern cleared the bar, a single nudge panel appears. Verify directly:
+
+```
+nudge_analyze {}
+nudge_check {}
+nudge_action { "nudge_id": "<id from nudge_check>", "action": "dismiss" }
+```
+
+Two dismissals of the same category permanently opt it out. An empty
+`nudge_check` (no nudge) is the expected, common case - quiet is the default.

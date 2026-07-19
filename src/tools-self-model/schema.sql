@@ -116,3 +116,43 @@ CREATE TABLE IF NOT EXISTS self_insights (
 
 CREATE INDEX IF NOT EXISTS idx_self_insights_category ON self_insights(category);
 CREATE INDEX IF NOT EXISTS idx_self_insights_session  ON self_insights(session_id);
+
+-- ---------------------------------------------------------------------------
+-- nudges : proactively surfaced observations (Phase 3: Initiative and
+--          Background Awareness). One row per detected pattern instance,
+--          keyed by a stable pattern_id (category:subject) so re-detection
+--          updates rather than duplicates.
+--   status: pending | surfaced | snoozed | dismissed | actioned
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS nudges (
+  pattern_id        TEXT    PRIMARY KEY,             -- stable, e.g. "topic_recurrence:locale"
+  pattern_category  TEXT    NOT NULL,                -- one of the 7 detector categories
+  message           TEXT    NOT NULL,                -- the nudge text to surface
+  score             REAL    NOT NULL DEFAULT 0,      -- combined priority score
+  relevance_score   REAL    DEFAULT NULL,
+  urgency_score     REAL    DEFAULT NULL,
+  receptivity_score REAL    DEFAULT NULL,
+  status            TEXT    NOT NULL DEFAULT 'pending',
+  first_detected    TEXT    NOT NULL,                -- ISO-8601 UTC
+  last_surfaced     TEXT    DEFAULT NULL,            -- ISO-8601 UTC
+  dismiss_count     INTEGER NOT NULL DEFAULT 0,      -- per-pattern dismissals
+  session_id        TEXT    DEFAULT NULL,            -- session that produced it
+  updated_at        TEXT    NOT NULL                 -- ISO-8601 UTC
+);
+
+CREATE INDEX IF NOT EXISTS idx_nudges_status   ON nudges(status);
+CREATE INDEX IF NOT EXISTS idx_nudges_category ON nudges(pattern_category);
+CREATE INDEX IF NOT EXISTS idx_nudges_score    ON nudges(score DESC);
+
+-- ---------------------------------------------------------------------------
+-- nudge_optouts : per-category dismissal tracking. Two dismissals of the same
+--                 pattern category permanently opt that category out (the
+--                 prioritiser stops storing new nudges of that category and
+--                 nudge_check refuses to surface them).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS nudge_optouts (
+  pattern_category TEXT    PRIMARY KEY,
+  dismiss_count    INTEGER NOT NULL DEFAULT 0,
+  opted_out        INTEGER NOT NULL DEFAULT 0,       -- 0 = active, 1 = permanently off
+  updated_at       TEXT    NOT NULL
+);
