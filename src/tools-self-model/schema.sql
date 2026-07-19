@@ -1,0 +1,118 @@
+-- src/tools-self-model/schema.sql
+-- Canonical schema for the Self-Model Interrogation database (Phase 1).
+--
+-- Single source of truth shared by:
+--   - db.js               (Node / better-sqlite3, runtime writer)
+--   - self_model_aggregator.py / self_model_summarizer.py (Python, stdlib sqlite3)
+--   - self-model.test.js  (verification)
+--
+-- Seven tables, matching the Neural Capability Expansion specification exactly:
+--   session_log, module_activations, tool_usage, topic_clusters,
+--   session_timing, compile_history, self_insights
+--
+-- All DDL is idempotent (CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS)
+-- so it can be applied on every boot without error and without data loss.
+
+-- ---------------------------------------------------------------------------
+-- session_log : one row per session, opened lazily on first event, finalised
+--               at session close.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS session_log (
+  id             TEXT    PRIMARY KEY,               -- session id (string)
+  start_time     TEXT    NOT NULL,                  -- ISO-8601 UTC
+  end_time       TEXT    DEFAULT NULL,              -- ISO-8601 UTC, set/updated on activity + close
+  message_count  INTEGER NOT NULL DEFAULT 0,        -- turns observed in this session
+  topic_summary  TEXT    DEFAULT NULL               -- natural-language summary written at close
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_log_start ON session_log(start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_session_log_end   ON session_log(end_time DESC);
+
+-- ---------------------------------------------------------------------------
+-- module_activations : per-session module usage tracking.
+--   One row per (session_id, module_id). load_count increments each time the
+--   module is loaded into a compiled skill; total_time_active accumulates the
+--   active duration attributed to the module (milliseconds).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS module_activations (
+  session_id        TEXT    NOT NULL,
+  module_id         TEXT    NOT NULL,
+  load_count        INTEGER NOT NULL DEFAULT 0,
+  total_time_active INTEGER NOT NULL DEFAULT 0,     -- milliseconds
+  PRIMARY KEY (session_id, module_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_module_activations_module ON module_activations(module_id);
+
+-- ---------------------------------------------------------------------------
+-- tool_usage : per-session tool usage aggregation.
+--   One row per (session_id, tool_name). call_count increments per call;
+--   total_duration_ms accumulates measured handler duration.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tool_usage (
+  session_id        TEXT    NOT NULL,
+  tool_name         TEXT    NOT NULL,
+  call_count        INTEGER NOT NULL DEFAULT 0,
+  total_duration_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (session_id, tool_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_usage_tool ON tool_usage(tool_name);
+
+-- ---------------------------------------------------------------------------
+-- topic_clusters : topic frequency tracking derived from session summaries.
+--   Populated by the aggregator from session_log.topic_summary. One row per
+--   (session_id, topic_keyword) with an accumulated weight.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS topic_clusters (
+  session_id    TEXT    NOT NULL,
+  topic_keyword TEXT    NOT NULL,
+  weight        REAL    NOT NULL DEFAULT 0,
+  PRIMARY KEY (session_id, topic_keyword)
+);
+
+CREATE INDEX IF NOT EXISTS idx_topic_clusters_keyword ON topic_clusters(topic_keyword);
+
+-- ---------------------------------------------------------------------------
+-- session_timing : session pattern analysis (one row per session).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS session_timing (
+  session_id       TEXT    PRIMARY KEY,
+  day_of_week      INTEGER,                          -- 0=Sunday .. 6=Saturday
+  hour_of_day      INTEGER,                          -- 0..23 (UTC of session start)
+  duration_minutes INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_timing_dow  ON session_timing(day_of_week);
+CREATE INDEX IF NOT EXISTS idx_session_timing_hour ON session_timing(hour_of_day);
+
+-- ---------------------------------------------------------------------------
+-- compile_history : compile performance tracking. One row per skill_compile.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS compile_history (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id            TEXT    NOT NULL,
+  compile_time_ms       INTEGER,
+  modules_loaded_count  INTEGER,
+  manifest_version      TEXT,
+  created_at            TEXT    NOT NULL             -- ISO-8601 UTC
+);
+
+CREATE INDEX IF NOT EXISTS idx_compile_history_session ON compile_history(session_id);
+
+-- ---------------------------------------------------------------------------
+-- self_insights : surfaced observations and generated summaries.
+--   category distinguishes sources, e.g. 'summary', 'observation', and (from
+--   Phase 2) 'state_vector'.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS self_insights (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT,
+  insight_text  TEXT    NOT NULL,
+  category      TEXT    NOT NULL DEFAULT 'observation',
+  source_module TEXT,
+  created_at    TEXT    NOT NULL                     -- ISO-8601 UTC
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_insights_category ON self_insights(category);
+CREATE INDEX IF NOT EXISTS idx_self_insights_session  ON self_insights(session_id);

@@ -98,6 +98,22 @@ import {
   handlePsychologyAlignmentAssess,
 } from "./tools/psychology.js";
 
+// Self-Model Interrogation (Phase 1)
+// stdio (Claude Desktop) exposes the query tool but does not perform per-turn
+// recording: the self-model DB lives on the Railway HTTP service volume.
+import {
+  selfModelQueryToolDefinition,
+  handleSelfModelQuery,
+} from "./tools/selfModelQuery.js";
+
+// Sustained Self Across Sessions (Phase 2)
+import {
+  selfStateWriteToolDefinition,
+  handleSelfStateWrite,
+  selfStateReadToolDefinition,
+  handleSelfStateRead,
+} from "./tools/selfState.js";
+
 // SCOPE-01 / SCOPE-03 / SCOPE-04 / SCOPE-05 -- TrueSource outreach email
 import {
   emailSendToolDefinition,
@@ -258,6 +274,11 @@ const TOOLS = [
   psychologyEmotionTaxonomyToolDefinition,
   psychologySentimentAnalyzeToolDefinition,
   psychologyAlignmentAssessToolDefinition,
+  // Self-Model Interrogation (Phase 1)
+  selfModelQueryToolDefinition,
+  // Sustained Self Across Sessions (Phase 2)
+  selfStateWriteToolDefinition,
+  selfStateReadToolDefinition,
   // TrueSource outreach email
   emailSendToolDefinition,
   emailGetConfigToolDefinition,
@@ -396,6 +417,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "psychology_emotion_taxonomy":  return await handlePsychologyEmotionTaxonomy(args);
       case "psychology_sentiment_analyze": return await handlePsychologySentimentAnalyze(args);
       case "psychology_alignment_assess":  return await handlePsychologyAlignmentAssess(args);
+      case "self_model_query":             return await handleSelfModelQuery(args);
+      case "self_state_write":             return await handleSelfStateWrite(args);
+      case "self_state_read":              return await handleSelfStateRead(args);
       // SCOPE-01 / SCOPE-03 email
       case "email_send":                   return await handleEmailSend(args);
       case "email_get_config":             return await handleEmailGetConfig(args);

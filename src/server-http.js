@@ -197,6 +197,22 @@ import {
   handlePsychologyAlignmentAssess,
 } from "./tools/psychology.js";
 
+// Self-Model Interrogation (Phase 1)
+import {
+  selfModelQueryToolDefinition,
+  handleSelfModelQuery,
+} from "./tools/selfModelQuery.js";
+import { selfModelRecordToolCall } from "./tools-self-model/hook.js";
+import { initSelfModelDb, isSelfModelEnabled } from "./tools-self-model/db.js";
+
+// Sustained Self Across Sessions (Phase 2)
+import {
+  selfStateWriteToolDefinition,
+  handleSelfStateWrite,
+  selfStateReadToolDefinition,
+  handleSelfStateRead,
+} from "./tools/selfState.js";
+
 // ---------- TrueSource outreach direct send (SCOPE-01/03/04/05) ----------
 import {
   emailSendToolDefinition,
@@ -676,6 +692,13 @@ const TOOLS = [
   psychologySentimentAnalyzeToolDefinition,
   psychologyAlignmentAssessToolDefinition,
 
+  // ---------- Self-Model Interrogation (Phase 1) ----------
+  selfModelQueryToolDefinition,
+
+  // ---------- Sustained Self Across Sessions (Phase 2) ----------
+  selfStateWriteToolDefinition,
+  selfStateReadToolDefinition,
+
   // ---------- TrueSource outreach direct send ----------
   emailSendToolDefinition,
   emailGetConfigToolDefinition,
@@ -873,6 +896,7 @@ function buildEffectiveToolList() {
 }
 
 async function dispatchToolCall(name, args) {
+  const _selfModelStartedAt = Date.now();
   const result = await dispatchToolCallCore(name, args);
   // Fire-and-forget: the hook has its own try/catch, and this one is the
   // belt to its braces. A Neural Core problem must never surface as a tool
@@ -881,6 +905,13 @@ async function dispatchToolCall(name, args) {
     brainScanOnToolCompleted(name, args, result);
   } catch (hookErr) {
     log("warn", `brain_scan hook error after ${name}: ${hookErr.message}`);
+  }
+  // Self-Model Interrogation (Phase 1): record module_activations and tool_usage
+  // after every turn. Fully guarded; can never surface as a tool failure.
+  try {
+    selfModelRecordToolCall(name, args, result, _selfModelStartedAt);
+  } catch (hookErr) {
+    log("warn", `self_model hook error after ${name}: ${hookErr.message}`);
   }
   return result;
 }
@@ -941,6 +972,9 @@ async function dispatchToolCallCore(name, args) {
         case "psychology_emotion_taxonomy":  return await handlePsychologyEmotionTaxonomy(args);
         case "psychology_sentiment_analyze": return await handlePsychologySentimentAnalyze(args);
         case "psychology_alignment_assess":  return await handlePsychologyAlignmentAssess(args);
+        case "self_model_query":             return await handleSelfModelQuery(args);
+        case "self_state_write":             return await handleSelfStateWrite(args);
+        case "self_state_read":              return await handleSelfStateRead(args);
 
         // ---------- TrueSource outreach direct send ----------
         case "email_send":                   return await handleEmailSend(args);
@@ -3185,6 +3219,18 @@ httpServer.listen(PORT, HOST, () => {
   log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
     logTenantModeStatus();
     if ( isTenantMode() ) initDevice();
+    // Self-Model Interrogation (Phase 1): create/open the self-model database on
+    // the Railway volume so recording is ready before the first tool call.
+    if (isSelfModelEnabled()) {
+      try {
+        const ok = initSelfModelDb();
+        log("info", `Self-model: ${ok ? "ENABLED (self_model_query, per-turn recording)" : "unavailable (volume not writable — feature no-ops)"}`);
+      } catch (err) {
+        log("warn", `Self-model init failed at boot (feature will no-op): ${err.message}`);
+      }
+    } else {
+      log("info", "Self-model: disabled (SELF_MODEL_ENABLED=false)");
+    }
     registerProvisionRoute(app);
     registerExportRoute(app);
   log("info", `Modular skill: env_var=${process.env.SKILL_MODULAR_ENABLED || "not set"} | effective=${isModularEnabled() ? "ENABLED" : "disabled"} | runtime toggle: GET /modular-mode, POST /set-modular-mode`);

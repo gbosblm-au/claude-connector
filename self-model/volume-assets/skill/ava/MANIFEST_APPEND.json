@@ -1,0 +1,111 @@
+{
+  "_comment": "Self-model module registrations (Phase 1: Self-Model Interrogation; Phase 2: Sustained Self Across Sessions). Merged into MANIFEST.json at compile time by skill-modular.js. Append-only: existing module ids are never overridden.",
+  "modules": [
+    {
+      "id": "self-model-architecture",
+      "path": "modules/self-model/self-model-architecture.md",
+      "always_load": false,
+      "triggers": {
+        "keywords": ["self-model", "self", "myself", "database", "session_log", "activations"],
+        "phrases": [
+          "how do you know about yourself",
+          "self model",
+          "self-model",
+          "your own history",
+          "how you work",
+          "which modules were active",
+          "what modules ran"
+        ],
+        "regex": ["self[- ]model"],
+        "subjects": ["introspection", "self-knowledge"]
+      },
+      "adjacency": {
+        "co_load": ["self-model-query-dispatch"],
+        "weak_co_load": []
+      },
+      "requires": []
+    },
+    {
+      "id": "self-model-query-dispatch",
+      "path": "modules/self-model/self-model-query-dispatch.md",
+      "always_load": false,
+      "triggers": {
+        "keywords": ["module", "modules", "tool", "tools", "topics", "unused", "trend", "when"],
+        "phrases": [
+          "what modules were most active",
+          "which tools have i used",
+          "when do i usually",
+          "what topics have we covered",
+          "which modules have never been activated",
+          "is my response quality changing",
+          "self model query",
+          "self_model_query"
+        ],
+        "regex": ["most active", "used most", "never (been )?activated"],
+        "subjects": ["introspection", "self-knowledge"]
+      },
+      "adjacency": {
+        "co_load": ["self-model-architecture"],
+        "weak_co_load": []
+      },
+      "requires": ["self-model-architecture"]
+    },
+    {
+      "id": "state-vector-schema",
+      "path": "modules/self-model/state-vector-schema.md",
+      "always_load": false,
+      "triggers": {
+        "keywords": ["state", "vector", "session", "continuity", "curiosities", "unresolved", "relationship"],
+        "phrases": [
+          "state vector",
+          "session state",
+          "between sessions",
+          "cross-session",
+          "cross session",
+          "carry forward",
+          "what were we working on",
+          "where did we leave",
+          "session close",
+          "session open",
+          "unresolved questions",
+          "open projects"
+        ],
+        "regex": ["session[- ]state", "state[- ]vector"],
+        "subjects": ["continuity", "sustained-self"]
+      },
+      "adjacency": {
+        "co_load": ["cross-session-curiosity", "self-model-architecture"],
+        "weak_co_load": []
+      },
+      "requires": ["self-model-architecture"]
+    },
+    {
+      "id": "cross-session-curiosity",
+      "path": "modules/self-model/cross-session-curiosity.md",
+      "always_load": false,
+      "triggers": {
+        "keywords": ["curiosity", "curiosities", "curious", "thread", "threads", "decay", "interest"],
+        "phrases": [
+          "cross-session curiosity",
+          "curiosity score",
+          "what are you curious about",
+          "open threads",
+          "decay unused",
+          "still interested in"
+        ],
+        "regex": ["curiosit(y|ies)", "cross[- ]session"],
+        "subjects": ["continuity", "sustained-self"]
+      },
+      "adjacency": {
+        "co_load": ["state-vector-schema"],
+        "weak_co_load": ["self-model-architecture"]
+      },
+      "requires": ["state-vector-schema"]
+    }
+  ],
+  "mandatory_for_triggers": {},
+  "tag_web": {
+    "self-model": ["self-model", "self_model_query", "module_activations", "tool_usage", "introspection"],
+    "sustained-self": ["state vector", "session state", "cross-session", "curiosity", "continuity", "self_state_read", "self_state_write"]
+  }
+}

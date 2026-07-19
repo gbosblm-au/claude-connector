@@ -920,6 +920,17 @@ export async function handleSkillLoadSpecialist(args) {
   }
 
   const manifest = readJsonFile(paths.manifestFile, { modules: [] });
+  
+  // Also scan MANIFEST_APPEND.json for modules registered there
+  const appendManifest = readJsonFile(paths.manifestAppendFile, null);
+  if (appendManifest && appendManifest.modules && Array.isArray(appendManifest.modules)) {
+    const existingIds = new Set((manifest.modules || []).map(m => m.id));
+    const newModules = appendManifest.modules.filter(m => !existingIds.has(m.id));
+    if (newModules.length > 0) {
+      manifest.modules = [...(manifest.modules || []), ...newModules];
+    }
+  }
+  
   const module = (manifest.modules || []).find(m => m.id === moduleId);
 
   if (!module) {
