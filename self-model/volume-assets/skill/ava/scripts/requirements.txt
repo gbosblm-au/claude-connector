@@ -1,0 +1,3 @@
+# Python dependencies for the self-model / tutor volume scripts.
+# Phases 1-4 are standard-library only. Phase 5b (homework_assessment.py) needs reportlab.
+reportlab>=4.0,<5

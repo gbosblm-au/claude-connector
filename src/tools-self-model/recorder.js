@@ -189,6 +189,67 @@ export function closeSession(sessionId, opts = {}) {
   } catch (err) {
     log("warn", `[self-model] closeSession failed: ${err.message}`);
   }
+
+  // Phase 6: mirror this session's rows to the gateway self-model store when
+  // dual-write is enabled. Fire and forget, fully guarded.
+  dualWriteIngestToGateway(sessionId);
+}
+
+/**
+ * Best-effort ingest of a session's rows (log, module activations, tool usage,
+ * topic clusters) to the gateway self-model API. Enabled only when
+ * SELF_MODEL_DUAL_WRITE=1 and GATEWAY_URL is set. Never throws into the caller.
+ */
+function dualWriteIngestToGateway(sessionId) {
+  try {
+    if (process.env.SELF_MODEL_DUAL_WRITE !== "1") return;
+    const base = (process.env.GATEWAY_URL || "").replace(/\/+$/, "");
+    const token = process.env.GATEWAY_API_KEY || "";
+    if (!base || !sessionId || typeof fetch !== "function") return;
+
+    const db = getSelfModelDb();
+    if (!db) return;
+
+    const logRow = db.prepare(
+      `SELECT start_time, end_time, message_count, topic_summary FROM session_log WHERE id = ?`
+    ).get(sessionId) || {};
+    const modules = db.prepare(
+      `SELECT module_id, load_count, total_time_active AS total_time_ms FROM module_activations WHERE session_id = ?`
+    ).all(sessionId);
+    const tools = db.prepare(
+      `SELECT tool_name, call_count, total_duration_ms FROM tool_usage WHERE session_id = ?`
+    ).all(sessionId);
+    let topics = [];
+    try {
+      topics = db.prepare(
+        `SELECT topic_keyword, weight FROM topic_clusters WHERE session_id = ?`
+      ).all(sessionId);
+    } catch { topics = []; }  // topic_clusters may carry no weight column in older schemas
+
+    const payload = {
+      session_id: sessionId,
+      log: {
+        start_time: logRow.start_time || null,
+        end_time: logRow.end_time || null,
+        message_count: Number.isFinite(logRow.message_count) ? logRow.message_count : null,
+        topic_summary: logRow.topic_summary || null,
+        status: "closed",
+      },
+      module_activations: modules,
+      tool_usage: tools,
+      topic_clusters: topics,
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    fetch(`${base}/ti-self-model/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    }).catch(() => { /* swallow: SQLite is source of truth */ })
+      .finally(() => clearTimeout(timer));
+  } catch { /* never let dual-write affect the primary path */ }
 }
 
 /**

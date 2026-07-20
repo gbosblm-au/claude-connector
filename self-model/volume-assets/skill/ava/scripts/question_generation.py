@@ -129,17 +129,38 @@ def main(argv=None):
     parser.add_argument("--output", default=None)  # script-execute compatibility
     args = parser.parse_args(argv)
 
+    # Rollout routing: read from Postgres (hydrated) when the read switch is on.
     try:
-        conn = sm.connect(args.db)
-    except FileNotFoundError as err:
-        print(json.dumps({"error": str(err), "question": None}))
-        return 2
+        import self_model_gateway as smgw
+        import store
+        rollout = smgw.Rollout()
+        gateway = smgw.SelfModelGateway()
+    except Exception:  # noqa: BLE001
+        rollout = None
+        gateway = None
+
+    conn = None
     try:
+        if rollout and rollout.should_read_gateway_first() and gateway is not None:
+            conn, ok = store.hydrate_inmemory(gateway, concepts=None, with_topics=True)
+            if not ok and not rollout.allow_sqlite_read_fallback():
+                print(json.dumps({"error": "gateway unreachable and SQLite fallback disabled", "question": None}))
+                return 1
+            if not ok:
+                conn.close()
+                conn = sm.connect(args.db)
+        else:
+            conn = sm.connect(args.db)
+
         out = next_question(conn)
         print(json.dumps(out, ensure_ascii=False))
         return 0
+    except FileNotFoundError as err:
+        print(json.dumps({"error": str(err), "question": None}))
+        return 2
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":

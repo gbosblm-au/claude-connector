@@ -383,9 +383,50 @@ export function writeStateVector(sessionId, vector) {
       cat: STATE_VECTOR_CATEGORY,
       ts: nowIso(),
     });
+    // Phase 6: dual-write to the gateway Postgres store when enabled. Fire and
+    // forget, fully guarded: SQLite remains the source of truth and this can
+    // never affect the return value or throw into the caller.
+    dualWriteStateToGateway(sessionId, vector);
     return true;
   } catch (err) {
     log("warn", `[self-model] writeStateVector failed: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * Best-effort mirror of the state vector to the gateway self-model API.
+ * Enabled only when SELF_MODEL_DUAL_WRITE=1 and GATEWAY_URL is set. Uses the
+ * global fetch with a short timeout; any failure is swallowed (the gateway-side
+ * queue/flush lives in the connector Python client for batch paths).
+ */
+function dualWriteStateToGateway(sessionId, vector) {
+  try {
+    if (process.env.SELF_MODEL_DUAL_WRITE !== "1") return;
+    const base = (process.env.GATEWAY_URL || "").replace(/\/+$/, "");
+    const token = process.env.GATEWAY_API_KEY || "";
+    if (!base || typeof fetch !== "function") return;
+
+    const q = Array.isArray(vector?.active_curiosities) ? vector.active_curiosities.length : 0;
+    const rq = Array.isArray(vector?.unresolved_questions) ? vector.unresolved_questions.length : 0;
+    const rel = vector?.relationship_position || {};
+    const payload = {
+      vector_json: vector,
+      curiosity_count: q,
+      resolved_question_count: rq,
+      session_count: Number.isFinite(vector?.session_count) ? vector.session_count : (rel.session_count || 0),
+      trust_level: Number.isFinite(rel.trust_level) ? rel.trust_level : 0,
+      session_id: sessionId || null,
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    fetch(`${base}/ti-self-model/state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    }).catch(() => { /* swallow: SQLite is source of truth */ })
+      .finally(() => clearTimeout(timer));
+  } catch { /* never let dual-write affect the primary path */ }
 }

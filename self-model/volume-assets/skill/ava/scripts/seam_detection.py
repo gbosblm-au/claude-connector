@@ -157,22 +157,56 @@ def _seam(seam_type, concept, adjacent=None, concept_b=None, score=0.0, signals=
     }
 
 
+def _seam_to_payload(seam):
+    return {
+        "seam_type": seam.get("seam_type"),
+        "source_concept": seam.get("concept"),
+        "target_concept": seam.get("adjacent") or seam.get("concept_b"),
+        "description": f"{seam.get('question_type')} seam (score {seam.get('score')})",
+        "strength": seam.get("score", 0),
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Detect seams in the student model.")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
     parser.add_argument("--output", default=None)  # script-execute compatibility
     args = parser.parse_args(argv)
 
+    # Rollout routing (Stage 0 default: read from on-disk SQLite, no gateway writes).
     try:
-        conn = sm.connect(args.db)
+        import self_model_gateway as smgw
+        import store
+        rollout = smgw.Rollout()
+        gateway = smgw.SelfModelGateway()
+    except Exception:  # noqa: BLE001
+        rollout = None
+        gateway = None
+
+    conn = None
+    try:
+        if rollout and rollout.should_read_gateway_first() and gateway is not None:
+            conn, ok = store.hydrate_inmemory(gateway, concepts=None, with_topics=True)
+            if not ok and not rollout.allow_sqlite_read_fallback():
+                print(json.dumps({"error": "gateway unreachable and SQLite fallback disabled", "seams": []}))
+                return 1
+            if not ok:
+                conn.close()
+                conn = sm.connect(args.db)
+        else:
+            conn = sm.connect(args.db)
+
+        seams = detect_seams(conn)
+        if rollout and rollout.should_write_gateway() and gateway is not None and seams:
+            gateway.insert_seams([_seam_to_payload(s) for s in seams])
+        print(json.dumps({"seams": seams}, ensure_ascii=False))
+        return 0
     except FileNotFoundError as err:
         print(json.dumps({"error": str(err), "seams": []}))
         return 2
-    try:
-        print(json.dumps({"seams": detect_seams(conn)}, ensure_ascii=False))
-        return 0
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":

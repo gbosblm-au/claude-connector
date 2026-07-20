@@ -136,6 +136,12 @@ import {
   handleStudentModelRead,
 } from "./tools/socraticTools.js";
 
+// Assessed Homework PDF Render (Phase 5b)
+import {
+  homeworkAssessRenderToolDefinition,
+  handleHomeworkAssessRender,
+} from "./tools/homeworkTools.js";
+
 // SCOPE-01 / SCOPE-03 / SCOPE-04 / SCOPE-05 -- TrueSource outreach email
 import {
   emailSendToolDefinition,
@@ -310,6 +316,8 @@ const TOOLS = [
   studentModelRelateToolDefinition,
   socraticSeamQuestionToolDefinition,
   studentModelReadToolDefinition,
+  // Assessed Homework PDF Render (Phase 5b)
+  homeworkAssessRenderToolDefinition,
   // TrueSource outreach email
   emailSendToolDefinition,
   emailGetConfigToolDefinition,
@@ -458,6 +466,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "student_model_relate":         return await handleStudentModelRelate(args);
       case "socratic_seam_question":       return await handleSocraticSeamQuestion(args);
       case "student_model_read":           return await handleStudentModelRead(args);
+      case "homework_assess_render":       return await handleHomeworkAssessRender(args);
       // SCOPE-01 / SCOPE-03 email
       case "email_send":                   return await handleEmailSend(args);
       case "email_get_config":             return await handleEmailGetConfig(args);

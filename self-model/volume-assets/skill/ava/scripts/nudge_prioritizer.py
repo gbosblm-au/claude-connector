@@ -190,7 +190,7 @@ def prioritize(conn, candidates, weights):
 
     result = {"evaluated": len(candidates), "inserted": 0, "updated": 0,
               "skipped_threshold": 0, "skipped_optout": 0, "skipped_closed": 0,
-              "receptivity": round(receptivity, 3)}
+              "receptivity": round(receptivity, 3), "_inserted_nudges": []}
 
     for cand in candidates:
         category = cand.get("category")
@@ -213,6 +213,12 @@ def prioritize(conn, candidates, weights):
         action = upsert_nudge(conn, cand, scores)
         if action == "inserted":
             result["inserted"] += 1
+            result["_inserted_nudges"].append({
+                "pattern_type": category,
+                "score": scores["combined"],
+                "title": cand.get("pattern_id") or category,
+                "body": cand.get("message"),
+            })
         elif action == "updated":
             result["updated"] += 1
         elif action == "skipped_closed":
@@ -255,6 +261,20 @@ def main(argv=None):
         weights = (args.w_relevance, args.w_urgency, args.w_receptivity)
         with conn:
             summary = prioritize(conn, candidates, weights)
+
+        # Phase 6: mirror newly inserted nudges to the gateway when dual-write is on.
+        inserted = summary.pop("_inserted_nudges", [])
+        try:
+            import self_model_gateway as smgw
+            rollout = smgw.Rollout()
+            if rollout.should_write_gateway() and inserted:
+                gateway = smgw.SelfModelGateway()
+                for n in inserted:
+                    gateway.create_nudge(n["pattern_type"], n["score"], n["title"], n["body"])
+                summary["mirrored_to_gateway"] = len(inserted)
+        except Exception:  # noqa: BLE001 - mirroring must never break the SQLite path
+            pass
+
         print(json.dumps(summary, ensure_ascii=False))
         return 0
     except sqlite3.Error as err:

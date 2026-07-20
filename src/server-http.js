@@ -235,6 +235,12 @@ import {
   handleStudentModelRead,
 } from "./tools/socraticTools.js";
 
+// Assessed Homework PDF Render (Phase 5b)
+import {
+  homeworkAssessRenderToolDefinition,
+  handleHomeworkAssessRender,
+} from "./tools/homeworkTools.js";
+
 // ---------- TrueSource outreach direct send (SCOPE-01/03/04/05) ----------
 import {
   emailSendToolDefinition,
@@ -732,6 +738,9 @@ const TOOLS = [
   socraticSeamQuestionToolDefinition,
   studentModelReadToolDefinition,
 
+  // ---------- Assessed Homework PDF Render (Phase 5b) ----------
+  homeworkAssessRenderToolDefinition,
+
   // ---------- TrueSource outreach direct send ----------
   emailSendToolDefinition,
   emailGetConfigToolDefinition,
@@ -1015,6 +1024,7 @@ async function dispatchToolCallCore(name, args) {
         case "student_model_relate":         return await handleStudentModelRelate(args);
         case "socratic_seam_question":       return await handleSocraticSeamQuestion(args);
         case "student_model_read":           return await handleStudentModelRead(args);
+        case "homework_assess_render":       return await handleHomeworkAssessRender(args);
 
         // ---------- TrueSource outreach direct send ----------
         case "email_send":                   return await handleEmailSend(args);

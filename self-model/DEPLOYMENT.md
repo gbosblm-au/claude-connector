@@ -249,3 +249,158 @@ socratic_seam_question {}
 The last call should return an activation question connecting functors to monads.
 Confidence estimates carry an uncertainty interval and decay when stale; calibrate
 with explicit confirmations rather than trusting inferred reads too far.
+
+---
+
+# Tutor (Phase 5) - Understanding Check + Assessed Homework
+
+Phase 5a is client-only (ts-client-gateway v5.19.0); Phase 5b is connector-only
+(claude-connector v12.17.0). The gateway is unchanged.
+
+## Phase 5a (client)
+
+New `src/js/09b-understanding-check.js` and `src/css/19-understanding-check.css`
+are picked up automatically by serve-time concatenation; no build step. The
+overlay sends bracketed directives ([STUDENT_UNDERSTANDS], [STUDENT_EXPLAIN_MORE],
+[STUDENT_IDLE]) as chat messages, handled like the existing homework directives.
+
+## Phase 5b (connector)
+
+1. Deploy v12.17.0 (adds the `homework_assess_render` tool).
+2. Add the script to the volume:
+   `/data/skill/ava/scripts/homework_assessment.py`
+3. Install reportlab on the volume's Python (see
+   `/data/skill/ava/scripts/requirements.txt`): `pip install "reportlab>=4,<5"`.
+4. Deploy the updated `MANIFEST_APPEND.json` (now ten modules) and the new module
+   `modules/self-model/understanding-check-homework.md`.
+
+### Smoke test
+
+```
+homework_assess_render {
+  "homework_slug": "week-3", "student_name": "Mila", "student_age": 12,
+  "questions": [
+    {"number":1,"concept":"Author's tone","question":"Why the scare quotes?","correct_answer":"sarcasm","student_answer":"sarcasm"},
+    {"number":2,"concept":"Border geometry","question":"inner area?","correct_answer":"176","student_answer":"300","assessment":"incorrect","comment":"Subtract 2w per side first."}
+  ]
+}
+```
+
+Returns a score summary and a base64 PDF. Deliver the PDF as the permanent record.
+
+---
+
+# Self-Model (Phase 6) - SQLite to Postgres Migration
+
+Moves the self-model store from the connector's ephemeral SQLite volume to Postgres
+on the gateway, under a `self_model` schema. Gateway >= 2.14.0, connector >= 12.18.0.
+The migration is staged (dual-write) and non-breaking; SQLite stays the source of
+truth until cutover.
+
+## Gateway (v2.14.0)
+
+- The `self_model` schema (12 tables) is created automatically at boot by initDb.
+- The Self-Model API mounts at `/ti-self-model` (8 endpoints, rate limited 60/min).
+- No new configuration. For local/CI without SSL, set `PGSSL=disable`.
+
+## Connector (v12.18.0)
+
+Set these on the connector to enable dual-write (leave unset to stay SQLite-only):
+
+```
+GATEWAY_URL=https://<gateway-host>
+GATEWAY_API_KEY=<service token accepted by the JWT routes>
+SELF_MODEL_DUAL_WRITE=1
+SELF_MODEL_QUEUE_PATH=/data/self-model-queue.jsonl   # optional
+```
+
+- With dual-write on, state writes mirror to `/ti-self-model/state` best-effort;
+  SQLite remains authoritative.
+- `self_model_gateway.py` is the client for the Python paths (student model,
+  nudges, insights) and provides queue + flush_queue for batch resilience.
+
+## Rollout (dual-write, each stage >= 7 days)
+
+1. Schema + dual-write: Postgres writes run in parallel; reads stay on SQLite.
+2. Read switch: reads prefer Postgres, fall back to SQLite; writes still dual.
+3. Remove SQLite writes: Postgres only for writes; SQLite read fallback retained.
+4. Cutover: reads fully on Postgres; drop SQLite. Verify row counts via
+   `GET /ti-self-model/admin/stats` before each transition.
+
+Rollback at any stage: re-enable the SQLite read path, verify with a row-count
+check, switch reads back. Dual-write means both stores stay complete.
+
+## Admin dashboard (Self-Model tab)
+
+The five views are downstream consumers of the delivered API:
+- System Health -> `GET /admin/stats` (row counts, last-write, migration status).
+- Module Activation -> `POST /query {intent: module_activation_summary}`.
+- Session Patterns -> `POST /query {intent: session_overview}`.
+- Tool Usage -> `POST /query {intent: tool_usage_summary}`.
+- Nudges -> `GET /nudge` + `POST /nudge {action: dismiss|snooze}`.
+
+---
+
+# Self-Model (Phase 6 cont.) - Script wiring and the dual-write rollout runbook
+
+Gateway >= 2.15.0, connector >= 12.19.0. All connector self-model scripts now honour
+the rollout flags; with no flags set they behave exactly as before (Stage 0, SQLite
+only).
+
+## Rollout flags (connector env)
+
+| Flag                             | Default | Meaning                                   |
+|----------------------------------|---------|-------------------------------------------|
+| SELF_MODEL_DUAL_WRITE            | off     | also write the gateway (Postgres)         |
+| SELF_MODEL_READ_POSTGRES         | off     | read Postgres first (SQLite fallback)     |
+| SELF_MODEL_SQLITE_WRITE          | 1       | write SQLite (set 0 to stop at Stage 3)   |
+| SELF_MODEL_SQLITE_READ_FALLBACK  | 1       | allow SQLite read fallback (0 at Stage 4) |
+
+Also required when dual-write is on: GATEWAY_URL and GATEWAY_API_KEY.
+
+## Stages (each held >= 7 days; verify with GET /ti-self-model/admin/stats)
+
+Stage 1 - Schema + dual-write
+  SELF_MODEL_DUAL_WRITE=1
+  Postgres writes run in parallel; reads stay on SQLite. Confirm row counts grow
+  in Postgres and match SQLite.
+
+Stage 2 - Read switch
+  SELF_MODEL_DUAL_WRITE=1, SELF_MODEL_READ_POSTGRES=1
+  Reads prefer Postgres and fall back to SQLite. The seam pipeline hydrates the
+  model and topic rows from Postgres. Watch for read errors; the fallback masks
+  them but they should be zero before proceeding.
+
+Stage 3 - Remove SQLite writes
+  SELF_MODEL_DUAL_WRITE=1, SELF_MODEL_READ_POSTGRES=1, SELF_MODEL_SQLITE_WRITE=0
+  Postgres is authoritative. Mutations hydrate from Postgres, compute with the
+  same logic, and persist back to Postgres. SQLite is frozen but still readable
+  as a safety net.
+
+Stage 4 - Cutover
+  add SELF_MODEL_SQLITE_READ_FALLBACK=0
+  Reads come only from Postgres. Once stable, the SQLite volume can be retired.
+
+Rollback: at any stage, set SELF_MODEL_READ_POSTGRES=0 and SELF_MODEL_SQLITE_WRITE=1
+to return to SQLite authority. Because dual-write keeps both stores current through
+Stage 2, rollback to Stage 1/2 is lossless. After Stage 3 (SQLite frozen), roll back
+by replaying from Postgres or accepting the gap since freeze.
+
+## What each script does under the flags
+
+- student_model.py - observe/relate/decay mirror changed concepts to the gateway
+  (Stages 1-2) or compute against a Postgres-hydrated in-memory DB and push back
+  (Stages 3-4). dump reads the preferred source.
+- seam_detection.py - reads the model and topics from the preferred source; writes
+  detected seams to the gateway when dual-write is on.
+- question_generation.py - reads the preferred source for the --next pipeline.
+- nudge_prioritizer.py - mirrors newly inserted nudges to the gateway.
+- recorder.js (closeSession) - mirrors the session's log, module activations, tool
+  usage, and topic clusters to /ti-self-model/ingest.
+
+## Note on the queue
+
+Batch/CLI writes that fail while the gateway is briefly unreachable are appended to
+SELF_MODEL_QUEUE_PATH by the Python client and replayed by flush_queue(). Schedule a
+periodic flush (or call it at connector start) so transient gateway outages during
+the rollout do not drop Postgres writes.

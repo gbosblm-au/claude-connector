@@ -258,6 +258,17 @@ def export_confidence_by_domain(conn):
     return {d: round(sum(v) / len(v), 3) for d, v in agg.items() if v}
 
 
+def _affected_concepts(args):
+    names = []
+    if args.concept:
+        names.append(args.concept.strip())
+    if args.adjacent_to:
+        names.append(args.adjacent_to.strip())
+    if args.conflicts_with:
+        names.append(args.conflicts_with.strip())
+    return [n for n in names if n]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Build and maintain the student model.")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
@@ -275,32 +286,83 @@ def main(argv=None):
     parser.add_argument("--output", default=None)  # script-execute compatibility
     args = parser.parse_args(argv)
 
+    # Rollout routing. With no env flags set this is Stage 0 and behaves exactly
+    # as before: on-disk SQLite only.
     try:
-        conn = connect(args.db)
-    except FileNotFoundError as err:
-        print(json.dumps({"error": str(err)}))
-        return 2
+        import self_model_gateway as smgw
+        import store
+        rollout = smgw.Rollout()
+        gateway = smgw.SelfModelGateway()
+    except Exception:  # noqa: BLE001 - never let rollout wiring break the core path
+        rollout = None
+        gateway = None
 
+    is_mutation = args.observe or args.relate or args.decay
+    postgres_authoritative = bool(rollout and not rollout.should_write_sqlite())
+
+    conn = None
+    inmemory = False
     try:
+        if is_mutation and postgres_authoritative and gateway is not None:
+            # Stage 3-4: hydrate from Postgres, compute, push back.
+            concepts = None if args.decay else _affected_concepts(args)
+            conn, ok = store.hydrate_inmemory(gateway, concepts=concepts)
+            inmemory = True
+            if not ok:
+                print(json.dumps({"ok": False, "error": "gateway unreachable and SQLite writes disabled"}))
+                return 1
+        else:
+            try:
+                conn = connect(args.db)
+            except FileNotFoundError as err:
+                print(json.dumps({"error": str(err)}))
+                return 2
+
         with conn:
             if args.observe:
                 result = observe(conn, args.concept, args.signal, args.source, args.domain)
-                print(json.dumps({"ok": True, "observed": result}, ensure_ascii=False))
+                _persist_mutation(rollout, gateway, conn, _affected_concepts(args), inmemory)
+                print(json.dumps({"ok": True, "observed": result, **_rollout_meta(rollout)}, ensure_ascii=False))
             elif args.relate:
                 result = relate(conn, args.concept, args.adjacent_to, args.conflicts_with)
-                print(json.dumps({"ok": True, "related": result}, ensure_ascii=False))
+                _persist_mutation(rollout, gateway, conn, _affected_concepts(args), inmemory)
+                print(json.dumps({"ok": True, "related": result, **_rollout_meta(rollout)}, ensure_ascii=False))
             elif args.decay:
-                print(json.dumps({"ok": True, **decay(conn)}, ensure_ascii=False))
+                res = decay(conn)
+                all_names = [r["concept"] for r in conn.execute("SELECT concept FROM student_model").fetchall()]
+                _persist_mutation(rollout, gateway, conn, all_names, inmemory)
+                print(json.dumps({"ok": True, **res, **_rollout_meta(rollout)}, ensure_ascii=False))
             elif args.export_confidence:
                 print(json.dumps({"ok": True, "confidence_by_domain": export_confidence_by_domain(conn)}, ensure_ascii=False))
             else:  # dump
-                print(json.dumps({"ok": True, "student_model": get_model(conn)}, ensure_ascii=False))
+                model = store.load_model(rollout, gateway, conn) if rollout else get_model(conn)
+                print(json.dumps({"ok": True, "student_model": model}, ensure_ascii=False))
         return 0
     except (ValueError, sqlite3.Error) as err:
         print(json.dumps({"ok": False, "error": str(err)}))
         return 1
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+
+
+def _rollout_meta(rollout):
+    return {"rollout": rollout.as_dict()} if rollout else {}
+
+
+def _persist_mutation(rollout, gateway, conn, concept_names, inmemory):
+    """Mirror the changed concepts to the gateway per the rollout flags.
+
+    - SQLite authoritative (Stages 0-2): the on-disk write already happened; here
+      we additionally mirror to the gateway when dual-write is on.
+    - Postgres authoritative (Stages 3-4): the compute ran on an in-memory copy;
+      here we push the changed rows to the gateway (the only durable store).
+    """
+    if not rollout or not gateway:
+        return
+    if inmemory or rollout.should_write_gateway():
+        import store
+        store.mirror_concepts(conn, gateway, concept_names)
 
 
 if __name__ == "__main__":
