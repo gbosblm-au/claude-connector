@@ -41,6 +41,7 @@ import {
 } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import { log } from '../utils/logger.js';
+import { deriveModuleEntry, writeModuleFragment } from './manifest-fragments.js';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -209,7 +210,11 @@ export const moduleWriteToolDefinition = {
     'Write or overwrite a module file on the Railway volume by its relative path within modules/ ' +
     '(e.g. "music-analysis/music-analysis-somatic.md" or "philosophy/new-topic.md"). ' +
     'Use this to directly edit or create modular skill files without leaving Claude. ' +
-    'Does NOT automatically update MANIFEST.json — run skill_audit or update the manifest separately after creating a new module. ' +
+    'v12.21.0: writing a .md module AUTOMATICALLY registers it in a manifest fragment under ' +
+    'references/manifest/ (per MANIFEST_DIRECTORY_PROTOCOL.md), so skill_compile, skill_recompile, ' +
+    'skill_load_specialist, and brain_scan catalog it immediately — no manual MANIFEST.json edit and ' +
+    'no manifest_rebuild.py run is required. Pass manifest_entry to control triggers/metadata; ' +
+    'otherwise a dispatchable entry is derived from the path and content. ' +
     'Backs up the updated file to WordPress after a successful write.\n\n' +
     'SAFETY GUARDRAIL — OVERWRITE PROTECTION:\n' +
     'If the target file already exists, the write is BLOCKED and the existing file stats are returned. ' +
@@ -225,6 +230,9 @@ export const moduleWriteToolDefinition = {
       content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change (used for WP backup metadata). Optional.' },
       force:       { type: 'boolean', description: 'Set to true to confirm overwrite of an EXISTING file. Only accepted after Brian has been notified and has explicitly confirmed the overwrite. Do NOT pass true speculatively. Default: false.' },
+      manifest_entry: { type: 'object', description: 'Optional manifest module entry (MANIFEST_APPEND schema: id, title, category, triggers{keywords,phrases,task_class}, provides, depends_on, load_priority, load_strategy, always_load). Fields you supply override the derived defaults; id and path are always ensured. Omit to auto-derive from the file path and content.' },
+      dispatch_rule:  { type: 'object', description: 'Optional dispatch rule to register alongside the module in the same fragment (fragment schema: id, trigger_description, trigger_patterns{keywords,phrases,task_class}, module_to_add, confidence). Omit to register the module without a routing rule.' },
+      skip_manifest:  { type: 'boolean', description: 'Set true to write the module file WITHOUT registering a manifest fragment (e.g. editing a body whose registration already exists and should not be touched). Default: false — registration is automatic.' },
     },
     required: ['file', 'content'],
   },
@@ -347,7 +355,7 @@ export const scriptWriteToolDefinition = {
 // ---------------------------------------------------------------------------
 
 export async function handleModuleWrite(args) {
-  const { file, content, change_note, force = false } = args;
+  const { file, content, change_note, force = false, manifest_entry = null, dispatch_rule = null, skip_manifest = false } = args;
   if (!content || typeof content !== 'string') throw new Error('content is required');
   const cleanPath  = validateContentPath(file, ['md', 'json']);
   const paths      = getContentPaths();
@@ -412,6 +420,51 @@ export async function handleModuleWrite(args) {
   if (!isNew) log('warn', `[module_write] Overwriting existing file (force=true confirmed): modules/${cleanPath}`);
   writeFileSync(fullPath, content, 'utf8');
 
+  // -------------------------------------------------------------------------
+  // v12.21.0: STRUCTURAL MANIFEST REGISTRATION.
+  //
+  // The previous behaviour ended with a note — "Remember to add an entry to
+  // MANIFEST.json" — and the 2026-07-21 travel-module failure is what
+  // discretionary registration produces: a module on disk that skill_compile
+  // cannot see. Registration now happens in the same tool call: a manifest
+  // fragment is created/updated in references/manifest/ per
+  // MANIFEST_DIRECTORY_PROTOCOL.md, which skill_compile, skill_recompile,
+  // skill_load_specialist, and brain_scan all read directly.
+  //
+  // Only .md module bodies are registered (a .json module file is data, not a
+  // dispatchable module). skip_manifest opts out for body-only edits.
+  // -------------------------------------------------------------------------
+  let manifestResult = { registered: false, reason: 'skipped' };
+  const isMarkdownModule = /\.md$/i.test(cleanPath);
+  if (skip_manifest) {
+    manifestResult = { registered: false, reason: 'skip_manifest=true — existing registration left untouched' };
+  } else if (!isMarkdownModule) {
+    manifestResult = { registered: false, reason: 'non-.md module file — data files are not registered as dispatchable modules' };
+  } else {
+    try {
+      const entry = deriveModuleEntry(cleanPath, content, manifest_entry || {});
+      const frag  = writeModuleFragment(paths.avaDir, entry, dispatch_rule);
+      manifestResult = {
+        registered:      true,
+        fragment_file:   `references/manifest/${frag.file}`,
+        fragment_action: frag.action,
+        module_action:   frag.module_action,
+        module_id:       entry.id,
+        module_path:     entry.path,
+        dispatch_rule:   dispatch_rule ? 'registered' : 'none',
+      };
+    } catch (err) {
+      // A registration failure must never lose the module body write, but it
+      // must also never pass silently — that silence is the original bug.
+      log('error', `[module_write] manifest fragment registration FAILED for modules/${cleanPath}: ${err.message}`);
+      manifestResult = {
+        registered: false,
+        error:      err.message,
+        required_action: 'Registration failed. Create the fragment manually in references/manifest/ or re-run module_write.',
+      };
+    }
+  }
+
   let wpResult = { skipped: true, reason: 'WP_SKILL_URL or WP_SKILL_KEY not configured' };
   if (wpSkillUrl && wpSkillKey) {
     try {
@@ -433,10 +486,11 @@ export async function handleModuleWrite(args) {
         action:     isNew ? 'created' : 'overwritten',
         line_count: content.split('\n').length,
         path:       fullPath,
+        manifest_registration: manifestResult,
         wp_backup:  formatWpResult(wpResult),
-        note: isNew
-          ? 'Module file created. Remember to add an entry to MANIFEST.json if this is a new module for the dispatcher.'
-          : 'Module file overwritten (force=true confirmed). WordPress backup pushed.',
+        note: manifestResult.registered
+          ? `Module ${isNew ? 'created' : 'overwritten'} AND registered in ${manifestResult.fragment_file}. skill_compile, skill_recompile, skill_load_specialist, and brain_scan catalog it automatically — no MANIFEST.json edit or manifest_rebuild.py run is needed.`
+          : `Module ${isNew ? 'created' : 'overwritten'}. Manifest registration: ${manifestResult.reason || manifestResult.error || 'not performed'}.`,
       }, null, 2),
     }],
   };

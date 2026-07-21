@@ -1,4 +1,4 @@
-// src/server-http.js  v12.8.2
+// src/server-http.js  v12.21.0
 // HTTP MCP server for browser-based Claude (claude.ai) and Railway deployment.
 //
 // v12.4.0: Add skill_recompile MCP tool. Mid-session delta recompile: runs the

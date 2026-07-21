@@ -1,5 +1,15 @@
 # Claude Connector - Changelog
 
+## v12.21.0 - 2026-07-21
+
+### Structural manifest fragment registration
+
+module_write now auto-registers every .md module as a manifest fragment in
+references/manifest/; skill_compile, skill_recompile, and skill_load_specialist
+read the merged MANIFEST + MANIFEST_APPEND + fragment view live; brain_scan.py
+v2.1.0 catalogs fragment-registered modules with provenance and inferred paths.
+Full detail: CHANGELOG-v12.21.0.md.
+
 ## v12.4.0 - 2026-06-09
 
 ### Add skill_recompile MCP tool (mid-session delta recompile)

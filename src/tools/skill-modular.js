@@ -36,6 +36,7 @@ import {
   existsSync,
 } from 'node:fs';
 import { log } from '../utils/logger.js';
+import { loadMergedManifest } from './manifest-fragments.js';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -485,38 +486,33 @@ function applyLearnedLinkages(dispatchRules, query, candidates) {
 }
 
 function compileSkill(query, contextHint, paths, personPrior = null, moduleAccessLevel = 'full') {
-  // Read main manifest
-let manifest = readJsonFile(paths.manifestFile, { modules: [], mandatory_for_triggers: {}, tag_web: {}, budget: {} });
-
-// --- MANIFEST_APPEND merge ---
-const appendManifest = readJsonFile(paths.manifestAppendFile, null);
-if (appendManifest && appendManifest.modules && Array.isArray(appendManifest.modules)) {
-  const existingIds = new Set((manifest.modules || []).map(m => m.id));
-  const newModules = appendManifest.modules.filter(m => !existingIds.has(m.id));
-  if (newModules.length > 0) {
-    manifest.modules = [...(manifest.modules || []), ...newModules];
-    log('info', `compileSkill: MANIFEST_APPEND merged ${newModules.length} new modules: ${newModules.map(m => m.id).join(', ')}`);
-  }
-  // Merge mandatory_for_triggers (append only, never override)
-  if (appendManifest.mandatory_for_triggers) {
-    for (const [trigger, moduleIds] of Object.entries(appendManifest.mandatory_for_triggers)) {
-      const existing = manifest.mandatory_for_triggers[trigger] || [];
-      manifest.mandatory_for_triggers[trigger] = [...new Set([...existing, ...moduleIds])];
-    }
-  }
-  // Merge tag_web (add new tags, don't override existing)
-  
-  if (appendManifest.tag_web) {
-    for (const [tag, keywords] of Object.entries(appendManifest.tag_web)) {
-      if (!manifest.tag_web[tag]) {
-        manifest.tag_web[tag] = keywords;
-      }
-    }
-  }
-}
-// --- End MANIFEST_APPEND merge ---
+  // v12.21.0: MANIFEST.json + MANIFEST_APPEND.json + references/manifest/*.json
+  // fragments merged through the shared loader. APPEND semantics are
+  // byte-for-byte the previous inline block; the fragment layer is the
+  // structural fix for modules that were written to disk but never made it
+  // into MANIFEST.json (2026-07-21 travel-module failure) — module_write now
+  // registers a fragment and this merge makes it live at compile time with no
+  // manifest_rebuild.py step.
+  const merged = loadMergedManifest(paths, readJsonFile);
+  const manifest = merged.manifest;
 
   const dispatchRules = readJsonFile(paths.dispatchRulesFile, { layer0_mandatory: { rules: [] }, learned_linkages: { rules: [] } });
+
+  // v12.21.0: fragment dispatch_rules feed learned linkages IN MEMORY for this
+  // compile (flattened to the string-array trigger_patterns shape that
+  // applyLearnedLinkages consumes — the fragment's object shape would silently
+  // never fire). DISPATCH_RULES.json on disk is not modified; fragments remain
+  // the single source of truth for their own rules.
+  if (merged.fragmentLinkages.length) {
+    if (!dispatchRules.learned_linkages) dispatchRules.learned_linkages = { rules: [] };
+    if (!Array.isArray(dispatchRules.learned_linkages.rules)) dispatchRules.learned_linkages.rules = [];
+    const existingRuleIds = new Set(dispatchRules.learned_linkages.rules.map(r => r && r.id));
+    const newLinkages = merged.fragmentLinkages.filter(r => !existingRuleIds.has(r.id));
+    if (newLinkages.length) {
+      dispatchRules.learned_linkages.rules = [...dispatchRules.learned_linkages.rules, ...newLinkages];
+      log('info', `compileSkill: ${newLinkages.length} fragment dispatch rule(s) active: ${newLinkages.map(r => r.id).join(', ')}`);
+    }
+  }
 
   // Read CORE
   const core = existsSync(paths.coreFile) ? readFileSync(paths.coreFile, 'utf8') : '';
@@ -919,7 +915,10 @@ export async function handleSkillLoadSpecialist(args) {
     return { content: [{ type: 'text', text: JSON.stringify({ error: 'module_id is required' }, null, 2) }], isError: true };
   }
 
-  const manifest = readJsonFile(paths.manifestFile, { modules: [] });
+  // v12.21.0: look the module up in the MERGED view (MANIFEST + APPEND +
+  // references/manifest fragments) so a module registered by module_write is
+  // loadable by id in the same session, without a manifest_rebuild.py run.
+  const manifest = loadMergedManifest(paths, readJsonFile).manifest;
   const module = (manifest.modules || []).find(m => m.id === moduleId);
 
   if (!module) {
@@ -927,8 +926,21 @@ export async function handleSkillLoadSpecialist(args) {
       content: [{
         type: 'text',
         text: JSON.stringify({
-          error: `Module '${moduleId}' not found in MANIFEST.json.`,
+          error: `Module '${moduleId}' not found in MANIFEST.json, MANIFEST_APPEND.json, or references/manifest/ fragments.`,
           available_modules: (manifest.modules || []).map(m => m.id),
+        }, null, 2),
+      }],
+      isError: true,
+    };
+  }
+
+  if (!module.path) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: `Module '${moduleId}' is registered but carries no path and no modules/ file matching its id exists on disk.`,
+          hint: 'Re-run module_write for this module, or add a "path" field to its manifest fragment entry.',
         }, null, 2),
       }],
       isError: true,
