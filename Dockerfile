@@ -98,7 +98,7 @@ WORKDIR /app
 # Pillow need cairo, pango, gdk-pixbuf, ffi), plus base and emoji fonts. These
 # are the glibc/apt equivalents of the former Alpine apk packages.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv \
+      python3 python3-pip python3-venv python-is-python3 \
       libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 \
       libffi8 shared-mime-info \
       fontconfig fonts-dejavu fonts-noto-color-emoji \
