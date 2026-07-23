@@ -113,9 +113,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --break-system-packages is required, matching the previous image). reportlab
 # is included for Phase 5b's homework_assessment.py.
 RUN pip3 install --break-system-packages --retries 5 --timeout 120 \
-      python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint reportlab \
+      python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint reportlab PyMuPDF \
     && rm -rf /root/.cache/pip
-
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/fitz
 # Android SDK 34 (isolated stage). Remove these two lines to build a
 # document-only image without the mobile pipeline.
 ENV ANDROID_HOME=/opt/android-sdk
