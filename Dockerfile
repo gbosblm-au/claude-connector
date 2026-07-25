@@ -105,9 +105,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libreoffice-writer \
       wget ca-certificates \
     && mkdir -p /usr/share/fonts/custom \
-    && wget -q -O /usr/share/fonts/custom/Raleway-Regular.ttf \
+    && wget -q -O /usr/share/fonts/custom/Raleway-Regular.ttf "https://fonts.gstatic.com/s/raleway/v34/1Ptxg8zYS_SKggPN4iEgvnHyvveLxVvao4CPNLA3JC9c.ttf" \
+    && fc-cache -f
 
-@@ -114,42 +113,42 @@
 # --break-system-packages is required, matching the previous image). reportlab
 # is included for Phase 5b's homework_assessment.py.
 RUN pip3 install --break-system-packages --retries 5 --timeout 120 \
