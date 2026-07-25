@@ -417,17 +417,8 @@ export function onToolCompleted(name, args, result) {
     if (name === 'skill_compile') {
       const payload = parseToolResult(result);
       if (payload) writeCompileRecord(payload);
-      // A compile changes what is lit, not what exists. The scan is cheap and
-      // skips itself when nothing is newer than the output, so let it run.
-      scheduleBrainScan();
-      return;
     }
 
-    if (RESCAN_TRIGGERS.has(name)) {
-      if (result && result.isError) return;
-      logFn('info', `brain_scan: ${name} changed the architecture - rescan scheduled`);
-      scheduleBrainScan();
-    }
   } catch (err) {
     logFn('warn', `brain_scan: hook error after ${name}: ${err.message}`);
   }

@@ -1,5 +1,20 @@
 # Claude Connector - Changelog
 
+## v12.22.0 - 2026-07-24
+
+### Volume snapshot and restore endpoints
+
+GET /volume-snapshot, POST /volume-restore and GET /volume-snapshot/status
+replace the manual pre/post-deployment Railway console tar commands, and are
+driven from the WordPress Connector Snapshots screen.
+
+Also fixes three defects found while wiring them in: route modules were
+registered after the catch-all 404 so POST /provision and GET /export-all were
+unreachable; owner-mode /provision accepted any api_key, which was an
+unauthenticated arbitrary file write once the route became reachable; and both
+/provision path containment checks used prefix matching rather than a path
+boundary. Full detail: CHANGELOG-v12.22.0.md.
+
 ## v12.21.0 - 2026-07-21
 
 ### Structural manifest fragment registration

@@ -34,16 +34,15 @@ import {
   writeFileSync,
   mkdirSync,
   existsSync,
-  readdirSync,
 } from 'node:fs';
 import { log } from '../utils/logger.js';
 import { loadMergedManifest } from './manifest-fragments.js';
-import { join } from 'node:path';
+
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
 
-function getModularPaths() {
+export function getModularPaths() {
   const skillFilePath = process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md';
   const baseDir = skillFilePath.replace(/SKILL\.md$/, '');
 
@@ -518,17 +517,6 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   // Read CORE
   const core = existsSync(paths.coreFile) ? readFileSync(paths.coreFile, 'utf8') : '';
 
-  // NEW: Load protocol files from references/protocol/
-const protocolDir = paths.avaDir + 'references/protocol/';
-let protocolContent = '';
-if (existsSync(protocolDir)) {
-  const protocolFiles = readdirSync(protocolDir).filter(f => f.endsWith('.md'));
-  for (const pf of protocolFiles) {
-    protocolContent += '\n\n### ' + pf.replace(/\.md$/, '').replace(/[-_]/g, ' ') + '\n\n';
-    protocolContent += readFileSync(join(protocolDir, pf), 'utf8');
-  }
-}
-
   // Detect trigger conditions
   const conditions = detectTriggerConditions(query);
   log('info', `skill-modular: conditions detected: ${conditions.join(', ') || 'none'}`);
@@ -668,9 +656,9 @@ if (existsSync(protocolDir)) {
     ? readFileSync(paths.personalityFile, 'utf8').trim()
     : '';
 
-  const parts = protocolContent
-  ? [core, '\n\n## Active Protocols\n\n' + protocolContent + '\n\n---\n', personalityContent ? '\n\n' + personalityContent : '']
-  : (personalityContent ? [core, '\n\n' + personalityContent] : [core]);
+  const parts = personalityContent
+    ? [core, '\n\n' + personalityContent]
+    : [core];
 
   // Load non-self-check modules
   for (const id of orderedIds) {

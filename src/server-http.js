@@ -78,6 +78,8 @@ import {
 import { createServer } from "http";
 import { execSync } from "child_process";
 import { registerExportRoute } from './routes/export.js';
+// v12.22.0: pre/post deployment volume snapshot and restore endpoints.
+import { registerVolumeSnapshotRoutes } from './routes/volume-snapshot.js';
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "fs";
@@ -2895,6 +2897,32 @@ app.get("/brain-data", async (req, res) => {
 // Diagnostics: is the scanner deployed, has it ever run, is one running now.
 // ---------------------------------------------------------------------------
 
+
+// POST /brain-scan — trigger a neural core scan on demand (v12.23.0)
+// Called by WordPress CRON job. Gated by the document download token.
+app.post('/brain-scan', async (req, res) => {
+  const token = (req.query.token || req.headers['x-scan-token'] || '').trim();
+  const allowedToken = process.env.DOCUMENT_DOWNLOAD_TOKEN || process.env.RAILWAY_RESTORE_TOKEN || '';
+
+  if (allowedToken && token !== allowedToken) {
+    return res.status(403).json({ ok: false, error: 'Invalid or missing scan token.' });
+  }
+
+  try {
+    const ok = await runBrainScan({ force: true });
+    res.json({
+      ok,
+      timestamp: new Date().toISOString(),
+      note: ok
+        ? 'Brain scan completed successfully.'
+        : 'Brain scan did not complete. Check connector logs for details.',
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
 app.get("/brain-data/status", (req, res) => {
   const token = (req.query.token || req.headers["x-railway-restore-token"] || "").toString().trim();
   if (!RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN) {
@@ -3204,12 +3232,30 @@ app.post("/ti-skill-check-scope", async (req, res) => {
 });
 
 
+// -----------------------------------------------------------------------
+// Route modules  (v12.22.0)
+//
+// These MUST be registered here, before the catch-all 404 below.
+//
+// Until v12.22.0 these three calls lived inside the httpServer.listen()
+// callback, which runs after this file has finished evaluating. Express
+// matches layers in registration order, so the catch-all below was always
+// reached first and POST /provision and GET /export-all returned 404 for
+// every request. Moving them ahead of the catch-all makes them reachable.
+// -----------------------------------------------------------------------
+registerProvisionRoute(app);
+registerExportRoute(app);
+registerVolumeSnapshotRoutes(app);
+
 app.use((_req, res) => {
   res.status(404).json({
     error: "Not found",
     endpoints: {
       mcp:                   "POST /mcp",
       health:                "GET /health",
+      volumeSnapshot:        "GET /volume-snapshot (X-Railway-Restore-Token required)",
+      volumeRestore:         "POST /volume-restore (X-Railway-Restore-Token required)",
+      volumeSnapshotStatus:  "GET /volume-snapshot/status (X-Railway-Restore-Token required)",
       restoreSkill:          "POST /restore-skill (X-Railway-Restore-Token required)",
       restoreBooks:          "POST /restore-books (X-Railway-Restore-Token required)",
       restoreProfiles:       "POST /restore-profiles (X-Railway-Restore-Token required)",
@@ -3281,8 +3327,9 @@ httpServer.listen(PORT, HOST, () => {
     } else {
       log("info", "Self-model: disabled (SELF_MODEL_ENABLED=false)");
     }
-    registerProvisionRoute(app);
-    registerExportRoute(app);
+    // v12.22.0: registerProvisionRoute / registerExportRoute /
+    // registerVolumeSnapshotRoutes moved to module scope above the catch-all
+    // 404 handler. Registering them here left them permanently shadowed.
   log("info", `Modular skill: env_var=${process.env.SKILL_MODULAR_ENABLED || "not set"} | effective=${isModularEnabled() ? "ENABLED" : "disabled"} | runtime toggle: GET /modular-mode, POST /set-modular-mode`);
   log("info", `Person-aware dispatch: AVA_PERSON_PRIOR_ENABLED=${process.env.AVA_PERSON_PRIOR_ENABLED || "not set (defaults true)"}`);
   log("info", `Module restore endpoints: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-modules, /restore-personality, /restore-dispatch-rules)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
