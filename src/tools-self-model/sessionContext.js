@@ -12,11 +12,17 @@
 // This is deliberately lightweight. Aggregation and querying roll up by
 // session_id, so the only requirement is that events within one session share
 // an id and that a new id is minted per process/session start.
+//
+// v12.24.0: Added per-user per-tenant identity tracking. setCurrentUser()
+// stores the tenant_id and user_id resolved from ts_gateway_session_init,
+// and getCurrentUser() returns them for scoping self-model records.
 
 import { randomUUID } from "node:crypto";
 
 let _currentSessionId = null;
 let _currentSessionStart = null;
+let _currentTenantId = null;
+let _currentUserId = null;
 
 /**
  * Generate a new session id: a UTC date prefix plus a short random suffix,
@@ -57,6 +63,30 @@ export function beginSession(sessionId) {
 }
 
 /**
+ * Set the current user identity, resolved from ts_gateway_session_init.
+ * Both values are carried through to every self-model record so data is
+ * scoped per-user per-tenant rather than per-connector.
+ *
+ * @param {string} tenantId
+ * @param {string|number} userId
+ */
+export function setCurrentUser(tenantId, userId) {
+  _currentTenantId = typeof tenantId === "string" && tenantId.trim() ? tenantId.trim() : null;
+  _currentUserId = (userId !== null && userId !== undefined) ? String(userId) : null;
+}
+
+/**
+ * Return the current user identity, or nulls if not yet resolved.
+ * @returns {{ tenantId: string|null, userId: string|null }}
+ */
+export function getCurrentUser() {
+  return {
+    tenantId: _currentTenantId,
+    userId: _currentUserId,
+  };
+}
+
+/**
  * Resolve the session id for the current event.
  * Prefers an explicit id on args; otherwise returns the current session id,
  * minting one lazily if none exists yet.
@@ -92,4 +122,6 @@ export function getSessionStart() {
 export function _resetSessionContext() {
   _currentSessionId = null;
   _currentSessionStart = null;
+  _currentTenantId = null;
+  _currentUserId = null;
 }

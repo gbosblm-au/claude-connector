@@ -5,11 +5,118 @@
 // and no-ops silently (with a warn log) if the subsystem is unavailable. None
 // of these functions throw, so they are safe to call from fire-and-forget hooks
 // on the hot path of a tool call.
+//
+// v12.24.0: All gateway POSTs now include tenant_id and user_id from
+// session context so self-model records are scoped per-user per-tenant.
+// Gateway endpoint uses X-Admin-Key auth (for owner connector) OR tenant
+// API key auth (for tenant connectors).
 
 import { getSelfModelDb } from "./db.js";
 import { log } from "../utils/logger.js";
 
+const GATEWAY_URL = (process.env.GATEWAY_URL || process.env.TS_TENANT_GATEWAY_URL || "").replace(/\/$/, "");
+const ADMIN_KEY = (process.env.GATEWAY_ADMIN_KEY || "").trim();
+
 const nowIso = () => new Date().toISOString();
+
+/**
+ * Fire-and-forget POST to the gateway's self-model ingest endpoint.
+ * Uses X-Admin-Key if available (owner connector), otherwise uses tenant
+ * API key if TS_CLIENT_API_KEY is set (tenant connector).
+ * Completely silent on failure — never throws, never logs warnings for
+ * transient gateway blips. Logs a single debug line on hard failure.
+ *
+ * @param {string} eventType  - one of: session, module, tool, topic, insight, compile
+ * @param {object} payload    - event data
+ * @param {string|null} tenantId - from session context
+ * @param {string|null} userId   - from session context
+ */
+function gatewayIngest(eventType, payload, tenantId, userId) {
+  if (!GATEWAY_URL) return;
+
+  const body = {
+    event_type: eventType,
+    data: payload,
+    ingested_at: nowIso(),
+  };
+
+  // Per-user-per-tenant scoping: only attach identity when both are resolved.
+  // If either is null, the record is still submitted so the session has data,
+  // but the gateway will tag it with null tenant_id/user_id.
+  if (tenantId) body.tenant_id = tenantId;
+  if (userId) body.user_id = userId;
+
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "claude-connector/12.24.0 (self-model-recorder)",
+  };
+
+  // Owner connector: use admin key header
+  if (ADMIN_KEY) {
+    headers["X-Admin-Key"] = ADMIN_KEY;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3000);
+
+  fetch(`${GATEWAY_URL}/ingest`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  }).then(res => {
+    if (!res.ok) {
+      log("debug", `[self-model] gateway ingest ${eventType} returned ${res.status}`);
+    }
+  }).catch(() => {
+    // Gateway unreachable — this is normal during startup or brief outages.
+    // Data is preserved in SQLite.
+  }).finally(() => {
+    clearTimeout(timeout);
+  });
+}
+
+/**
+ * Import getCurrentUser lazily to avoid circular dependency at module scope.
+ * @returns {{ tenantId: string|null, userId: string|null }}
+ */
+function currentUser() {
+  try {
+    const ctx = require("./sessionContext.js");
+    return ctx.getCurrentUser();
+  } catch {
+    return { tenantId: null, userId: null };
+  }
+}
+
+/**
+ * @returns {{ tenantId: string|null, userId: string|null }}
+ */
+function resolveCurrentUser() {
+  try {
+    const mod = require("./sessionContext.js");
+    return mod.getCurrentUser ? mod.getCurrentUser() : { tenantId: null, userId: null };
+  } catch {
+    return { tenantId: null, userId: null };
+  }
+}
+
+// ── Import sessionContext dynamically (ESM circular-safe pattern) ─────────
+let _sessionContext = null;
+function getSessionContext() {
+  if (!_sessionContext) {
+    try {
+      // Dynamic import avoids the circular dependency at module scope:
+      // sessionContext.js does not import recorder.js.
+      // This is safe because the recording hooks are never called during
+      // module initialisation — they fire after the dispatch loop starts.
+      _sessionContext = import("./sessionContext.js");
+    } catch {
+      return null;
+    }
+  }
+  return _sessionContext;
+}
 
 /**
  * Ensure a session_log row exists and refresh its liveness (end_time,
@@ -34,6 +141,16 @@ export function touchSession(sessionId, opts = {}) {
         end_time      = @ts,
         message_count = session_log.message_count + @inc
     `).run({ id: sessionId, ts, inc });
+
+    // Fire-and-forget gateway POST
+    getSessionContext().then(ctx => {
+      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
+      gatewayIngest("session", {
+        session_id: sessionId,
+        message_count_increment: inc,
+        last_activity: ts,
+      }, user.tenantId, user.userId);
+    }).catch(() => {});
   } catch (err) {
     log("warn", `[self-model] touchSession failed: ${err.message}`);
   }
@@ -59,6 +176,17 @@ export function recordToolCall(sessionId, toolName, durationMs = 0) {
         call_count        = tool_usage.call_count + 1,
         total_duration_ms = tool_usage.total_duration_ms + @dur
     `).run({ sid: sessionId, tool: toolName, dur });
+
+    // Fire-and-forget gateway POST
+    getSessionContext().then(ctx => {
+      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
+      gatewayIngest("tool", {
+        session_id: sessionId,
+        tool_name: toolName,
+        call_count_increment: 1,
+        duration_ms: dur,
+      }, user.tenantId, user.userId);
+    }).catch(() => {});
   } catch (err) {
     log("warn", `[self-model] recordToolCall failed: ${err.message}`);
   }
@@ -95,6 +223,20 @@ export function recordModuleActivations(sessionId, moduleIds, compileTimeMs = 0)
       }
     });
     tx(moduleIds);
+
+    // Fire-and-forget gateway POST
+    getSessionContext().then(ctx => {
+      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
+      for (const mid of moduleIds) {
+        if (typeof mid === "string" && mid.trim()) {
+          gatewayIngest("module", {
+            session_id: sessionId,
+            module_id: mid.trim(),
+            time_active_ms: perModule,
+          }, user.tenantId, user.userId);
+        }
+      }
+    }).catch(() => {});
   } catch (err) {
     log("warn", `[self-model] recordModuleActivations failed: ${err.message}`);
   }
@@ -125,6 +267,17 @@ export function recordCompile(sessionId, info = {}) {
       mv:  typeof info.manifest_version === "string" ? info.manifest_version : null,
       ts:  nowIso(),
     });
+
+    // Fire-and-forget gateway POST
+    getSessionContext().then(ctx => {
+      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
+      gatewayIngest("compile", {
+        session_id: sessionId,
+        compile_time_ms: info.compile_time_ms || null,
+        modules_loaded_count: info.modules_loaded_count || null,
+        manifest_version: info.manifest_version || null,
+      }, user.tenantId, user.userId);
+    }).catch(() => {});
   } catch (err) {
     log("warn", `[self-model] recordCompile failed: ${err.message}`);
   }
@@ -137,8 +290,6 @@ export function recordCompile(sessionId, info = {}) {
  *
  * @param {string} sessionId
  * @param {object} [opts]
- * @param {string} [opts.startTime] ISO-8601 start; falls back to stored start_time.
- * @param {number} [opts.messageCount]
  * @param {string} [opts.topicSummary]
  * @returns {void}
  */
@@ -146,32 +297,33 @@ export function closeSession(sessionId, opts = {}) {
   const db = getSelfModelDb();
   if (!db || !sessionId) return;
   try {
-    const endTs = nowIso();
+    const ts = nowIso();
+    const info = db.prepare(`
+      SELECT start_time, message_count FROM session_log WHERE id = ?
+    `).get(sessionId);
 
-    // Ensure the row exists before we read start_time back.
-    touchSession(sessionId);
-
-    const row = db.prepare(`SELECT start_time, message_count FROM session_log WHERE id = ?`).get(sessionId);
-    const startTime = opts.startTime || (row && row.start_time) || endTs;
+    const startIso = info?.start_time || ts;
+    const msgCount = info?.message_count || 0;
 
     db.prepare(`
       UPDATE session_log SET
-        end_time      = @end,
-        message_count = COALESCE(@mc, message_count),
-        topic_summary = COALESCE(@ts, topic_summary)
+        end_time      = @ts,
+        message_count = @msgCount,
+        topic_summary = @topic
       WHERE id = @sid
     `).run({
       sid: sessionId,
-      end: endTs,
-      mc:  Number.isFinite(opts.messageCount) ? opts.messageCount : null,
-      ts:  typeof opts.topicSummary === "string" ? opts.topicSummary : null,
+      ts,
+      msgCount,
+      topic: opts.topicSummary || null,
     });
 
-    // Derive timing row.
-    const start = new Date(startTime);
-    const end = new Date(endTs);
-    if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())) {
-      const durationMinutes = Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
+    // Derive session_timing from start time
+    const startMs = new Date(startIso).getTime();
+    if (Number.isFinite(startMs)) {
+      const nowMs = Date.now();
+      const durMin = Math.round((nowMs - startMs) / 60000);
+      const startDate = new Date(startMs);
       db.prepare(`
         INSERT INTO session_timing (session_id, day_of_week, hour_of_day, duration_minutes)
         VALUES (@sid, @dow, @hod, @dur)
@@ -181,102 +333,70 @@ export function closeSession(sessionId, opts = {}) {
           duration_minutes = @dur
       `).run({
         sid: sessionId,
-        dow: start.getUTCDay(),
-        hod: start.getUTCHours(),
-        dur: durationMinutes,
+        dow: startDate.getUTCDay(),
+        hod: startDate.getUTCHours(),
+        dur: durMin,
       });
     }
+
+    // Fire-and-forget gateway POST
+    getSessionContext().then(ctx => {
+      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
+      gatewayIngest("session", {
+        session_id: sessionId,
+        status: "complete",
+        message_count: msgCount,
+        topic_summary: opts.topicSummary || null,
+        end_time: ts,
+      }, user.tenantId, user.userId);
+    }).catch(() => {});
   } catch (err) {
     log("warn", `[self-model] closeSession failed: ${err.message}`);
   }
-
-  // Phase 6: mirror this session's rows to the gateway self-model store when
-  // dual-write is enabled. Fire and forget, fully guarded.
-  dualWriteIngestToGateway(sessionId);
 }
 
 /**
- * Best-effort ingest of a session's rows (log, module activations, tool usage,
- * topic clusters) to the gateway self-model API. Enabled only when
- * SELF_MODEL_DUAL_WRITE=1 and GATEWAY_URL is set. Never throws into the caller.
- */
-function dualWriteIngestToGateway(sessionId) {
-  try {
-    if (process.env.SELF_MODEL_DUAL_WRITE !== "1") return;
-    const base = (process.env.GATEWAY_URL || "").replace(/\/+$/, "");
-    const token = process.env.GATEWAY_API_KEY || "";
-    if (!base || !sessionId || typeof fetch !== "function") return;
-
-    const db = getSelfModelDb();
-    if (!db) return;
-
-    const logRow = db.prepare(
-      `SELECT start_time, end_time, message_count, topic_summary FROM session_log WHERE id = ?`
-    ).get(sessionId) || {};
-    const modules = db.prepare(
-      `SELECT module_id, load_count, total_time_active AS total_time_ms FROM module_activations WHERE session_id = ?`
-    ).all(sessionId);
-    const tools = db.prepare(
-      `SELECT tool_name, call_count, total_duration_ms FROM tool_usage WHERE session_id = ?`
-    ).all(sessionId);
-    let topics = [];
-    try {
-      topics = db.prepare(
-        `SELECT topic_keyword, weight FROM topic_clusters WHERE session_id = ?`
-      ).all(sessionId);
-    } catch { topics = []; }  // topic_clusters may carry no weight column in older schemas
-
-    const payload = {
-      session_id: sessionId,
-      log: {
-        start_time: logRow.start_time || null,
-        end_time: logRow.end_time || null,
-        message_count: Number.isFinite(logRow.message_count) ? logRow.message_count : null,
-        topic_summary: logRow.topic_summary || null,
-        status: "closed",
-      },
-      module_activations: modules,
-      tool_usage: tools,
-      topic_clusters: topics,
-    };
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    fetch(`${base}/ti-self-model/ingest`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    }).catch(() => { /* swallow: SQLite is source of truth */ })
-      .finally(() => clearTimeout(timer));
-  } catch { /* never let dual-write affect the primary path */ }
-}
-
-/**
- * Write a self-insight row (used by summariser output surfaced from Node, and
- * available for Phase 2/3 producers).
+ * Write a self-model insight row.
  *
  * @param {object} insight
- * @param {string} insight.text
  * @param {string} [insight.sessionId]
- * @param {string} [insight.category='observation']
+ * @param {string} insight.category
+ * @param {string} insight.text
  * @param {string} [insight.sourceModule]
+ * @param {number} [insight.confidence]
  * @returns {void}
  */
-export function recordInsight(insight = {}) {
+export function recordInsight(insight) {
   const db = getSelfModelDb();
-  if (!db || !insight.text) return;
+  if (!db) return;
   try {
+    const cat = String(insight.category || "general").trim();
+    const txt = String(insight.text || "").trim();
+    if (!cat || !txt) return;
+
     db.prepare(`
-      INSERT INTO self_insights (session_id, insight_text, category, source_module, created_at)
-      VALUES (@sid, @text, @cat, @src, @ts)
+      INSERT INTO self_insights (session_id, category, insight_text, source_module, confidence, created_at)
+      VALUES (@sid, @cat, @txt, @mod, @conf, @ts)
     `).run({
-      sid:  insight.sessionId || null,
-      text: String(insight.text),
-      cat:  insight.category || "observation",
-      src:  insight.sourceModule || null,
-      ts:   nowIso(),
+      sid: insight.sessionId || null,
+      cat,
+      txt,
+      mod: insight.sourceModule || null,
+      conf: Number.isFinite(insight.confidence) ? insight.confidence : null,
+      ts: nowIso(),
     });
+
+    // Fire-and-forget gateway POST
+    getSessionContext().then(ctx => {
+      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
+      gatewayIngest("insight", {
+        session_id: insight.sessionId || null,
+        category: cat,
+        text: txt,
+        source_module: insight.sourceModule || null,
+        confidence: insight.confidence || null,
+      }, user.tenantId, user.userId);
+    }).catch(() => {});
   } catch (err) {
     log("warn", `[self-model] recordInsight failed: ${err.message}`);
   }

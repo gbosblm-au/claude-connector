@@ -9,6 +9,10 @@
 //
 // The hook must never affect a tool call's success. It swallows all errors and
 // returns nothing.
+//
+// v12.24.0: On ts_gateway_session_init, extracts tenant_id and user_id from
+// the result payload and stores them via setCurrentUser(). All subsequent
+// recording calls carry the resolved identity for per-user-per-tenant scoping.
 
 import { isSelfModelEnabled } from "./db.js";
 import {
@@ -18,7 +22,7 @@ import {
   touchSession,
   closeSession,
 } from "./recorder.js";
-import { resolveSessionId, beginSession } from "./sessionContext.js";
+import { resolveSessionId, beginSession, setCurrentUser, getCurrentUser } from "./sessionContext.js";
 import { log } from "../utils/logger.js";
 
 /**
@@ -28,6 +32,23 @@ import { log } from "../utils/logger.js";
  * @returns {object|null}
  */
 function parseCompileResult(result) {
+  try {
+    const text = result?.content?.[0]?.text;
+    if (typeof text !== "string") return null;
+    const parsed = JSON.parse(text);
+    return (parsed && typeof parsed === "object") ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Best-effort extraction of the ts_gateway_session_init result payload.
+ * Returns the parsed JSON from content[0].text.
+ * @param {object} result
+ * @returns {object|null}
+ */
+function parseSessionInitResult(result) {
   try {
     const text = result?.content?.[0]?.text;
     if (typeof text !== "string") return null;
@@ -60,6 +81,17 @@ export function selfModelRecordToolCall(name, args, result, startedAt) {
       const explicit = (args && typeof args === "object" &&
         (args.session_id || args._session_id || args.sessionId)) || null;
       sessionId = beginSession(explicit || "").id;
+
+      // Extract tenant_id and user_id from the session init result
+      const payload = parseSessionInitResult(result);
+      if (payload) {
+        const tenantId = payload.tenant_id || payload.tenantId || null;
+        const userId = payload.user_id || payload.userId || null;
+        if (tenantId || userId) {
+          setCurrentUser(tenantId, userId);
+          log("info", `[self-model] Identity set: tenant=${tenantId}, user=${userId}`);
+        }
+      }
     } else {
       sessionId = resolveSessionId(args);
     }
@@ -109,3 +141,4 @@ export function selfModelCloseSession(opts = {}) {
     log("warn", `[self-model] close session hook error: ${err.message}`);
   }
 }
+
