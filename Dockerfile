@@ -98,24 +98,22 @@ WORKDIR /app
 # Pillow need cairo, pango, gdk-pixbuf, ffi), plus base and emoji fonts. These
 # are the glibc/apt equivalents of the former Alpine apk packages.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv \
+      python3 python3-pip python3-venv python-is-python3 \
       libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 \
       libffi8 shared-mime-info \
       fontconfig fonts-dejavu fonts-noto-color-emoji \
+      libreoffice-writer \
       wget ca-certificates \
     && mkdir -p /usr/share/fonts/custom \
     && wget -q -O /usr/share/fonts/custom/Raleway-Regular.ttf \
-       "https://fonts.gstatic.com/s/raleway/v34/1Ptxg8zYS_SKggPN4iEgvnHyvveLxVvao4CPNLA3JC9c.ttf" \
-    && fc-cache -f \
-    && rm -rf /var/lib/apt/lists/*
 
-# Python document-generation packages (Bookworm enforces PEP 668, so
+@@ -114,42 +113,42 @@
 # --break-system-packages is required, matching the previous image). reportlab
 # is included for Phase 5b's homework_assessment.py.
 RUN pip3 install --break-system-packages --retries 5 --timeout 120 \
-      python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint reportlab \
+      python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint reportlab PyMuPDF \
     && rm -rf /root/.cache/pip
-
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/fitz
 # Android SDK 34 (isolated stage). Remove these two lines to build a
 # document-only image without the mobile pipeline.
 ENV ANDROID_HOME=/opt/android-sdk
