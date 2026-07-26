@@ -941,7 +941,7 @@ function buildEffectiveToolList() {
 
 async function dispatchToolCall(name, args, context = null) {
   const _selfModelStartedAt = Date.now();
-  const result = await dispatchToolCallCore(name, args);
+  const result = await dispatchToolCallCore(name, args, context);
   // Fire-and-forget: the hook has its own try/catch, and this one is the
   // belt to its braces. A Neural Core problem must never surface as a tool
   // failure to the caller.
@@ -963,7 +963,7 @@ async function dispatchToolCall(name, args, context = null) {
   return result;
 }
 
-async function dispatchToolCallCore(name, args) {
+async function dispatchToolCallCore(name, args, context = null) {
       switch (name) {
         // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
         case "ts_gateway_session_init": return await handleTsGatewaySessionInit(args);
@@ -1116,9 +1116,9 @@ async function dispatchToolCallCore(name, args) {
         case "skill_rollback":          return await handleSkillRollback(args);
         case "skill_audit":             return await handleSkillAudit(args);
         // ---------- Modular Skill System (v11.0.0) ----------
-        case "skill_compile":           return await handleSkillCompile(args);
+        case "skill_compile":           return await handleSkillCompile(args, context);
         case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
-        case "skill_recompile":         return await handleSkillRecompile(args);
+        case "skill_recompile":         return await handleSkillRecompile(args, context);
         case "personality_write": {
           const _personalityResult = await handlePersonalityWrite(args);
           // Non-blocking WordPress gateway backup (tenant mode only).
@@ -1153,9 +1153,9 @@ async function dispatchToolCallCore(name, args) {
         case "script_execute":          return await handleScriptExecute(args);
 
         // ---------- Ava User Profiles (v10.8.0) ----------
-        case "profile_read":           return await handleProfileRead(args);
+        case "profile_read":           return await handleProfileRead(args, context);
         case "profile_write_person": {
-          const _profileResult = await handleProfileWritePerson(args);
+          const _profileResult = await handleProfileWritePerson(args, context);
           // Non-blocking WordPress gateway backup (tenant mode only).
           if (PROFILES_ENABLED && SKILL_BASE_DIR) {
             backupPersonalFileToGateway("PROFILES.md", `${SKILL_BASE_DIR}/PROFILES.md`)
@@ -1218,7 +1218,7 @@ const SYSTEM_WRITE_TOOLS = new Set([
 
 function createMcpServer(tenantContext) {
   const server = new Server(
-    { name: "claude-connector", version: "12.25.0" },
+    { name: "claude-connector", version: "12.26.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -1365,7 +1365,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "12.25.0",
+    version: "12.26.0",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],

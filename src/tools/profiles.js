@@ -64,6 +64,12 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { log } from '../utils/logger.js';
+import {
+  resolveSessionIdentity,
+  gatewayConfigured,
+  profileReadRemote,
+  profileWriteRemote,
+} from './ti-tools-client.js';
 
 // ---------------------------------------------------------------------------
 // Path helper
@@ -312,7 +318,12 @@ export const profileWritePersonToolDefinition = {
 // Handlers
 // ---------------------------------------------------------------------------
 
-export async function handleProfileRead(args) {
+// ---------------------------------------------------------------------------
+// Build the PROFILES.md (volume) read payload. Returns the payload object plus
+// helpers for the Postgres-primary wrapper: `hasData` and `seedContent` (the
+// specific person's section to seed into Postgres on a 404, when identifiable).
+// ---------------------------------------------------------------------------
+function readVolumePayload(args) {
   const { filePath } = getProfilesPaths();
   ensureDir(filePath);
 
@@ -321,22 +332,21 @@ export async function handleProfileRead(args) {
   if (!existsSync(filePath)) {
     log('info', 'profile_read: PROFILES.md does not exist yet');
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          content:      '',
-          persons:      [],
-          person_count: 0,
-          note: 'PROFILES.md does not exist on Railway volume. ' +
-                'Begin building a profile for this person from the current session. ' +
-                'Call profile_write_person at session close with the first profile entry.',
-        }, null, 2),
-      }],
+      payload: {
+        content:      '',
+        persons:      [],
+        person_count: 0,
+        note: 'PROFILES.md does not exist on Railway volume. ' +
+              'Begin building a profile for this person from the current session. ' +
+              'Call profile_write_person at session close with the first profile entry.',
+      },
+      hasData: false,
+      seedContent: null,
     };
   }
 
-  const content   = readFileSync(filePath, 'utf8');
-  const sections  = splitSections(content);
+  const content    = readFileSync(filePath, 'utf8');
+  const sections   = splitSections(content);
   const allPersons = extractPersonsList(sections);
 
   let lastUpdated = null;
@@ -345,7 +355,6 @@ export async function handleProfileRead(args) {
     lastUpdated = new Date(mtimeMs).toISOString();
   } catch { /* non-critical */ }
 
-  // If a specific person was requested, return only their section
   if (personNameFilter) {
     const personSection = sections.find(s => {
       const n = extractPersonName(s);
@@ -353,48 +362,122 @@ export async function handleProfileRead(args) {
     });
     if (!personSection) {
       return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            content:      null,
-            persons:      allPersons.map(p => p.name),
-            person_count: allPersons.length,
-            note:         `Person "${personNameFilter}" not found in PROFILES.md. ` +
-                          `Known persons: ${allPersons.map(p => p.name).join(', ') || 'none yet'}.`,
-          }, null, 2),
-        }],
+        payload: {
+          content:      null,
+          persons:      allPersons.map(p => p.name),
+          person_count: allPersons.length,
+          note:         `Person "${personNameFilter}" not found in PROFILES.md. ` +
+                        `Known persons: ${allPersons.map(p => p.name).join(', ') || 'none yet'}.`,
+        },
+        hasData: false,
+        seedContent: null,
       };
     }
     const person = allPersons.find(p => namesMatch(p.name, personNameFilter));
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          content:      personSection,
-          person:       person || null,
-          person_count: allPersons.length,
-          last_updated: lastUpdated,
-        }, null, 2),
-      }],
+      payload: {
+        content:      personSection,
+        person:       person || null,
+        person_count: allPersons.length,
+        last_updated: lastUpdated,
+      },
+      hasData: true,
+      seedContent: personSection,   // a single person's section -> safe to seed
     };
   }
 
-  // Full file return
   log('info', `profile_read: returned ${allPersons.length} person(s)`);
   return {
-    content: [{
-      type: 'text',
-      text: JSON.stringify({
-        content,
-        persons:      allPersons,
-        person_count: allPersons.length,
-        last_updated: lastUpdated,
-      }, null, 2),
-    }],
+    payload: {
+      content,
+      persons:      allPersons,
+      person_count: allPersons.length,
+      last_updated: lastUpdated,
+    },
+    hasData: allPersons.length > 0,
+    // Only a single-person file is safe to seed wholesale into one user's row.
+    seedContent: allPersons.length === 1 ? content : null,
   };
 }
 
-export async function handleProfileWritePerson(args) {
+function mcpText(payload, isError = false) {
+  const out = { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+  if (isError) out.isError = true;
+  return out;
+}
+
+/**
+ * profile_read -- Postgres-primary, PROFILES.md cache/fallback.
+ *
+ * @param {object} args     Tool args (may include person_name, tenant_id, user_id).
+ * @param {object} [context] Per-call { tenant_id, user_id } from the gateway.
+ */
+export async function handleProfileRead(args = {}, context = null) {
+  const volume = readVolumePayload(args);
+  const { tenantId, userId } = resolveSessionIdentity(context, args);
+
+  let profileSource = 'volume';
+  let postgres = null;
+
+  if (tenantId && userId && gatewayConfigured()) {
+    try {
+      const remote = await profileReadRemote(tenantId, userId);
+      if (remote.existing) {
+        postgres = {
+          content:    remote.content,
+          revision:   remote.revision,
+          updated_at: remote.updated_at,
+          source:     remote.source || null,
+        };
+        profileSource = 'postgres';
+      } else {
+        // 404: no Postgres profile yet. Seed from the volume when we can safely
+        // identify this user's single section, then serve the volume payload.
+        if (volume.seedContent) {
+          try {
+            await profileWriteRemote({
+              tenantId, userId, mode: 'replace',
+              content: volume.seedContent,
+              reason: 'seed from PROFILES.md on first read',
+              source: 'profile_sync',
+            });
+            log('info', `profile_read: seeded Postgres profile for tenant=${tenantId} user=${userId}`);
+          } catch (seedErr) {
+            log('warn', `profile_read: Postgres seed failed (non-fatal): ${seedErr.message}`);
+          }
+        }
+        profileSource = 'volume';
+      }
+    } catch (err) {
+      log('warn', `profile_read: gateway unavailable, using PROFILES.md: ${err.message}`);
+      profileSource = 'volume';
+    }
+  }
+
+  const payload = { ...volume.payload, profile_source: profileSource };
+  if (postgres) {
+    // Postgres is authoritative for the per-user personality content. Surface it
+    // alongside the (backward-compatible) volume-derived fields.
+    payload.personality_content    = postgres.content;
+    payload.personality_revision   = postgres.revision;
+    payload.personality_updated_at = postgres.updated_at;
+    payload.personality_source     = postgres.source;
+    payload.existing               = true;
+  }
+  return mcpText(payload);
+}
+
+/**
+ * profile_write_person -- Postgres-primary write, PROFILES.md cache/fallback.
+ *
+ * Writes the person's profile section to Postgres first (best-effort), then
+ * always writes the PROFILES.md cache and pushes to WordPress exactly as before.
+ * If Postgres is unreachable, the volume write still succeeds (graceful degrade).
+ *
+ * @param {object} args      Tool args (person_name, profile_content, change_note, ...).
+ * @param {object} [context] Per-call { tenant_id, user_id } from the gateway.
+ */
+export async function handleProfileWritePerson(args = {}, context = null) {
   const { filePath, wpUrl, wpKey } = getProfilesPaths();
   ensureDir(filePath);
 
@@ -402,43 +485,55 @@ export async function handleProfileWritePerson(args) {
   const profileContent = (args.profile_content || '').trim();
   const changeNote     = (args.change_note     || '').slice(0, 200);
 
-  if (!personName)     return { content: [{ type: 'text', text: JSON.stringify({ error: 'person_name is required.' }, null, 2) }], isError: true };
-  if (!profileContent) return { content: [{ type: 'text', text: JSON.stringify({ error: 'profile_content is required.' }, null, 2) }], isError: true };
+  if (!personName)     return mcpText({ error: 'person_name is required.' }, true);
+  if (!profileContent) return mcpText({ error: 'profile_content is required.' }, true);
 
   // Validate profile_content starts with the correct ## heading
   const headingRe = /^##\s+/m;
   if (!headingRe.test(profileContent)) {
-    return {
-      content: [{ type: 'text', text: JSON.stringify({
-        error: 'profile_content must start with "## [Person Name]". ' +
-               'Ensure the content begins with the person\'s ## heading.',
-      }, null, 2) }],
-      isError: true,
-    };
+    return mcpText({
+      error: 'profile_content must start with "## [Person Name]". ' +
+             'Ensure the content begins with the person\'s ## heading.',
+    }, true);
   }
 
   // Verify the ## heading in profile_content matches person_name
   const headingMatch = profileContent.match(/^##\s+(.+)$/m);
   const headingName  = headingMatch ? headingMatch[1].trim() : '';
   if (!namesMatch(headingName, personName)) {
-    return {
-      content: [{ type: 'text', text: JSON.stringify({
-        error: `person_name "${personName}" does not match the ## heading "${headingName}" in profile_content. ` +
-               'These must match exactly (case-insensitive).',
-      }, null, 2) }],
-      isError: true,
-    };
+    return mcpText({
+      error: `person_name "${personName}" does not match the ## heading "${headingName}" in profile_content. ` +
+             'These must match exactly (case-insensitive).',
+    }, true);
   }
 
-  // Read existing file or initialise
-  const existing = existsSync(filePath) ? readFileSync(filePath, 'utf8') : PROFILES_HEADER;
-  const sections  = splitSections(existing);
+  // --- Postgres primary write (best-effort) --------------------------------
+  const { tenantId, userId } = resolveSessionIdentity(context, args);
+  let postgres = { attempted: false };
+  if (tenantId && userId && gatewayConfigured()) {
+    postgres = { attempted: true, ok: false };
+    try {
+      const res = await profileWriteRemote({
+        tenantId, userId, mode: 'replace',
+        content: profileContent,
+        reason: changeNote || 'profile_write_person',
+        source: 'ai_auto',
+      });
+      postgres = { attempted: true, ok: true, changed: res.changed === true, revision: res.revision };
+      log('info', `profile_write_person: Postgres write ok (user=${userId}, changed=${postgres.changed}, rev=${postgres.revision}).`);
+    } catch (err) {
+      postgres = { attempted: true, ok: false, error: err.message };
+      log('warn', `profile_write_person: Postgres write failed, PROFILES.md fallback only: ${err.message}`);
+    }
+  }
 
-  // Separate header from person sections
-  const headerSection = sections.find(s => !extractPersonName(s)) || PROFILES_HEADER.trim();
+  // --- PROFILES.md cache write (always; also the fallback store) ------------
+  const existing = existsSync(filePath) ? readFileSync(filePath, 'utf8') : PROFILES_HEADER;
+  const sections = splitSections(existing);
+
+  const headerSection  = sections.find(s => !extractPersonName(s)) || PROFILES_HEADER.trim();
   const personSections = sections.filter(s => extractPersonName(s) !== null);
 
-  // Find if person already exists
   const existingIdx = personSections.findIndex(s => {
     const n = extractPersonName(s);
     return n && namesMatch(n, personName);
@@ -446,23 +541,20 @@ export async function handleProfileWritePerson(args) {
 
   let isNew = false;
   if (existingIdx >= 0) {
-    // Replace existing section
     personSections[existingIdx] = profileContent;
   } else {
-    // Append new person section
     personSections.push(profileContent);
     isNew = true;
   }
 
-  // Rebuild file: header + all person sections
-  const allSections   = [headerSection, ...personSections];
+  const allSections    = [headerSection, ...personSections];
   const updatedContent = joinSections(allSections);
-
   writeFileSync(filePath, updatedContent, 'utf8');
 
   const personCount = personSections.length;
+  const primaryStore = postgres.ok ? 'postgres' : 'volume';
 
-  log('info', `profile_write_person: ${isNew ? 'created' : 'updated'} profile for "${personName}" (${personCount} total person(s)) - ${changeNote}`);
+  log('info', `profile_write_person: ${isNew ? 'created' : 'updated'} "${personName}" (${personCount} person(s)) primary=${primaryStore} - ${changeNote}`);
 
   // Non-blocking WordPress push
   let wpResult = { skipped: true };
@@ -473,17 +565,14 @@ export async function handleProfileWritePerson(args) {
     log('warn', `profile_write_person: WP push failed: ${err.message}`);
   }
 
-  return {
-    content: [{
-      type: 'text',
-      text: JSON.stringify({
-        success:           true,
-        person_name:       personName,
-        operation:         isNew ? 'created' : 'updated',
-        person_count:      personCount,
-        change_note:       changeNote,
-        wordpress_backup:  formatWpResult(wpResult),
-      }, null, 2),
-    }],
-  };
+  return mcpText({
+    success:          true,
+    person_name:      personName,
+    operation:        isNew ? 'created' : 'updated',
+    person_count:     personCount,
+    change_note:      changeNote,
+    primary_store:    primaryStore,
+    postgres,
+    wordpress_backup: formatWpResult(wpResult),
+  });
 }

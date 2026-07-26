@@ -37,6 +37,11 @@ import {
 } from 'node:fs';
 import { log } from '../utils/logger.js';
 import { loadMergedManifest } from './manifest-fragments.js';
+import {
+  resolveSessionIdentity,
+  gatewayConfigured,
+  moduleFrequencyRemote,
+} from './ti-tools-client.js';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -179,6 +184,27 @@ function parseModuleFrequency(profilesContent, personName) {
   return rows.length > 0 ? { rows, sessions_total: maxTotal } : null;
 }
 
+// Shared qualification: turn a parsed module-frequency table into a prior.
+// Used by both the PROFILES.md path (personPriorLayer) and the Postgres path
+// (resolvePersonPrior), so both apply identical threshold/min-session gating.
+function buildPriorFromParsed(parsed, priorConfig, personName = '') {
+  const noop = { boostSet: new Set(), priorModules: [], active: false };
+  if (!parsed || !Array.isArray(parsed.rows) || parsed.rows.length === 0) return noop;
+
+  const threshold   = (typeof priorConfig?.frequency_threshold      === 'number') ? priorConfig.frequency_threshold      : 0.6;
+  const maxModules  = (typeof priorConfig?.max_prior_modules         === 'number') ? priorConfig.max_prior_modules         : 12;
+  const minSessions = (typeof priorConfig?.min_sessions_before_prior === 'number') ? priorConfig.min_sessions_before_prior : 3;
+
+  if ((parsed.sessions_total || 0) < minSessions) {
+    log('info', `skill-modular: person prior: sessions=${parsed.sessions_total} < min=${minSessions} - suppressed`);
+    return noop;
+  }
+  const qualified    = parsed.rows.filter(r => r.frequency >= threshold).sort((a, b) => b.frequency - a.frequency).slice(0, maxModules);
+  const priorModules = qualified.map(r => r.module_id);
+  log('info', `skill-modular: person prior for "${personName}": ${priorModules.length} modules (threshold=${threshold}, sessions=${parsed.sessions_total})`);
+  return { boostSet: new Set(priorModules), priorModules, active: priorModules.length > 0 };
+}
+
 function personPriorLayer(profilesFile, personName, priorConfig) {
   const noop = { boostSet: new Set(), priorModules: [], active: false };
   if (!personName) return noop;
@@ -186,9 +212,6 @@ function personPriorLayer(profilesFile, personName, priorConfig) {
     log('info', 'skill-modular: person prior: disabled via config');
     return noop;
   }
-  const threshold   = (typeof priorConfig?.frequency_threshold      === 'number') ? priorConfig.frequency_threshold      : 0.6;
-  const maxModules  = (typeof priorConfig?.max_prior_modules         === 'number') ? priorConfig.max_prior_modules         : 12;
-  const minSessions = (typeof priorConfig?.min_sessions_before_prior === 'number') ? priorConfig.min_sessions_before_prior : 3;
   let profilesContent = null;
   try { if (existsSync(profilesFile)) profilesContent = readFileSync(profilesFile, 'utf8'); }
   catch (err) { log('warn', `skill-modular: person prior: cannot read profiles: ${err.message}`); return noop; }
@@ -201,14 +224,52 @@ function personPriorLayer(profilesFile, personName, priorConfig) {
     log('info', `skill-modular: person prior: no module_frequency for "${personName}" - Layer 0 no-op`);
     return noop;
   }
-  if (parsed.sessions_total < minSessions) {
-    log('info', `skill-modular: person prior: sessions=${parsed.sessions_total} < min=${minSessions} - suppressed`);
+  return buildPriorFromParsed(parsed, priorConfig, personName);
+}
+
+/**
+ * Resolve the person prior (Layer 0), Postgres-primary with PROFILES.md
+ * fallback. When identity is resolvable and the gateway is reachable, module
+ * frequency comes from self_model via /ti-tools/module-frequency. On empty data,
+ * error, unreachable gateway, or missing identity, falls back to the PROFILES.md
+ * module_frequency table exactly as before.
+ *
+ * @returns {Promise<{boostSet:Set, priorModules:string[], active:boolean, source:string}>}
+ */
+async function resolvePersonPrior(paths, personName, priorConfig, identity) {
+  const noop = { boostSet: new Set(), priorModules: [], active: false, source: 'none' };
+  if (!personName) return noop;
+  if (priorConfig && priorConfig.enabled === false) {
+    log('info', 'skill-modular: person prior: disabled via config');
     return noop;
   }
-  const qualified    = parsed.rows.filter(r => r.frequency >= threshold).sort((a,b) => b.frequency - a.frequency).slice(0, maxModules);
-  const priorModules = qualified.map(r => r.module_id);
-  log('info', `skill-modular: person prior for "${personName}": ${priorModules.length} modules (threshold=${threshold}, sessions=${parsed.sessions_total})`);
-  return { boostSet: new Set(priorModules), priorModules, active: priorModules.length > 0 };
+
+  if (identity && identity.tenantId && identity.userId && gatewayConfigured()) {
+    try {
+      const rows = await moduleFrequencyRemote(identity.tenantId, identity.userId);
+      if (Array.isArray(rows) && rows.length > 0) {
+        const sessions_total = rows[0]?.sessions_total || Math.max(0, ...rows.map(r => r.sessions_total || 0));
+        const parsed = {
+          rows: rows.map(r => ({
+            module_id:       r.module_id,
+            frequency:       r.frequency,
+            sessions_active: r.sessions_active,
+            sessions_total:  r.sessions_total,
+          })),
+          sessions_total,
+        };
+        const prior = buildPriorFromParsed(parsed, priorConfig, personName);
+        log('info', `skill-modular: person prior source=postgres for "${personName}" (sessions=${sessions_total}).`);
+        return { ...prior, source: 'postgres' };
+      }
+      log('info', `skill-modular: person prior: no Postgres module-frequency for "${personName}" - falling back to PROFILES.md`);
+    } catch (err) {
+      log('warn', `skill-modular: person prior: Postgres module-frequency failed, using PROFILES.md: ${err.message}`);
+    }
+  }
+
+  const prior = personPriorLayer(paths.profilesFile, personName, priorConfig);
+  return { ...prior, source: 'volume' };
 }
 
 function checkPriorOverride(priorConfig, priorModules, layer1Scores) {
@@ -830,7 +891,7 @@ export const dispatchRuleAddToolDefinition = {
 // Handlers
 // ---------------------------------------------------------------------------
 
-export async function handleSkillCompile(args) {
+export async function handleSkillCompile(args, context = null) {
   const paths = getModularPaths();
 
   if (!existsSync(paths.avaDir)) {
@@ -858,9 +919,10 @@ export async function handleSkillCompile(args) {
   const priorEnvEnabled  = process.env.AVA_PERSON_PRIOR_ENABLED !== 'false';
   const dispatchRulesRaw = readJsonFile(paths.dispatchRulesFile, {});
   const priorConfig      = dispatchRulesRaw.person_prior_config || {};
+  const identity         = resolveSessionIdentity(context, args);
   const personPrior      = (priorEnvEnabled && personName)
-    ? personPriorLayer(paths.profilesFile, personName, priorConfig)
-    : { boostSet: new Set(), priorModules: [], active: false };
+    ? await resolvePersonPrior(paths, personName, priorConfig, identity)
+    : { boostSet: new Set(), priorModules: [], active: false, source: 'none' };
 
   if (!priorEnvEnabled) log('info', 'skill_compile: AVA_PERSON_PRIOR_ENABLED=false - Layer 0 skipped');
 
@@ -1201,7 +1263,7 @@ export const skillRecompileToolDefinition = {
   },
 };
 
-export async function handleSkillRecompile(args) {
+export async function handleSkillRecompile(args, context = null) {
   const paths = getModularPaths();
 
   if (!existsSync(paths.coreFile) || !existsSync(paths.manifestFile)) {
@@ -1233,9 +1295,10 @@ export async function handleSkillRecompile(args) {
   const priorEnvEnabled  = process.env.AVA_PERSON_PRIOR_ENABLED !== 'false';
   const dispatchRulesRaw = readJsonFile(paths.dispatchRulesFile, {});
   const priorConfig      = dispatchRulesRaw.person_prior_config || {};
+  const identity         = resolveSessionIdentity(context, args);
   const personPrior      = (priorEnvEnabled && personName)
-    ? personPriorLayer(paths.profilesFile, personName, priorConfig)
-    : { boostSet: new Set(), priorModules: [], active: false };
+    ? await resolvePersonPrior(paths, personName, priorConfig, identity)
+    : { boostSet: new Set(), priorModules: [], active: false, source: 'none' };
 
   let result;
   try {
