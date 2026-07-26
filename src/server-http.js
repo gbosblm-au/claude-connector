@@ -939,7 +939,7 @@ function buildEffectiveToolList() {
   return [...byName.values()];
 }
 
-async function dispatchToolCall(name, args) {
+async function dispatchToolCall(name, args, context = null) {
   const _selfModelStartedAt = Date.now();
   const result = await dispatchToolCallCore(name, args);
   // Fire-and-forget: the hook has its own try/catch, and this one is the
@@ -952,8 +952,11 @@ async function dispatchToolCall(name, args) {
   }
   // Self-Model Interrogation (Phase 1): record module_activations and tool_usage
   // after every turn. Fully guarded; can never surface as a tool failure.
+  // `context` (when present) carries the caller's per-call {tenant_id, user_id}
+  // so records are scoped per-user-per-tenant. It is null for direct MCP calls,
+  // in which case the hook falls back to session context.
   try {
-    selfModelRecordToolCall(name, args, result, _selfModelStartedAt);
+    selfModelRecordToolCall(name, args, result, _selfModelStartedAt, context);
   } catch (hookErr) {
     log("warn", `self_model hook error after ${name}: ${hookErr.message}`);
   }
@@ -1215,7 +1218,7 @@ const SYSTEM_WRITE_TOOLS = new Set([
 
 function createMcpServer(tenantContext) {
   const server = new Server(
-    { name: "claude-connector", version: "12.8.2" },
+    { name: "claude-connector", version: "12.25.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -1362,7 +1365,7 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "12.8.1",
+    version: "12.25.0",
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -2554,7 +2557,7 @@ app.post("/tool-call", async (req, res) => {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
   }
 
-  const { tool_name, tool_input } = req.body || {};
+  const { tool_name, tool_input, context } = req.body || {};
 
   if (!tool_name || typeof tool_name !== "string" || !tool_name.trim()) {
     return res.status(400).json({ error: "tool_name is required and must be a non-empty string." });
@@ -2563,7 +2566,9 @@ app.post("/tool-call", async (req, res) => {
   log("info", `[/tool-call] dispatching: ${tool_name}`);
 
   try {
-    const mcpResult = await dispatchToolCall(tool_name.trim(), tool_input || {});
+    // `context` (when the gateway supplies it) carries { tenant_id, user_id }
+    // for the session so the self-model recorder attributes this call correctly.
+    const mcpResult = await dispatchToolCall(tool_name.trim(), tool_input || {}, context || null);
 
     // Extract the primary text content from the MCP result.
     // Most tools return a single text block; we join multiples with newlines.

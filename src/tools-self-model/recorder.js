@@ -6,10 +6,15 @@
 // of these functions throw, so they are safe to call from fire-and-forget hooks
 // on the hot path of a tool call.
 //
-// v12.24.0: All gateway POSTs now include tenant_id and user_id from
-// session context so self-model records are scoped per-user per-tenant.
-// Gateway endpoint uses X-Admin-Key auth (for owner connector) OR tenant
-// API key auth (for tenant connectors).
+// v12.25.0: Identity (tenant_id, user_id) is now passed in explicitly by the
+// caller (the self-model hook resolves it from the gateway-supplied per-call
+// context, falling back to the process session context). This removes the two
+// previous defects:
+//   1. The async dynamic import() of sessionContext, which raced the write and
+//      often resolved after the POST was already sent with null identity.
+//   2. The process.env.TENANT_ID / process.env.USER_ID hardcode fallbacks,
+//      which are wrong for a multi-user connector and were explicitly rejected.
+// The local SQLite writes are unchanged; identity only scopes the gateway POST.
 
 import { getSelfModelDb } from "./db.js";
 import { log } from "../utils/logger.js";
@@ -20,38 +25,57 @@ const ADMIN_KEY = (process.env.GATEWAY_ADMIN_KEY || "").trim();
 const nowIso = () => new Date().toISOString();
 
 /**
- * Fire-and-forget POST to the gateway's self-model ingest endpoint.
- * Uses X-Admin-Key if available (owner connector), otherwise uses tenant
- * API key if TS_CLIENT_API_KEY is set (tenant connector).
- * Completely silent on failure — never throws, never logs warnings for
- * transient gateway blips. Logs a single debug line on hard failure.
+ * Normalise a caller-supplied identity object to { tenantId, userId } with
+ * null defaults. Accepts either shape ({tenantId,userId} or {tenant_id,user_id})
+ * so it is tolerant of both the hook's output and any direct caller.
  *
- * @param {string} eventType  - one of: session, module, tool, topic, insight, compile
- * @param {object} payload    - event data
- * @param {string|null} tenantId - from session context
- * @param {string|null} userId   - from session context
+ * @param {object|null|undefined} identity
+ * @returns {{ tenantId: string|null, userId: string|null }}
  */
-function gatewayIngest(eventType, payload, tenantId, userId) {
+function normaliseIdentity(identity) {
+  if (!identity || typeof identity !== "object") return { tenantId: null, userId: null };
+  const t = identity.tenantId ?? identity.tenant_id ?? null;
+  const u = identity.userId ?? identity.user_id ?? null;
+  return {
+    tenantId: (t !== null && t !== undefined && String(t).trim() !== "") ? String(t).trim() : null,
+    userId:   (u !== null && u !== undefined && String(u).trim() !== "") ? String(u).trim() : null,
+  };
+}
+
+/**
+ * Fire-and-forget POST to the gateway's self-model ingest endpoint.
+ * Sends the tenant_id and user_id exactly as resolved for this call. When the
+ * identity is unknown (null), the fields are sent as null and the gateway
+ * records the row with null scope rather than guessing — the connector never
+ * fabricates or hardcodes an identity.
+ *
+ * Completely silent on failure: never throws, and only logs a debug line on a
+ * non-OK response. The local SQLite copy is the durable buffer.
+ *
+ * @param {string} eventType  One of: session, module, tool, topic, insight, compile.
+ * @param {object} payload    Event data.
+ * @param {{tenantId: string|null, userId: string|null}} identity  Resolved identity.
+ */
+function gatewayIngest(eventType, payload, identity) {
   if (!GATEWAY_URL) return;
+
+  const { tenantId, userId } = normaliseIdentity(identity);
 
   const body = {
     event_type: eventType,
     data: payload,
     ingested_at: nowIso(),
+    tenant_id: tenantId,
+    user_id: userId,
   };
-
-  // Per-user-per-tenant scoping: only attach identity when both are resolved.
-  // If either is null, the record is still submitted so the session has data,
-  // but the gateway will tag it with null tenant_id/user_id.
-  if (tenantId) body.tenant_id = tenantId;
-  if (userId) body.user_id = userId;
 
   const headers = {
     "Content-Type": "application/json",
-    "User-Agent": "claude-connector/12.24.0 (self-model-recorder)",
+    "User-Agent": "claude-connector/12.25.0 (self-model-recorder)",
   };
 
-  // Owner connector: use admin key header
+  // Owner connector authenticates the ingest with the shared admin key. The
+  // per-record identity is carried in the body (above), independent of auth.
   if (ADMIN_KEY) {
     headers["X-Admin-Key"] = ADMIN_KEY;
   }
@@ -69,53 +93,11 @@ function gatewayIngest(eventType, payload, tenantId, userId) {
       log("debug", `[self-model] gateway ingest ${eventType} returned ${res.status}`);
     }
   }).catch(() => {
-    // Gateway unreachable — this is normal during startup or brief outages.
-    // Data is preserved in SQLite.
+    // Gateway unreachable — normal during startup or brief outages. Data is
+    // preserved in SQLite.
   }).finally(() => {
     clearTimeout(timeout);
   });
-}
-
-/**
- * Import getCurrentUser lazily to avoid circular dependency at module scope.
- * @returns {{ tenantId: string|null, userId: string|null }}
- */
-function currentUser() {
-  try {
-    const ctx = require("./sessionContext.js");
-    return ctx.getCurrentUser();
-  } catch {
-    return { tenantId: null, userId: null };
-  }
-}
-
-/**
- * @returns {{ tenantId: string|null, userId: string|null }}
- */
-function resolveCurrentUser() {
-  try {
-    const mod = require("./sessionContext.js");
-    return mod.getCurrentUser ? mod.getCurrentUser() : { tenantId: null, userId: null };
-  } catch {
-    return { tenantId: null, userId: null };
-  }
-}
-
-// ── Import sessionContext dynamically (ESM circular-safe pattern) ─────────
-let _sessionContext = null;
-function getSessionContext() {
-  if (!_sessionContext) {
-    try {
-      // Dynamic import avoids the circular dependency at module scope:
-      // sessionContext.js does not import recorder.js.
-      // This is safe because the recording hooks are never called during
-      // module initialisation — they fire after the dispatch loop starts.
-      _sessionContext = import("./sessionContext.js");
-    } catch {
-      return null;
-    }
-  }
-  return _sessionContext;
 }
 
 /**
@@ -126,6 +108,7 @@ function getSessionContext() {
  * @param {string} sessionId
  * @param {object} [opts]
  * @param {boolean} [opts.incrementMessage=false] Count this event as a turn.
+ * @param {{tenantId,userId}} [opts.identity] Resolved identity for the gateway POST.
  * @returns {void}
  */
 export function touchSession(sessionId, opts = {}) {
@@ -142,15 +125,11 @@ export function touchSession(sessionId, opts = {}) {
         message_count = session_log.message_count + @inc
     `).run({ id: sessionId, ts, inc });
 
-    // Fire-and-forget gateway POST
-    getSessionContext().then(ctx => {
-      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
-      gatewayIngest("session", {
-        session_id: sessionId,
-        message_count_increment: inc,
-        last_activity: ts,
-      }, user.tenantId, user.userId);
-    }).catch(() => {});
+    gatewayIngest("session", {
+      session_id: sessionId,
+      message_count_increment: inc,
+      last_activity: ts,
+    }, opts.identity);
   } catch (err) {
     log("warn", `[self-model] touchSession failed: ${err.message}`);
   }
@@ -162,9 +141,10 @@ export function touchSession(sessionId, opts = {}) {
  * @param {string} sessionId
  * @param {string} toolName
  * @param {number} [durationMs=0]
+ * @param {{tenantId,userId}} [identity]
  * @returns {void}
  */
-export function recordToolCall(sessionId, toolName, durationMs = 0) {
+export function recordToolCall(sessionId, toolName, durationMs = 0, identity = null) {
   const db = getSelfModelDb();
   if (!db || !sessionId || !toolName) return;
   try {
@@ -177,16 +157,12 @@ export function recordToolCall(sessionId, toolName, durationMs = 0) {
         total_duration_ms = tool_usage.total_duration_ms + @dur
     `).run({ sid: sessionId, tool: toolName, dur });
 
-    // Fire-and-forget gateway POST
-    getSessionContext().then(ctx => {
-      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
-      gatewayIngest("tool", {
-        session_id: sessionId,
-        tool_name: toolName,
-        call_count_increment: 1,
-        duration_ms: dur,
-      }, user.tenantId, user.userId);
-    }).catch(() => {});
+    gatewayIngest("tool", {
+      session_id: sessionId,
+      tool_name: toolName,
+      call_count_increment: 1,
+      duration_ms: dur,
+    }, identity);
   } catch (err) {
     log("warn", `[self-model] recordToolCall failed: ${err.message}`);
   }
@@ -199,9 +175,10 @@ export function recordToolCall(sessionId, toolName, durationMs = 0) {
  * @param {string} sessionId
  * @param {string[]} moduleIds
  * @param {number} [compileTimeMs=0] Total compile time to attribute across modules.
+ * @param {{tenantId,userId}} [identity]
  * @returns {void}
  */
-export function recordModuleActivations(sessionId, moduleIds, compileTimeMs = 0) {
+export function recordModuleActivations(sessionId, moduleIds, compileTimeMs = 0, identity = null) {
   const db = getSelfModelDb();
   if (!db || !sessionId || !Array.isArray(moduleIds) || moduleIds.length === 0) return;
   try {
@@ -224,19 +201,15 @@ export function recordModuleActivations(sessionId, moduleIds, compileTimeMs = 0)
     });
     tx(moduleIds);
 
-    // Fire-and-forget gateway POST
-    getSessionContext().then(ctx => {
-      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
-      for (const mid of moduleIds) {
-        if (typeof mid === "string" && mid.trim()) {
-          gatewayIngest("module", {
-            session_id: sessionId,
-            module_id: mid.trim(),
-            time_active_ms: perModule,
-          }, user.tenantId, user.userId);
-        }
+    for (const mid of moduleIds) {
+      if (typeof mid === "string" && mid.trim()) {
+        gatewayIngest("module", {
+          session_id: sessionId,
+          module_id: mid.trim(),
+          time_active_ms: perModule,
+        }, identity);
       }
-    }).catch(() => {});
+    }
   } catch (err) {
     log("warn", `[self-model] recordModuleActivations failed: ${err.message}`);
   }
@@ -250,9 +223,10 @@ export function recordModuleActivations(sessionId, moduleIds, compileTimeMs = 0)
  * @param {number} [info.compile_time_ms]
  * @param {number} [info.modules_loaded_count]
  * @param {string} [info.manifest_version]
+ * @param {{tenantId,userId}} [identity]
  * @returns {void}
  */
-export function recordCompile(sessionId, info = {}) {
+export function recordCompile(sessionId, info = {}, identity = null) {
   const db = getSelfModelDb();
   if (!db || !sessionId) return;
   try {
@@ -268,16 +242,12 @@ export function recordCompile(sessionId, info = {}) {
       ts:  nowIso(),
     });
 
-    // Fire-and-forget gateway POST
-    getSessionContext().then(ctx => {
-      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
-      gatewayIngest("compile", {
-        session_id: sessionId,
-        compile_time_ms: info.compile_time_ms || null,
-        modules_loaded_count: info.modules_loaded_count || null,
-        manifest_version: info.manifest_version || null,
-      }, user.tenantId, user.userId);
-    }).catch(() => {});
+    gatewayIngest("compile", {
+      session_id: sessionId,
+      compile_time_ms: info.compile_time_ms || null,
+      modules_loaded_count: info.modules_loaded_count || null,
+      manifest_version: info.manifest_version || null,
+    }, identity);
   } catch (err) {
     log("warn", `[self-model] recordCompile failed: ${err.message}`);
   }
@@ -291,6 +261,7 @@ export function recordCompile(sessionId, info = {}) {
  * @param {string} sessionId
  * @param {object} [opts]
  * @param {string} [opts.topicSummary]
+ * @param {{tenantId,userId}} [opts.identity]
  * @returns {void}
  */
 export function closeSession(sessionId, opts = {}) {
@@ -339,17 +310,13 @@ export function closeSession(sessionId, opts = {}) {
       });
     }
 
-    // Fire-and-forget gateway POST
-    getSessionContext().then(ctx => {
-      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
-      gatewayIngest("session", {
-        session_id: sessionId,
-        status: "complete",
-        message_count: msgCount,
-        topic_summary: opts.topicSummary || null,
-        end_time: ts,
-      }, user.tenantId, user.userId);
-    }).catch(() => {});
+    gatewayIngest("session", {
+      session_id: sessionId,
+      status: "complete",
+      message_count: msgCount,
+      topic_summary: opts.topicSummary || null,
+      end_time: ts,
+    }, opts.identity);
   } catch (err) {
     log("warn", `[self-model] closeSession failed: ${err.message}`);
   }
@@ -364,9 +331,10 @@ export function closeSession(sessionId, opts = {}) {
  * @param {string} insight.text
  * @param {string} [insight.sourceModule]
  * @param {number} [insight.confidence]
+ * @param {{tenantId,userId}} [identity]
  * @returns {void}
  */
-export function recordInsight(insight) {
+export function recordInsight(insight, identity = null) {
   const db = getSelfModelDb();
   if (!db) return;
   try {
@@ -386,17 +354,13 @@ export function recordInsight(insight) {
       ts: nowIso(),
     });
 
-    // Fire-and-forget gateway POST
-    getSessionContext().then(ctx => {
-      const user = ctx ? ctx.getCurrentUser() : { tenantId: null, userId: null };
-      gatewayIngest("insight", {
-        session_id: insight.sessionId || null,
-        category: cat,
-        text: txt,
-        source_module: insight.sourceModule || null,
-        confidence: insight.confidence || null,
-      }, user.tenantId, user.userId);
-    }).catch(() => {});
+    gatewayIngest("insight", {
+      session_id: insight.sessionId || null,
+      category: cat,
+      text: txt,
+      source_module: insight.sourceModule || null,
+      confidence: insight.confidence || null,
+    }, identity || insight.identity || null);
   } catch (err) {
     log("warn", `[self-model] recordInsight failed: ${err.message}`);
   }
