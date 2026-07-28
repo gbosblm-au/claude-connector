@@ -9,6 +9,7 @@
 import { log }           from '../utils/logger.js';
 import { getDeviceId,
          getDeviceName } from '../utils/deviceId.js';
+import { fetchRelationalPrinciples } from './ti-relational-principles-client.js';
 
 const CLIENT_MODE    = (process.env.TS_CLIENT_MODE       || 'owner').toLowerCase();
 const GATEWAY_URL    = (process.env.TS_TENANT_GATEWAY_URL || '').replace(/\/$/, '');
@@ -91,7 +92,7 @@ export async function handleTsGatewaySessionInit(args) {
           error:  `Gateway unreachable: ${netErr.message}`,
           status: 'gateway_unavailable',
           degraded_mode: true,
-          note: 'TrueSource infrastructure is unavailable. Continue with reduced capability: proceed with memory_get_session_context, profile_read, and skill_compile using the connector tools directly.',
+          note: 'Tenax infrastructure is unavailable. Continue with reduced capability: proceed with memory_get_session_context, profile_read, and skill_compile using the connector tools directly.',
         }, null, 2),
       }],
     };
@@ -130,18 +131,37 @@ export async function handleTsGatewaySessionInit(args) {
   const userId = data.user_id || null;
   const assistantName = data.assistant_name || 'Aria';
 
-  return {
+   // v12.26.0: Fetch relational principles for system prompt injection (position 2)
+  let relationalPrinciplesBlock = '';
+  let relationalPrinciplesCompressed = null;
+  try {
+    const rpData = await fetchRelationalPrinciples(data.tenant_id || tenantId, userId);
+    if (rpData && rpData.principles && rpData.principles.full_text) {
+      relationalPrinciplesBlock = rpData.principles.full_text;
+      if (Array.isArray(rpData.not_principles) && rpData.not_principles.length) {
+        relationalPrinciplesBlock += '\n\n## What I Am Not\n\n' + rpData.not_principles.join('\n\n');
+      }
+      relationalPrinciplesCompressed = rpData.compressed || null;
+    }
+  } catch (e) {
+    log('warn', `[ts_gateway_session_init] relational principles fetch failed: ${e.message}`);
+  }
+
+   return {
     content: [{
       type: 'text',
       text: JSON.stringify({
         session_authenticated: true,
-        tenant_id:      data.tenant_id      || tenantId,
-        display_name:   data.display_name   || '',
-        tier:           data.tier           || 'operational',
-        user_id:        userId,
-        assistant_name: assistantName,
-        session_id:     data.session_id     || new Date().toISOString().replace(/[-T:]/g, '').slice(0, 15),
+        tenant_id:           data.tenant_id      || tenantId,
+        display_name:        data.display_name   || '',
+        tier:                data.tier           || 'operational',
+        user_id:             userId,
+        assistant_name:      assistantName,
+        session_id:          data.session_id     || new Date().toISOString().replace(/[-T:]/g, '').slice(0, 15),
+        relational_principles: relationalPrinciplesBlock || null,
+        relational_principles_compressed: relationalPrinciplesCompressed,
         next_steps: [
+          'Step 1: If relational_principles is present, inject it at position 2 of the system prompt (after TVRL, before skill content).',
           'Step 2: Call memory_get_session_context with a context_hint drawn from the opening message topic.',
           'Step 3: Call profile_read to identify the person you are speaking with.',
           'Step 4: Call skill_compile with query=opening_message, context_hint from Step 2, person_name from Step 3. This is required and non-deferrable. Do not respond to the user before skill_compile has completed.',
