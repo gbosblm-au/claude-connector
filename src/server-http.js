@@ -67,6 +67,15 @@ import {
   handleIssueFlag,
   handlePeerReviewConsent,
 } from './tools/healthLog.js';
+// TENAX-FEAT-DIFF-001: post-session knowledge-graph extraction + quality scoring.
+import {
+  knowledgeGraphExtractToolDefinition,
+  handleKnowledgeGraphExtract,
+} from './tools/knowledgeGraph.js';
+import {
+  qualityScoreSubmitToolDefinition,
+  handleQualityScoreSubmit,
+} from './tools/qualityScore.js';
 import {
   clientRegistryUpdateToolDefinition,
   clientCheckinToolDefinition,
@@ -662,6 +671,9 @@ const TOOLS = [
     healthLogWriteToolDefinition,
     issueFlagToolDefinition,
     peerReviewConsentToolDefinition,
+    // Post-session extraction + scoring (called at session close, after memory_write).
+    knowledgeGraphExtractToolDefinition,
+    qualityScoreSubmitToolDefinition,
   ] : []),
 
   // ---------- Peer Review: check-in tools (v12.5.0) ----------
@@ -1173,6 +1185,10 @@ async function dispatchToolCallCore(name, args, context = null) {
         case "health_log_write":         return await handleHealthLogWrite(args);
         case "issue_flag":               return await handleIssueFlag(args);
         case "peer_review_consent_set":  return await handlePeerReviewConsent(args);
+
+        // ---------- Post-session extraction + scoring (tenant mode) ----------
+        case "knowledge_graph_extract":  return await handleKnowledgeGraphExtract(args);
+        case "quality_score_submit":     return await handleQualityScoreSubmit(args);
 
         // ---------- Peer Review: check-in tools (v12.5.0 - owner mode) ----------
         case "client_registry_update":  return await handleClientRegistryUpdate(args);
