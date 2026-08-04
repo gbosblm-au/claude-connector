@@ -39,9 +39,62 @@ import {
   readdirSync,
   statSync,
 } from 'node:fs';
-import { join, basename, dirname } from 'node:path';
+import { join, basename, dirname, resolve, sep } from 'node:path';
 import { log } from '../utils/logger.js';
 import { deriveModuleEntry, writeModuleFragment } from './manifest-fragments.js';
+
+// ---------------------------------------------------------------------------
+// Typed validation error
+//
+// FIX 2: Validation failures (missing/wrong argument key, bad extension, path
+// traversal) are client-class errors, not server faults. Throwing a plain
+// Error caused them to escape uncaught to the dispatcher and surface as HTTP
+// 500. This typed error lets each handler recognise a validation failure and
+// convert it into a clean 400-shaped { error, code } result, while genuine
+// internal failures still propagate and surface as 500.
+// ---------------------------------------------------------------------------
+class ToolValidationError extends Error {
+  constructor(message, code = 'validation_error') {
+    super(message);
+    this.name = 'ToolValidationError';
+    this.code = code;
+    this.status = 400;
+  }
+}
+
+// FIX 1: Argument-key aliasing.
+//
+// The gateway /tools manifest historically advertised `path` for the write
+// tools before a rename to `filename`, so different call paths send `path`,
+// `filename`, or (for module_write) `file` for the same logical argument. A
+// single-key destructure receives `undefined` when the caller uses the other
+// key, the validator then throws "filename is required" / "path is required",
+// and the request fails. Resolving the first present string-valued key makes
+// the handlers accept whichever key the caller sends.
+function firstStringKey(args, ...keys) {
+  if (!args || typeof args !== 'object') return undefined;
+  for (const k of keys) {
+    const v = args[k];
+    if (typeof v === 'string' && v.trim() !== '') return v.trim();
+  }
+  return undefined;
+}
+
+// FIX 3: Content guard.
+//
+// The write handlers validated the path but never the body. Passing
+// `undefined` (another key-drift symptom, or an omitted argument) to
+// writeFileSync writes the literal string "undefined" as the entire file
+// content, silent data corruption that is worse than an error. This guard
+// rejects a missing, null, non-string, or empty body before any write. An
+// empty string is rejected to preserve module_write's original `!content`
+// behaviour and to keep the error message truthful.
+function requireContent(content) {
+  if (content === undefined || content === null || typeof content !== 'string' || content.length === 0) {
+    throw new ToolValidationError('content is required and must be a non-empty string');
+  }
+  return content;
+}
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -68,12 +121,12 @@ function ensureContentDirs(paths) {
 
 // Validate a flat filename (archive only — no directory components).
 function validateFilename(name) {
-  if (!name || typeof name !== 'string') throw new Error('filename is required');
+  if (!name || typeof name !== 'string') throw new ToolValidationError('filename is required');
   const clean = basename(name.trim());
-  if (!clean) throw new Error('filename resolves to empty after normalisation');
-  if (clean.startsWith('.')) throw new Error('hidden filenames not permitted');
-  if (!/^[a-zA-Z0-9_\-\.]+$/.test(clean)) throw new Error(`Invalid characters in filename "${clean}"`);
-  if (clean.length > 120) throw new Error('filename exceeds 120 characters');
+  if (!clean) throw new ToolValidationError('filename resolves to empty after normalisation');
+  if (clean.startsWith('.')) throw new ToolValidationError('hidden filenames not permitted');
+  if (!/^[a-zA-Z0-9_\-\.]+$/.test(clean)) throw new ToolValidationError(`Invalid characters in filename "${clean}"`);
+  if (clean.length > 120) throw new ToolValidationError('filename exceeds 120 characters');
   return clean;
 }
 
@@ -82,26 +135,26 @@ function validateFilename(name) {
 // "subdir/subdir2/filename.ext", "subdir/subdir2/subdir3/filename.ext".
 // No leading slash. No .. traversal. Alphanumeric + hyphens + underscores + dots only.
 function validateContentPath(rawPath, allowedExtensions) {
-  if (!rawPath || typeof rawPath !== 'string') throw new Error('path is required');
+  if (!rawPath || typeof rawPath !== 'string') throw new ToolValidationError('path is required');
   const clean = rawPath.trim().replace(/\\/g, '/').replace(/^\/+/, '');
-  if (!clean) throw new Error('path is empty');
-  if (clean.includes('..'))  throw new Error('Path traversal (..) not permitted');
-  if (clean.includes('//'))  throw new Error('Double slashes not permitted');
+  if (!clean) throw new ToolValidationError('path is empty');
+  if (clean.includes('..'))  throw new ToolValidationError('Path traversal (..) not permitted');
+  if (clean.includes('//'))  throw new ToolValidationError('Double slashes not permitted');
   const parts = clean.split('/');
-  if (parts.length > 4) throw new Error(`Path is too deep (max 3 subdirectory levels): "${clean}"`);
+  if (parts.length > 4) throw new ToolValidationError(`Path is too deep (max 3 subdirectory levels): "${clean}"`);
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    if (!part) throw new Error(`Empty path component in "${clean}"`);
+    if (!part) throw new ToolValidationError(`Empty path component in "${clean}"`);
     const validChars = i === parts.length - 1
       ? /^[a-zA-Z0-9_\-\.]+$/.test(part)  // filename: dots allowed
       : /^[a-zA-Z0-9_\-]+$/.test(part);    // directory: no dots
-    if (!validChars) throw new Error(`Invalid characters in path component "${part}" of "${clean}"`);
-    if (part.length > 120) throw new Error(`Path component "${part}" exceeds 120 characters`);
+    if (!validChars) throw new ToolValidationError(`Invalid characters in path component "${part}" of "${clean}"`);
+    if (part.length > 120) throw new ToolValidationError(`Path component "${part}" exceeds 120 characters`);
   }
   if (allowedExtensions && allowedExtensions.length > 0) {
     const ext = clean.split('.').pop().toLowerCase();
     if (!allowedExtensions.includes(ext)) {
-      throw new Error(`Extension ".${ext}" not permitted. Allowed: ${allowedExtensions.join(', ')}`);
+      throw new ToolValidationError(`Extension ".${ext}" not permitted. Allowed: ${allowedExtensions.join(', ')}`);
     }
   }
   return clean;
@@ -111,10 +164,22 @@ function validateContentPath(rawPath, allowedExtensions) {
 // WordPress backup helper
 // ---------------------------------------------------------------------------
 
+// FIX 5: The WordPress backup is a best-effort side effect and must never
+// determine whether a write succeeds. Previously this call was awaited with no
+// timeout, so a slow or hanging WordPress endpoint blocked the whole tool call
+// up to the gateway request timeout and could itself surface as a 500/408. The
+// request is now bounded by WP_SKILL_TIMEOUT_MS (default 8000ms); on timeout it
+// returns a failed-but-non-fatal result and the write still completes.
+function wpTimeoutMs() {
+  const raw = Number(process.env.WP_SKILL_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 8000;
+}
+
 async function pushContentToWp(section, filePath, content, changeNote) {
   const wpSkillUrl = (process.env.WP_SKILL_URL || '').replace(/\/$/, '');
   const wpSkillKey = process.env.WP_SKILL_KEY || '';
   if (!wpSkillUrl || !wpSkillKey) return { skipped: true, reason: 'WP_SKILL_URL or WP_SKILL_KEY not configured' };
+  const timeoutMs = wpTimeoutMs();
   try {
     const res = await fetch(`${wpSkillUrl}/${section}`, {
       method: 'POST',
@@ -130,6 +195,7 @@ async function pushContentToWp(section, filePath, content, changeNote) {
         timestamp:   new Date().toISOString(),
         line_count:  content.split('\n').length,
       }),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
       const t = await res.text().catch(() => '');
@@ -137,6 +203,9 @@ async function pushContentToWp(section, filePath, content, changeNote) {
     }
     return { ok: true };
   } catch (err) {
+    if (err && err.name === 'TimeoutError') {
+      return { ok: false, error: `WP backup timed out after ${timeoutMs}ms` };
+    }
     return { ok: false, error: err.message };
   }
 }
@@ -178,6 +247,15 @@ function listContentDirRecursive(baseDir, subPath) {
 
 function readContentFile(dirPath, filePath) {
   const fullPath = join(dirPath, filePath);
+  // FIX 8: Defensive traversal guard. Not every present or future call path is
+  // guaranteed to run validateContentPath/validateFilename first, so re-verify
+  // at the read boundary that the resolved target stays inside its section
+  // directory before touching the filesystem.
+  const resolvedBase = resolve(dirPath);
+  const resolvedFull = resolve(fullPath);
+  if (resolvedFull !== resolvedBase && !resolvedFull.startsWith(resolvedBase + sep)) {
+    throw new ToolValidationError(`Path escapes content directory: ${filePath}`);
+  }
   if (!existsSync(fullPath)) throw new Error(`File not found: ${filePath}`);
   return readFileSync(fullPath, 'utf8');
 }
@@ -215,6 +293,8 @@ export const moduleWriteToolDefinition = {
     'skill_load_specialist, and brain_scan catalog it immediately — no manual MANIFEST.json edit and ' +
     'no manifest_rebuild.py run is required. Pass manifest_entry to control triggers/metadata; ' +
     'otherwise a dispatchable entry is derived from the path and content. ' +
+    'Only .md module files are registered as dispatchable modules; a .json module file is written as data ' +
+    'and is intentionally NOT registered, so skill_compile / skill_load_specialist will not dispatch it. ' +
     'Backs up the updated file to WordPress after a successful write.\n\n' +
     'SAFETY GUARDRAIL — OVERWRITE PROTECTION:\n' +
     'If the target file already exists, the write is BLOCKED and the existing file stats are returned. ' +
@@ -342,7 +422,7 @@ export const scriptWriteToolDefinition = {
   inputSchema: {
     type: 'object',
     properties: {
-      filename:    { type: 'string', description: 'Relative path within scripts/ including subdirectory (e.g. "music-analysis/new_script.py"). Accepted extensions: .py, .sh, .js, .ts, .txt, .md.' },
+      filename:    { type: 'string', description: 'Relative path within scripts/ including subdirectory (e.g. "music-analysis/new_script.py"). Accepted extensions: .py, .sh, .js, .mjs, .cjs, .ts, .txt, .md, .json.' },
       content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change. Optional.' },
     },
@@ -355,9 +435,23 @@ export const scriptWriteToolDefinition = {
 // ---------------------------------------------------------------------------
 
 export async function handleModuleWrite(args) {
-  const { file, content, change_note, force = false, manifest_entry = null, dispatch_rule = null, skip_manifest = false } = args;
-  if (!content || typeof content !== 'string') throw new Error('content is required');
-  const cleanPath  = validateContentPath(file, ['md', 'json']);
+  const { content, change_note, force = false, manifest_entry = null, dispatch_rule = null, skip_manifest = false } = args;
+  // FIX 1: accept file / filename / path interchangeably (gateway key drift).
+  const file = firstStringKey(args, 'file', 'filename', 'path');
+
+  // FIX 2/3: validation failures return a clean 400-shape instead of escaping
+  // as a 500. Genuine internal failures below still propagate normally.
+  let cleanPath;
+  try {
+    requireContent(content);
+    cleanPath = validateContentPath(file, ['md', 'json']);
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
+    }
+    throw err;
+  }
+
   const paths      = getContentPaths();
   const fullPath   = join(paths.modulesDir, cleanPath);
   const dir        = dirname(fullPath);
@@ -410,6 +504,7 @@ export async function handleModuleWrite(args) {
             '3. Wait for Brian\'s explicit confirmation.',
             '4. Then call module_write again with force: true.',
           ],
+          diagnostics: { resolved_file: file ?? null, force_requested: force },
           note: 'New files (non-existing paths) are created immediately without force: true.',
         }, null, 2),
       }],
@@ -467,14 +562,20 @@ export async function handleModuleWrite(args) {
 
   let wpResult = { skipped: true, reason: 'WP_SKILL_URL or WP_SKILL_KEY not configured' };
   if (wpSkillUrl && wpSkillKey) {
+    const timeoutMs = wpTimeoutMs();
     try {
       const res = await fetch(`${wpSkillUrl}/modules`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey, 'User-Agent': 'claude-connector/12.8.0 (ava-module-write)' },
         body: JSON.stringify({ file: cleanPath, content, change_note: change_note || '', timestamp: new Date().toISOString(), line_count: content.split('\n').length }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       wpResult = res.ok ? { ok: true } : { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 200) };
-    } catch (err) { wpResult = { ok: false, error: err.message }; }
+    } catch (err) {
+      wpResult = (err && err.name === 'TimeoutError')
+        ? { ok: false, error: `WP backup timed out after ${timeoutMs}ms` }
+        : { ok: false, error: err.message };
+    }
   }
 
   return {
@@ -504,19 +605,35 @@ export function handleArchiveList(_args) {
 }
 
 export function handleArchiveRead(args) {
-  const { filename } = args;
-  const clean   = validateFilename(filename);
-  const paths   = getContentPaths();
-  const content = readContentFile(paths.archiveDir, clean);
-  return { content: [{ type: 'text', text: JSON.stringify({ section: 'archive', filename: clean, line_count: content.split('\n').length, content }, null, 2) }] };
+  try {
+    const filename = firstStringKey(args, 'filename', 'path');
+    const clean   = validateFilename(filename);
+    const paths   = getContentPaths();
+    const content = readContentFile(paths.archiveDir, clean);
+    return { content: [{ type: 'text', text: JSON.stringify({ section: 'archive', filename: clean, line_count: content.split('\n').length, content }, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
+    }
+    throw err;
+  }
 }
 
 export async function handleArchiveWrite(args) {
-  const { filename, content, change_note } = args;
-  const clean  = validateFilename(filename);
-  const paths  = getContentPaths();
-  const result = await writeContentFile(paths.archiveDir, 'archive', clean, content, change_note);
-  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  try {
+    const { content, change_note } = args;
+    const filename = firstStringKey(args, 'filename', 'path');
+    requireContent(content);
+    const clean  = validateFilename(filename);
+    const paths  = getContentPaths();
+    const result = await writeContentFile(paths.archiveDir, 'archive', clean, content, change_note);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
+    }
+    throw err;
+  }
 }
 
 export function handleReferenceList(_args) {
@@ -527,19 +644,35 @@ export function handleReferenceList(_args) {
 }
 
 export function handleReferenceRead(args) {
-  const { filename } = args;
-  const clean   = validateContentPath(filename, ['md', 'txt', 'json']);
-  const paths   = getContentPaths();
-  const content = readContentFile(paths.referencesDir, clean);
-  return { content: [{ type: 'text', text: JSON.stringify({ section: 'references', filename: clean, line_count: content.split('\n').length, content }, null, 2) }] };
+  try {
+    const filename = firstStringKey(args, 'filename', 'path');
+    const clean   = validateContentPath(filename, ['md', 'txt', 'json']);
+    const paths   = getContentPaths();
+    const content = readContentFile(paths.referencesDir, clean);
+    return { content: [{ type: 'text', text: JSON.stringify({ section: 'references', filename: clean, line_count: content.split('\n').length, content }, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
+    }
+    throw err;
+  }
 }
 
 export async function handleReferenceWrite(args) {
-  const { filename, content, change_note } = args;
-  const clean  = validateContentPath(filename, ['md', 'txt', 'json']);
-  const paths  = getContentPaths();
-  const result = await writeContentFile(paths.referencesDir, 'references', clean, content, change_note);
-  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  try {
+    const { content, change_note } = args;
+    const filename = firstStringKey(args, 'filename', 'path');
+    requireContent(content);
+    const clean  = validateContentPath(filename, ['md', 'txt', 'json']);
+    const paths  = getContentPaths();
+    const result = await writeContentFile(paths.referencesDir, 'references', clean, content, change_note);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
+    }
+    throw err;
+  }
 }
 
 export function handleScriptList(_args) {
@@ -550,19 +683,35 @@ export function handleScriptList(_args) {
 }
 
 export function handleScriptRead(args) {
-  const { filename } = args;
-  const clean   = validateContentPath(filename, ['py', 'sh', 'js', 'ts', 'txt', 'md', 'json']);
-  const paths   = getContentPaths();
-  const content = readContentFile(paths.scriptsDir, clean);
-  return { content: [{ type: 'text', text: JSON.stringify({ section: 'scripts', filename: clean, line_count: content.split('\n').length, content }, null, 2) }] };
+  try {
+    const filename = firstStringKey(args, 'filename', 'path');
+    const clean   = validateContentPath(filename, ['py', 'sh', 'js', 'mjs', 'cjs', 'ts', 'txt', 'md', 'json']);
+    const paths   = getContentPaths();
+    const content = readContentFile(paths.scriptsDir, clean);
+    return { content: [{ type: 'text', text: JSON.stringify({ section: 'scripts', filename: clean, line_count: content.split('\n').length, content }, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
+    }
+    throw err;
+  }
 }
 
 export async function handleScriptWrite(args) {
-  const { filename, content, change_note } = args;
-  const clean  = validateContentPath(filename, ['py', 'sh', 'js', 'ts', 'txt', 'md', 'json']);
-  const paths  = getContentPaths();
-  const result = await writeContentFile(paths.scriptsDir, 'scripts', clean, content, change_note);
-  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  try {
+    const { content, change_note } = args;
+    const filename = firstStringKey(args, 'filename', 'path');
+    requireContent(content);
+    const clean  = validateContentPath(filename, ['py', 'sh', 'js', 'mjs', 'cjs', 'ts', 'txt', 'md', 'json']);
+    const paths  = getContentPaths();
+    const result = await writeContentFile(paths.scriptsDir, 'scripts', clean, content, change_note);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,4 +756,4 @@ function buildRestoreHandler(sectionLabel, getDirFn, validateFn) {
 
 export const handleArchiveRestoreFromWp   = buildRestoreHandler('archive',    p => p.archiveDir,    validateFilename);
 export const handleReferenceRestoreFromWp = buildRestoreHandler('references', p => p.referencesDir, p => validateContentPath(p, ['md', 'txt', 'json']));
-export const handleScriptRestoreFromWp    = buildRestoreHandler('scripts',    p => p.scriptsDir,    p => validateContentPath(p, ['py', 'sh', 'js', 'ts', 'txt', 'md', 'json']));
+export const handleScriptRestoreFromWp    = buildRestoreHandler('scripts',    p => p.scriptsDir,    p => validateContentPath(p, ['py', 'sh', 'js', 'mjs', 'cjs', 'ts', 'txt', 'md', 'json']));
