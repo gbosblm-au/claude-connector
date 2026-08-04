@@ -326,19 +326,26 @@ describe( 'TNX-C-001: the middleware rejects unauthenticated tool-surface reques
     assert.equal( res.statusCode, 401 );
   } );
 
-  test( 'every tool-surface route requires authentication', async () => {
+  test( 'the MCP transports require the connector key and are never public', async () => {
+    // v12.31.0: this test previously also asserted that every /restore-* and
+    // /volume-* route "has no independent credential". That assertion was
+    // simply wrong -- all of them verify RAILWAY_RESTORE_TOKEN internally --
+    // and asserting it encoded the very mistake that broke connector snapshot
+    // restore. Those routes are now covered by the dedicated
+    // self-authenticated-coverage suite below, which derives the list from the
+    // source rather than restating it by hand.
     const { isPublicPath, isSelfAuthenticatedPath } = await import( '../middleware/mcpAuth.js' );
-    const mustBeGated = [
+
+    const mustRequireMcpKey = [
       '/sse', '/messages', '/mcp',
-      '/restore-skill', '/restore-books', '/restore-profiles', '/restore-modules',
-      '/restore-personality', '/restore-dispatch-rules', '/restore-archive',
-      '/restore-references', '/restore-scripts',
-      '/set-modular-mode', '/brain-scan', '/brain-data', '/skill-export',
-      '/ti-skill-compile', '/ti-skill-check-scope', '/data/upload-binary',
+      '/data/upload-binary',   // removed in v12.28.0; must not become reachable
+      '/export-all',           // has no credential of its own
     ];
-    for ( const p of mustBeGated ) {
+
+    for ( const p of mustRequireMcpKey ) {
       assert.equal( isPublicPath( p ), false, `${ p } must not be public` );
-      assert.equal( isSelfAuthenticatedPath( p ), false, `${ p } has no independent credential` );
+      assert.equal( isSelfAuthenticatedPath( p ), false,
+        `${ p } has no independent credential and must require MCP_API_KEY` );
     }
   } );
 
@@ -792,5 +799,157 @@ describe( 'TNX-H-014: credentials are encrypted, atomic and on the volume', () =
     rmSync( dir, { recursive: true, force: true } );
     if ( prevDir === undefined ) delete process.env.CONNECTOR_DATA_DIR; else process.env.CONNECTOR_DATA_DIR = prevDir;
     if ( prevKey === undefined ) delete process.env.CONNECTOR_SECRET_KEY; else process.env.CONNECTOR_SECRET_KEY = prevKey;
+  } );
+} );
+
+// ---------------------------------------------------------------------------
+// REGRESSION GUARD -- self-authenticated route coverage
+//
+// v12.31.0. The v12.28.0 auth gate (TNX-C-001) allowlisted only /tools and
+// /tool-call as self-authenticated and missed the other twenty-one routes that
+// verify X-Railway-Restore-Token internally, including every /restore-* target
+// and all three /volume-* endpoints.
+//
+// The symptom was not a clean 401. The ts-client-gateway plugin streams an
+// 11 MB tar.gz to POST /volume-restore; the gate rejected it as soon as the
+// headers arrived, the server reset the HTTP/2 stream mid-upload, and cURL
+// reported "error 92: stream was not closed cleanly: CANCEL" with no status
+// code. Connector snapshot restore failed after every deployment with an error
+// that pointed at the network rather than at authentication.
+//
+// A hand-maintained list is what broke. This test derives the truth from the
+// source instead: it finds every handler that reads x-railway-restore-token and
+// asserts each corresponding route is exempt from the MCP key.
+// ---------------------------------------------------------------------------
+
+describe( 'Auth gate: every self-authenticated route is exempt from the MCP key', () => {
+  /**
+   * Scan a source file for route registrations whose handler body reads the
+   * restore token.
+   *
+   * @param {string} source File contents.
+   * @returns {Array<{ method: string, path: string }>}
+   */
+  function findRestoreTokenRoutes( source ) {
+    const lines  = source.split( '\n' );
+    const routes = [];
+
+    lines.forEach( ( line, index ) => {
+      // Matches app.post("/x", ...) and router.post('/x', ...) alike.
+      const m = /(?:app|router)\.(get|post|put|delete|all)\(\s*["']([^"']+)["']/.exec( line );
+      if ( m ) routes.push( { line: index, method: m[ 1 ].toUpperCase(), path: m[ 2 ] } );
+    } );
+
+    const starts = routes.map( ( r ) => r.line );
+    const found  = [];
+
+    routes.forEach( ( route, i ) => {
+      const end  = i + 1 < starts.length ? starts[ i + 1 ] : lines.length;
+      const body = lines.slice( route.line, end ).join( '\n' );
+      if ( body.includes( 'x-railway-restore-token' ) ) {
+        found.push( { method: route.method, path: route.path } );
+      }
+    } );
+
+    return found;
+  }
+
+  test( 'no route reading X-Railway-Restore-Token is blocked by the MCP gate', async () => {
+    const { readFileSync, readdirSync, existsSync } = await import( 'node:fs' );
+    const { join, dirname } = await import( 'node:path' );
+    const { fileURLToPath } = await import( 'node:url' );
+    const { isPublicPath, isSelfAuthenticatedPath } = await import( '../middleware/mcpAuth.js' );
+
+    const srcRoot = join( dirname( fileURLToPath( import.meta.url ) ), '..' );
+
+    /** @type {string[]} */
+    const files = [ join( srcRoot, 'server-http.js' ) ];
+    const routesDir = join( srcRoot, 'routes' );
+    if ( existsSync( routesDir ) ) {
+      for ( const f of readdirSync( routesDir ) ) {
+        if ( f.endsWith( '.js' ) ) files.push( join( routesDir, f ) );
+      }
+    }
+
+    /** @type {string[]} */
+    const unreachable = [];
+
+    for ( const file of files ) {
+      for ( const route of findRestoreTokenRoutes( readFileSync( file, 'utf8' ) ) ) {
+        // Parameterised paths never equal a literal request path, so probe with
+        // the parameter segment replaced.
+        const probe = route.path.includes( '/:' )
+          ? `${ route.path.split( '/:' )[ 0 ] }/x`
+          : route.path;
+
+        if ( ! isPublicPath( probe ) && ! isSelfAuthenticatedPath( probe ) ) {
+          unreachable.push( `${ route.method } ${ route.path }` );
+        }
+      }
+    }
+
+    assert.deepEqual( unreachable, [],
+      'These routes authenticate with X-Railway-Restore-Token but are blocked by the ' +
+      'MCP key gate, so the WordPress plugin cannot reach them:\n  ' +
+      unreachable.join( '\n  ' ) );
+  } );
+
+  test( 'the snapshot restore endpoints the plugin depends on are reachable', async () => {
+    // Named explicitly as well as derived, because these are the exact paths
+    // the Connector Snapshots and Disaster Recovery pages post to. If a future
+    // refactor removes them from the allowlist, the failure should name them.
+    const { isSelfAuthenticatedPath } = await import( '../middleware/mcpAuth.js' );
+
+    const required = [
+      '/volume-restore', '/volume-snapshot', '/volume-snapshot/status',
+      '/restore-skill', '/restore-books', '/restore-profiles', '/restore-modules',
+      '/restore-personality', '/restore-dispatch-rules', '/restore-archive',
+      '/restore-references', '/restore-scripts',
+      '/brain-scan', '/brain-data', '/skill-export',
+      '/ti-skill-compile', '/ti-skill-check-scope', '/set-modular-mode',
+      '/tools', '/tool-call', '/provision',
+    ];
+
+    for ( const path of required ) {
+      assert.equal( isSelfAuthenticatedPath( path ), true,
+        `${ path } must be exempt from MCP_API_KEY; it verifies X-Railway-Restore-Token itself` );
+    }
+  } );
+
+  test( 'an unauthenticated upload receives a readable 401, not a stream reset', async () => {
+    // The gate must drain an inbound body before responding. Answering while
+    // the client is still uploading resets the stream, and over HTTP/2 the
+    // client then sees a transport error instead of the status code.
+    const { mcpAuthMiddleware, assertConfigured } = await import( '../middleware/mcpAuth.js' );
+
+    const prev = process.env.MCP_API_KEY;
+    process.env.MCP_API_KEY = 'z'.repeat( 40 );
+    assertConfigured();
+
+    const { Readable } = await import( 'node:stream' );
+
+    // A readable request stream standing in for a streaming upload.
+    const req = Readable.from( [ Buffer.alloc( 1024, 1 ), Buffer.alloc( 1024, 2 ) ] );
+    req.method  = 'POST';
+    req.path    = '/mcp';
+    req.headers = {};
+
+    const res = { statusCode: null, body: null, headersSent: false };
+    res.setHeader = () => {};
+    res.status = ( c ) => { res.statusCode = c; return res; };
+    res.json   = ( b ) => { res.body = b; res.headersSent = true; return res; };
+
+    let nexted = false;
+    mcpAuthMiddleware( req, res, () => { nexted = true; } );
+
+    // Allow the drain to complete.
+    await new Promise( ( r ) => setTimeout( r, 50 ) );
+
+    assert.equal( nexted, false, 'the request must not reach the handler' );
+    assert.equal( res.statusCode, 401, 'the caller must receive a status code, not a reset' );
+    assert.equal( res.body.code, 'MCP_AUTH_REQUIRED' );
+
+    if ( prev === undefined ) delete process.env.MCP_API_KEY;
+    else process.env.MCP_API_KEY = prev;
   } );
 } );

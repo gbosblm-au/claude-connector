@@ -108,8 +108,63 @@ const PUBLIC_ROUTES = [
  * see which control applies.
  */
 const SELF_AUTHENTICATED_ROUTES = [
-  { exact: '/tools' },        // X-Railway-Restore-Token
-  { exact: '/tool-call' },    // X-Railway-Restore-Token
+  // ── X-Railway-Restore-Token ────────────────────────────────────────────
+  //
+  // Every route below verifies RAILWAY_RESTORE_TOKEN internally before doing
+  // any work. They are exempt from MCP_API_KEY because the ts-client-gateway
+  // WordPress plugin authenticates to them with that token and has no way to
+  // hold the connector key.
+  //
+  // REGRESSION HISTORY (v12.31.0). v12.28.0 allowlisted only /tools and
+  // /tool-call and missed the other twenty-one. The visible symptom was NOT a
+  // clean 401: the plugin streams an 11 MB tar.gz to POST /volume-restore, this
+  // gate rejected it the moment the headers arrived, and the server reset the
+  // HTTP/2 stream while the body was still uploading. cURL reported
+  // "error 92: HTTP/2 stream 1 was not closed cleanly: CANCEL" with no status
+  // code, so connector snapshot restore failed after every deployment with an
+  // error that pointed at the network rather than at authentication.
+  //
+  // The list is verified by a test that scans server-http.js and the route
+  // modules for handlers reading x-railway-restore-token and asserts each one
+  // appears here. Maintaining this by hand is what broke it the first time.
+  { exact: '/tools' },
+  { exact: '/tool-call' },
+
+  // Skill and content restore targets used by the plugin's provisioning and
+  // Disaster Recovery pushes.
+  { exact: '/restore-skill' },
+  { exact: '/restore-books' },
+  { exact: '/restore-profiles' },
+  { exact: '/restore-modules' },
+  { exact: '/restore-personality' },
+  { exact: '/restore-dispatch-rules' },
+  { exact: '/restore-archive' },
+  { exact: '/restore-references' },
+  { exact: '/restore-scripts' },
+
+  // Whole-volume snapshot and restore. /volume-restore is the endpoint the
+  // Connector Snapshots page posts its archive to.
+  { exact: '/volume-snapshot' },
+  { exact: '/volume-restore' },
+  { exact: '/volume-snapshot/status' },
+
+  // Modular mode, brain scan and skill compilation.
+  { exact: '/set-modular-mode' },
+  { exact: '/brain-data' },
+  { exact: '/brain-data/status' },
+  { exact: '/brain-scan' },
+  { exact: '/skill-export' },
+  { exact: '/ti-skill-compile' },
+  { exact: '/ti-skill-check-scope' },
+
+  // Connector provisioning. In owner mode this verifies RAILWAY_RESTORE_TOKEN
+  // with a constant-time comparison; in tenant mode it validates the supplied
+  // api_key against the Gateway Service. Either way it authenticates itself,
+  // and the plugin's provisioning flow cannot present the connector key.
+  //
+  // NOTE: GET /export-all is deliberately NOT listed. It has no credential of
+  // its own, so it correctly remains behind the MCP key.
+  { exact: '/provision' },
 ];
 
 /** Cached digest of MCP_API_KEY. Populated by assertConfigured(). */
@@ -255,11 +310,73 @@ export function mcpAuthMiddleware( req, res, next ) {
     // WWW-Authenticate is required by RFC 7235 for a 401 and tells a
     // well-behaved client exactly what to present.
     res.setHeader( 'WWW-Authenticate', 'Bearer realm="claude-connector"' );
-    res.status( 401 ).json( {
-      error: 'Authentication required.',
-      code:  'MCP_AUTH_REQUIRED',
-      hint:  'Present the connector key as: Authorization: Bearer <MCP_API_KEY>',
-    } );
+
+    /**
+     * Send the rejection.
+     * @returns {void}
+     */
+    const reject = () => {
+      if ( res.headersSent ) return;
+      res.status( 401 ).json( {
+        error: 'Authentication required.',
+        code:  'MCP_AUTH_REQUIRED',
+        hint:  'Present the connector key as: Authorization: Bearer <MCP_API_KEY>',
+      } );
+    };
+
+    // v12.31.0: drain any inbound request body before responding.
+    //
+    // Responding while the client is still uploading causes the server to reset
+    // the stream. Over HTTP/2 the client then reports a transport error
+    // ("stream was not closed cleanly: CANCEL", cURL error 92) and never sees
+    // the status code at all, so an authentication failure is indistinguishable
+    // from a network fault. That is precisely how the v12.28.0 allowlist gap
+    // presented, and it cost far more time to diagnose than a plain 401 would
+    // have.
+    //
+    // Draining is capped: a caller must not be able to make an unauthenticated
+    // request cheap for itself and expensive for us by streaming indefinitely.
+    // Past the cap we destroy the socket, which is the correct outcome for a
+    // caller that is both unauthenticated and uncooperative.
+    const hasBody = req.method !== 'GET' && req.method !== 'HEAD' && req.readable;
+
+    if ( ! hasBody ) {
+      reject();
+      return;
+    }
+
+    const DRAIN_LIMIT_BYTES = 2 * 1024 * 1024;
+    const DRAIN_TIMEOUT_MS  = 5000;
+    let drained  = 0;
+    let finished = false;
+
+    /**
+     * @param {boolean} destroy Whether to tear down the socket.
+     * @returns {void}
+     */
+    const finish = ( destroy ) => {
+      if ( finished ) return;
+      finished = true;
+      clearTimeout( timer );
+      req.removeListener( 'data', onData );
+      req.removeListener( 'end', onEnd );
+      req.removeListener( 'error', onEnd );
+      reject();
+      if ( destroy && typeof req.destroy === 'function' ) req.destroy();
+    };
+
+    const onData = ( chunk ) => {
+      drained += chunk.length;
+      if ( drained > DRAIN_LIMIT_BYTES ) finish( true );
+    };
+    const onEnd = () => finish( false );
+
+    const timer = setTimeout( () => finish( true ), DRAIN_TIMEOUT_MS );
+    if ( typeof timer.unref === 'function' ) timer.unref();
+
+    req.on( 'data', onData );
+    req.on( 'end', onEnd );
+    req.on( 'error', onEnd );
     return;
   }
 
