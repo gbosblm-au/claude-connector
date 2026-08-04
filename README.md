@@ -45,7 +45,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for the complete release notes.
 ## What's New in v6.1.0
 
 - **Full Google Drive toolkit** with search, read, binary download, create, overwrite, metadata, recent files, permissions, upload, and list support.
-- **Bundled Google service account support**. If `./data/google-service-account.json` exists, the connector auto-loads it without needing an environment variable.
+- **Google service account support**. Set `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` to a path supplied by your secrets manager. Bundling the key file inside the repository is no longer supported and was removed in v12.28.0 (audit finding TNX-C-002).
 - **Config path fix** for default LinkedIn data files, preventing broken relative paths when `LINKEDIN_CSV_PATH` or `LINKEDIN_PROFILE_PATH` are not set.
 - **Backward compatible**. Existing Google Drive upload/list, WordPress, LinkedIn, search, and publishing functionality remain intact.
 

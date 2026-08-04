@@ -39,7 +39,15 @@ import {
   readdirSync,
   statSync,
 } from 'node:fs';
-import { join, basename, dirname, resolve, sep } from 'node:path';
+// v12.28.0: `resolve` and `sep` were imported for the inline FIX 8 traversal
+// guard. That guard now delegates to resolveContained, so both are orphaned
+// and are removed rather than left as dead imports.
+import { join, basename, dirname } from 'node:path';
+// v12.28.0 (TNX-C-005): shared boundary-correct containment helper. See
+// src/utils/pathContainment.js for why String.prototype.startsWith is not a
+// directory boundary test and why symlink refusal is a separate, necessary
+// control on top of any lexical check.
+import { resolveContained } from '../utils/pathContainment.js';
 import { log } from '../utils/logger.js';
 import { deriveModuleEntry, writeModuleFragment } from './manifest-fragments.js';
 
@@ -246,22 +254,46 @@ function listContentDirRecursive(baseDir, subPath) {
 }
 
 function readContentFile(dirPath, filePath) {
-  const fullPath = join(dirPath, filePath);
   // FIX 8: Defensive traversal guard. Not every present or future call path is
   // guaranteed to run validateContentPath/validateFilename first, so re-verify
   // at the read boundary that the resolved target stays inside its section
   // directory before touching the filesystem.
-  const resolvedBase = resolve(dirPath);
-  const resolvedFull = resolve(fullPath);
-  if (resolvedFull !== resolvedBase && !resolvedFull.startsWith(resolvedBase + sep)) {
-    throw new ToolValidationError(`Path escapes content directory: ${filePath}`);
+  //
+  // v12.28.0 (TNX-C-005): the original FIX 8 guard was
+  //   resolvedFull !== resolvedBase && !resolvedFull.startsWith(resolvedBase + sep)
+  // which IS boundary-correct -- the `+ sep` is what distinguishes it from the
+  // defective bare-prefix idiom found elsewhere in this codebase, and it
+  // correctly rejects the sibling-directory escape.
+  //
+  // It is replaced by the shared helper for two reasons. First, containment
+  // logic in one audited place cannot drift between call sites, which is the
+  // systemic problem the audit records in Section 5.1. Second, and materially,
+  // resolve() is a purely lexical operation that never touches the filesystem,
+  // so a symbolic link placed inside a section directory and pointing at, say,
+  // /data or /app satisfied the old check and was then read. resolveContained
+  // verifies physically with realpath and refuses symlinks.
+  const fullPath = resolveContained(dirPath, filePath);
+  if (!fullPath) {
+    throw new ToolValidationError(`Path escapes content directory, or resolves through a symbolic link: ${filePath}`);
   }
   if (!existsSync(fullPath)) throw new Error(`File not found: ${filePath}`);
   return readFileSync(fullPath, 'utf8');
 }
 
 async function writeContentFile(dirPath, section, filePath, content, changeNote) {
-  const fullPath = join(dirPath, filePath);
+  // v12.28.0 (TNX-C-005): the read path carried a traversal guard (FIX 8) but
+  // the WRITE path carried none, which is the more consequential of the two.
+  // Applying the same containment check here closes the asymmetry.
+  //
+  // resolveContained handles a target that does not exist yet -- the normal
+  // case for a create -- by walking to the deepest existing ancestor and
+  // verifying that IT is physically inside the base, so a symlinked
+  // intermediate directory cannot be used to place a new file outside the
+  // section directory.
+  const fullPath = resolveContained(dirPath, filePath);
+  if (!fullPath) {
+    throw new ToolValidationError(`Path escapes content directory, or resolves through a symbolic link: ${filePath}`);
+  }
   const fileDir  = dirname(fullPath);
   if (!existsSync(fileDir)) mkdirSync(fileDir, { recursive: true });
   const isNew = !existsSync(fullPath);

@@ -20,6 +20,7 @@ import { CONNECTOR_USER_AGENT } from "../config.js";
 import { log } from "../utils/logger.js";
 import { truncate } from "../utils/helpers.js";
 import * as cheerio from "cheerio";
+import { safeFetch } from "../utils/safeFetch.js";
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_MAX_CHARS = 50000;
@@ -29,23 +30,33 @@ const ABSOLUTE_MAX_CHARS = 200000;
 // Helpers
 // ---------------------------------------------------------------------------
 
+// v12.28.0 (TNX-C-009) -- SSRF guard.
+//
+// This function fetched a caller-supplied URL with `redirect: "follow"` and no
+// address validation of any kind. Combined with the previously unauthenticated
+// MCP surface (TNX-C-001), it let an anonymous caller use the connector as a
+// proxy into the private network: cloud instance metadata at 169.254.169.254,
+// the connector's own routes on localhost, and the Gateway Service and Postgres
+// on the internal network.
+//
+// safeFetch resolves the hostname, refuses every non-public address range for
+// both IPv4 and IPv6, pins the validated IP for the actual connection so DNS
+// rebinding cannot swap it at connect time, and revalidates every redirect hop
+// rather than only the initial URL. See src/utils/safeFetch.js.
 async function fetchWithTimeout(url, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, {
-      headers: {
-        "User-Agent": CONNECTOR_USER_AGENT,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
-        "Accept-Language": "en-AU,en;q=0.9",
-      },
-      redirect: "follow",
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+  return safeFetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": CONNECTOR_USER_AGENT,
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+      "Accept-Language": "en-AU,en;q=0.9",
+    },
+    // The total budget covers every redirect hop, not just the first request,
+    // so a redirect chain cannot be used to exceed the caller's timeout.
+    timeoutMs,
+    maxBytes: ABSOLUTE_MAX_CHARS * 4,   // UTF-8 worst case for the char cap below
+  });
 }
 
 function isAllowedScheme(urlStr) {

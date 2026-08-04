@@ -33,10 +33,49 @@ import {
 import { rmSync } from 'fs';
 import { resolve as resolvePath, extname, dirname as dirnamePath } from 'node:path';
 import { spawnSync } from 'node:child_process';
+// v12.28.0 (TNX-C-005): boundary-correct containment replaces the two
+// String.prototype.startsWith prefix checks that previously guarded this file.
+import { resolveContained } from '../utils/pathContainment.js';
+// v12.28.0 (TNX-C-004): shared minimal-environment builder. One implementation,
+// used by all five modules in this component that spawn a subprocess.
+import { buildScriptEnv as sharedBuildScriptEnv } from '../utils/scriptEnv.js';
 
 const SCRIPTS_BASE = process.env.SCRIPTS_DIR
   ? resolvePath( process.env.SCRIPTS_DIR )
   : resolvePath( '/data/skill/ava/scripts' );
+
+// ---------------------------------------------------------------------------
+// Script environment construction  (v12.28.0 -- TNX-C-004)
+//
+// The implementation lives in src/utils/scriptEnv.js and is shared with the
+// four other modules that spawn Python: homeworkTools.js, socraticTools.js,
+// nudgeTools.js and brain-scan-trigger.js. All five had the same
+// `{ ...process.env, PYTHONUNBUFFERED: '1' }` defect; the audit named only this
+// one. Keeping a second copy here is what produced the divergence the audit
+// documents in Section 5.2, so this module deliberately holds none.
+//
+// See src/utils/scriptEnv.js for the full rationale, the SCRIPT_GRANTABLE_ENV /
+// SCRIPT_ENV_MANIFEST two-place grant mechanism, and why the environment is
+// built from scratch rather than filtered.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the minimal environment for a script spawned by this tool.
+ *
+ * Thin wrapper preserving this module's original call signature so the unit
+ * tests and any external caller keep working.
+ *
+ * @param {string} outputDir      Temp directory the script writes results into.
+ * @param {string} [scriptKey=''] Script path relative to SCRIPTS_BASE.
+ * @returns {Record<string, string>} Environment for the child process.
+ */
+function buildScriptEnv( outputDir, scriptKey = '' ) {
+  return sharedBuildScriptEnv( { outputDir, scriptKey } );
+}
+
+// Exported for the unit tests, which assert that no credential name can reach
+// a spawned script through this function.
+export { buildScriptEnv };
 
 const MIME_MAP = {
   '.pdf':  'application/pdf',
@@ -106,10 +145,29 @@ export async function handleScriptExecute( toolInput ) {
     return { error: 'script_path is required and must be a string.' };
   }
 
-  const resolvedPath = resolvePath( SCRIPTS_BASE, script_path );
+  // v12.28.0 (TNX-C-005) -- containment fix.
+  //
+  // The previous guard was:
+  //   const resolvedPath = resolvePath( SCRIPTS_BASE, script_path );
+  //   if ( ! resolvedPath.startsWith( SCRIPTS_BASE ) ) reject();
+  //
+  // startsWith is a character-prefix test, not a directory boundary test. With
+  // SCRIPTS_BASE = /data/skill/ava/scripts, the path
+  // /data/skill/ava/scripts_evil/payload.py satisfies startsWith and was
+  // accepted, because "scripts_evil" shares the prefix "scripts". resolvePath
+  // normalises ".." so classic traversal was already blocked, but the
+  // sibling-directory escape was not.
+  //
+  // resolveContained uses path.relative for the boundary test and additionally
+  // refuses symbolic links. That second control matters here specifically:
+  // path.resolve is a lexical operation that never touches the filesystem, so
+  // a symlink placed inside the scripts directory pointing at, say,
+  // /usr/lib/python3/site-packages would have passed every lexical check and
+  // then been executed.
+  const resolvedPath = resolveContained( SCRIPTS_BASE, script_path );
 
-  if ( ! resolvedPath.startsWith( SCRIPTS_BASE ) ) {
-    return { error: 'script_path traverses outside the scripts directory. Path rejected.' };
+  if ( ! resolvedPath ) {
+    return { error: 'script_path traverses outside the scripts directory, or resolves through a symbolic link. Path rejected.' };
   }
 
   if ( ! resolvedPath.endsWith( '.py' ) ) {
@@ -159,7 +217,27 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
       cwd:       SCRIPTS_BASE,
       timeout:   maxTimeout * 1000,
       maxBuffer: 50 * 1024 * 1024,
-      env:       { ...process.env, PYTHONUNBUFFERED: '1' },
+      // v12.28.0 (TNX-C-004) -- environment isolation.
+      //
+      // This was previously `{ ...process.env, PYTHONUNBUFFERED: '1' }`, which
+      // handed every spawned script the connector's complete credential set:
+      // ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, PERPLEXITY_API_KEY,
+      // XAI_API_KEY, MISTRAL_API_KEY, GROQ_API_KEY, QWEN_API_KEY, BRAVE_API_KEY,
+      // TAVILY_API_KEY, SERPER_API_KEY, GOOGLE_CLIENT_SECRET,
+      // GOOGLE_REFRESH_TOKEN, SLACK_BOT_TOKEN, WP_APP_PASSWORD,
+      // MEMORY_AUTH_TOKEN, RAILWAY_RESTORE_TOKEN, AVA_MEMORY_WP_KEY and any
+      // database URL present. A three-line script posting os.environ to an
+      // external host exfiltrated the entire organisation's credentials.
+      //
+      // The file header's claim that spawnSync "with explicit python3 binary --
+      // no shell execution" made this safe addressed shell injection only. It
+      // said nothing about environment inheritance, which is a separate channel.
+      //
+      // The replacement is an explicit allowlist built by buildScriptEnv(). It
+      // is constructed from scratch rather than filtered from process.env, so a
+      // newly added secret is excluded by default rather than included by
+      // default.
+      env:       buildScriptEnv( outputDir, String( script_path ) ),
     } );
 
     // ✨ NEW: check for spawnSync-level errors (e.g. ENOENT)
@@ -182,8 +260,13 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
     const files = [];
     if ( Array.isArray( return_files ) && return_files.length > 0 ) {
       for ( const relPath of return_files ) {
-        const fullPath = resolvePath( outputDir, relPath );
-        if ( ! fullPath.startsWith( outputDir ) ) continue;  // traversal guard
+        // v12.28.0 (TNX-C-005): same containment defect as the script path
+        // guard above. A script could write /tmp/script_execute_output_X_evil/
+        // and then name it in return_files; the prefix check accepted it.
+        // Symlink refusal matters here too: the script controls the contents of
+        // its own output directory and could plant a link to /proc/self/environ.
+        const fullPath = resolveContained( outputDir, relPath );
+        if ( ! fullPath ) continue;                          // traversal guard
         if ( ! existsSync( fullPath ) ) continue;
 
         const stats = statSync( fullPath );

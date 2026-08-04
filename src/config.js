@@ -5,14 +5,9 @@
 // User-Agent string sent with all outbound HTTP requests.
 // Identifies the connector to remote servers and security systems.
 export const CONNECTOR_USER_AGENT = 'claude-connector/12.0.0 (TrueSource Consulting; WordPress automation; +https://truesourceconsulting.com.au)';
-import { existsSync } from "node:fs";
 
 const DEFAULT_LINKEDIN_CSV_PATH = new URL("../data/connections.csv", import.meta.url).pathname;
 const DEFAULT_LINKEDIN_PROFILE_PATH = new URL("../data/profile.json", import.meta.url).pathname;
-const BUNDLED_GOOGLE_SERVICE_ACCOUNT_KEY_FILE = new URL(
-  "../data/google-service-account.json",
-  import.meta.url
-).pathname;
 
 export const config = {
   // Search provider: "brave" | "tavily"
@@ -68,13 +63,22 @@ export const config = {
 
   // Google Drive API (optional)
   // Option A: Service Account (recommended)
-  // If GOOGLE_SERVICE_ACCOUNT_KEY_FILE is not set, the connector will also
-  // auto-load ./data/google-service-account.json when that file exists.
-  googleServiceAccountKeyFile:
-    process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE ||
-    (existsSync(BUNDLED_GOOGLE_SERVICE_ACCOUNT_KEY_FILE)
-      ? BUNDLED_GOOGLE_SERVICE_ACCOUNT_KEY_FILE
-      : ""),
+  //
+  // v12.28.0 (TNX-C-002): the auto-load-from-./data path was REMOVED.
+  //
+  // Previously this fell back to bundling ../data/google-service-account.json
+  // when GOOGLE_SERVICE_ACCOUNT_KEY_FILE was unset. That fallback existed to
+  // make setup convenient, and its consequence was that a complete, unredacted
+  // RSA private key sat in the repository and was copied into every Docker
+  // image. Combined with GOOGLE_DRIVE_SCOPES defaulting to full /auth/drive and
+  // GOOGLE_IMPERSONATE_SUBJECT enabling Workspace domain-wide delegation, the
+  // blast radius was every Drive resource the service account could reach.
+  //
+  // The credential must now be supplied explicitly, by pointing
+  // GOOGLE_SERVICE_ACCOUNT_KEY_FILE at a path mounted from a secrets manager or
+  // the platform's own secret store. If it is unset, Drive is simply not
+  // configured, which is the correct failure mode.
+  googleServiceAccountKeyFile: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || "",
   // Option B: OAuth2 Refresh Token
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
   googleClientSecret: process.env.GOOGLE_CLIENT_SECRET || "",

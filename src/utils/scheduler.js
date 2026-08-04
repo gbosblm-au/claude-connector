@@ -411,6 +411,26 @@ async function checkAndFireDueSchedules() {
 // Startup
 // -----------------------------------------------------------------------
 let started = false;
+/**
+ * Persist the in-memory schedule store to disk.
+ *
+ * v12.28.0 (TNX-H-006): exported so the shutdown handler can flush on the way
+ * out. saveStore() is already called on every mutation, so this is insurance
+ * rather than the primary persistence path -- but a drain that exits without
+ * flushing would lose any state written by an in-flight mutation that had not
+ * yet reached its own saveStore() call.
+ *
+ * @returns {boolean} True when the store was written, false on failure.
+ */
+export function flushScheduleStore() {
+  try {
+    saveStore();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function startScheduler() {
   if (started) return;
   loadStore();

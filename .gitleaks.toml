@@ -1,0 +1,87 @@
+# .gitleaks.toml
+#
+# Secret scanning configuration -- audit finding TNX-H-009 (Phase 0 item 12).
+#
+# Context: a complete, unredacted Google service-account RSA private key was
+# committed to the claude-connector repository and copied into every Docker
+# image built from it (TNX-C-002). Nothing in the toolchain would have caught
+# that, because no secret scanning existed in any of the three components.
+#
+# This file extends the gitleaks default ruleset rather than replacing it, so
+# the ~170 upstream provider rules stay active and are updated with the tool.
+# The extra rules below cover credential names specific to this platform, taken
+# from the connector's .env.example and the gateway's environment.
+#
+# Usage:
+#   gitleaks detect  --config .gitleaks.toml --redact          # full history
+#   gitleaks protect --config .gitleaks.toml --staged --redact # pre-commit
+#
+# In CI this must be a BLOCKING step, not an advisory one.
+
+title = "Tenax platform secret scanning"
+
+[extend]
+useDefault = true
+
+# ── Platform-specific credential names ──────────────────────────────────────
+
+[[rules]]
+id          = "tenax-connector-bearer-keys"
+description = "Tenax connector or gateway bearer credential assigned a literal value"
+regex       = '''(?i)\b(MCP_API_KEY|RAILWAY_RESTORE_TOKEN|DOCUMENT_DOWNLOAD_TOKEN|MEMORY_AUTH_TOKEN|UPLOAD_API_KEY|WEBHOOK_SECRET|GATEWAY_ADMIN_KEY|TS_CLIENT_API_KEY|AVA_MEMORY_WP_KEY)\s*[:=]\s*['"]?([A-Za-z0-9_\-\.\/\+=]{16,})['"]?'''
+entropy     = 3.0
+keywords    = ["mcp_api_key","railway_restore_token","document_download_token","memory_auth_token","upload_api_key","webhook_secret","gateway_admin_key","ts_client_api_key","ava_memory_wp_key"]
+
+[[rules]]
+id          = "tenax-jwt-secret"
+description = "JWT signing secret assigned a literal value"
+regex       = '''(?i)\b(JWT_SECRET|JWT_ACCESS_SECRET|JWT_REFRESH_SECRET)\s*[:=]\s*['"]?([A-Za-z0-9_\-\.\/\+=]{16,})['"]?'''
+entropy     = 3.0
+keywords    = ["jwt_secret","jwt_access_secret","jwt_refresh_secret"]
+
+[[rules]]
+id          = "tenax-model-provider-keys"
+description = "Model or search provider API key assigned a literal value"
+regex       = '''(?i)\b(ANTHROPIC|OPENAI|DEEPSEEK|PERPLEXITY|XAI|MISTRAL|GROQ|QWEN|BRAVE|TAVILY|SERPER|PEXELS|UNSPLASH|NEWS)_API_KEY\s*[:=]\s*['"]?([A-Za-z0-9_\-]{20,})['"]?'''
+entropy     = 3.5
+keywords    = ["_api_key"]
+
+[[rules]]
+id          = "tenax-google-service-account-file"
+description = "Google service-account JSON key material (the TNX-C-002 case)"
+regex       = '''"type"\s*:\s*"service_account"'''
+keywords    = ["service_account"]
+
+[[rules]]
+id          = "tenax-smtp-and-wp-passwords"
+description = "SMTP or WordPress application password assigned a literal value"
+regex       = '''(?i)\b(SMTP_PASS|WP_APP_PASSWORD|SLACK_BOT_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_REFRESH_TOKEN|LINKEDIN_CLIENT_SECRET)\s*[:=]\s*['"]?([^\s'"#]{12,})['"]?'''
+entropy     = 3.0
+keywords    = ["smtp_pass","wp_app_password","slack_bot_token","google_client_secret","google_refresh_token","linkedin_client_secret"]
+
+# ── Allowlist ───────────────────────────────────────────────────────────────
+#
+# Deliberately narrow. Every entry is a path where a credential-SHAPED string is
+# expected to be a placeholder or documentation, never a real value.
+#
+# NOTE: .env.example is allowlisted only for its bare `KEY=` lines, which carry
+# no value and therefore match nothing above. If a real value is ever pasted
+# into it, the entropy thresholds still fire.
+
+[allowlist]
+description = "Documentation, examples and audit reports"
+paths = [
+  '''\.env\.example$''',
+  '''(^|/)CHANGELOG[^/]*\.md$''',
+  '''(^|/)README\.md$''',
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)TENAX-Audit.*\.md$''',
+  '''(^|/)tests?/fixtures/''',
+]
+regexTarget = "match"
+regexes = [
+  # Standard documentation placeholders.
+  '''(?i)(your|example|placeholder|changeme|change-me|replace-me|xxx+|<[a-z_]+>)''',
+  # The test secret used by the committed unit tests.
+  '''test-secret-abcdefghijklmnop''',
+]

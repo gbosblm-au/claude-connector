@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit
+#
+# Blocking secret scan -- audit finding TNX-H-009 (Phase 0 item 12).
+#
+# Install once per clone:
+#     git config core.hooksPath .githooks
+#     chmod +x .githooks/pre-commit
+#
+# Install gitleaks:
+#     brew install gitleaks                       # macOS
+#     go install github.com/zricethezav/gitleaks/v8@latest
+#     docker pull zricethezav/gitleaks:latest      # no local install needed
+#
+# This hook is a convenience, NOT the control. A developer can bypass it with
+# --no-verify, so the same scan MUST also run as a blocking CI step on every
+# pull request (Phase 2 roadmap item 1). The hook exists to catch the mistake
+# before it reaches history, where removing it requires a rewrite.
+
+set -euo pipefail
+
+REPO_ROOT="$( git rev-parse --show-toplevel )"
+CONFIG="${REPO_ROOT}/.gitleaks.toml"
+
+if [ ! -f "${CONFIG}" ]; then
+  echo "pre-commit: .gitleaks.toml not found at ${CONFIG}. Refusing to commit." >&2
+  exit 1
+fi
+
+run_gitleaks() {
+  if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks protect --staged --redact --config "${CONFIG}" --source "${REPO_ROOT}"
+  elif command -v docker >/dev/null 2>&1; then
+    docker run --rm -v "${REPO_ROOT}:/repo" -w /repo zricethezav/gitleaks:latest \
+      protect --staged --redact --config /repo/.gitleaks.toml --source /repo
+  else
+    echo "pre-commit: gitleaks is not installed and docker is unavailable." >&2
+    echo "pre-commit: install gitleaks, or set TENAX_SKIP_SECRET_SCAN=1 to bypass" >&2
+    echo "pre-commit: (bypassing is logged in CI and the PR will still be blocked)." >&2
+    return 1
+  fi
+}
+
+if [ "${TENAX_SKIP_SECRET_SCAN:-0}" = "1" ]; then
+  echo "pre-commit: secret scan SKIPPED by TENAX_SKIP_SECRET_SCAN=1." >&2
+  exit 0
+fi
+
+if ! run_gitleaks; then
+  cat >&2 <<'MSG'
+
+pre-commit: BLOCKED. A secret was detected in the staged changes, or the
+scanner could not run.
+
+If this is a genuine secret:
+  1. Remove it from the staged files.
+  2. Rotate it. Assume it is compromised the moment it was written to disk.
+  3. Supply it through the environment or a secrets manager instead.
+
+If this is a false positive, add a narrow entry to the [allowlist] section of
+.gitleaks.toml and explain why in the same commit.
+
+MSG
+  exit 1
+fi
+
+echo "pre-commit: secret scan clean."

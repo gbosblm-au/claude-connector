@@ -1,5 +1,63 @@
-node_modules
-.git
+# .dockerignore  v12.28.0
+#
+# ALLOWLIST MODEL -- remediates TNX-C-002.
+#
+# The previous file was a five-line denylist:
+#
+#     node_modules
+#     .git
+#     .env
+#     *.log
+#     data/connections.csv
+#
+# data/google-service-account.json was not listed, so a complete, unredacted
+# RSA service-account private key was copied into every Docker image built from
+# this tree. A denylist that must enumerate every secret filename will always
+# eventually miss one, which is exactly what happened.
+#
+# This file inverts the model: everything is excluded, then the specific paths
+# the runtime image needs are re-included. A newly added secret is therefore
+# excluded by default and requires a deliberate, reviewable edit to ship.
+#
+# When adding a new runtime path, add the narrowest possible !rule below and
+# state why in a comment.
+
+# ── Exclude everything ──────────────────────────────────────────────────────
+*
+
+# ── Re-include only what the runtime image needs ────────────────────────────
+
+# Application source.
+!src/
+!src/**
+
+# Dependency manifest and lockfile. Both are required for `npm ci`.
+!package.json
+!package-lock.json
+
+# Standalone maintenance and codegen scripts invoked by npm scripts.
+!scripts/
+!scripts/**
+
+# ── Re-exclusions inside the allowed paths ──────────────────────────────────
+# Nested node_modules and test artefacts must not reach the image even though
+# their parent directory is allowed.
+src/**/node_modules
+scripts/**/node_modules
+**/*.test.js
+**/*.spec.js
+**/*.log
+
+# Credential material must never reach an image, under any filename, even if a
+# future !rule above would otherwise admit it. Docker evaluates rules in order,
+# so these trailing lines win.
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/service-account*.json
+**/*credentials*.json
+**/*secret*.json
 .env
-*.log
-data/connections.csv
+.env.*

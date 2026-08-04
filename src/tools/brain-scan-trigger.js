@@ -39,6 +39,7 @@ import { existsSync, mkdirSync, writeFileSync, renameSync, readFileSync, statSyn
 import { join, resolve as resolvePath, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { buildScriptEnv } from '../utils/scriptEnv.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -177,7 +178,14 @@ export async function runBrainScan(options = {}) {
     try {
       child = spawn(PYTHON_BIN, args, {
         cwd: SCRIPTS_DIR,
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        // v12.28.0 (TNX-C-004): this module spawned Python with the connector's
+// COMPLETE process environment. The audit cited only script-execute.js, but a
+// verification sweep for the `...process.env` idiom found this site too. Every
+// script run from here inherited ANTHROPIC_API_KEY, GOOGLE_REFRESH_TOKEN,
+// SLACK_BOT_TOKEN, WP_APP_PASSWORD, RAILWAY_RESTORE_TOKEN, MCP_API_KEY and the
+// rest. Replaced by the shared allowlist builder, which constructs the child
+// environment from scratch rather than filtering process.env.
+        env: buildScriptEnv({ scriptKey: 'brain_scan.py' }),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {

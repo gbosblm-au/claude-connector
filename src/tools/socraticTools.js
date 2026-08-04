@@ -21,6 +21,7 @@ import { resolve as resolvePath } from "node:path";
 import { getSelfModelDb, getSelfModelDbPath, isSelfModelEnabled } from "../tools-self-model/db.js";
 import { log } from "../utils/logger.js";
 
+import { buildScriptEnv } from "../utils/scriptEnv.js";
 const SCRIPTS_BASE = process.env.SCRIPTS_DIR
   ? resolvePath(process.env.SCRIPTS_DIR)
   : resolvePath("/data/skill/ava/scripts");
@@ -51,7 +52,14 @@ function runScript(scriptName, scriptArgs, timeoutSeconds = 30) {
     pythonBin(),
     [scriptPath, ...scriptArgs, "--db", dbPath],
     { cwd: SCRIPTS_BASE, timeout: timeoutSeconds * 1000, maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, PYTHONUNBUFFERED: "1", SELF_MODEL_DB_PATH: dbPath } }
+      // v12.28.0 (TNX-C-004): this module spawned Python with the connector's
+// COMPLETE process environment. The audit cited only script-execute.js, but a
+// verification sweep for the `...process.env` idiom found this site too. Every
+// script run from here inherited ANTHROPIC_API_KEY, GOOGLE_REFRESH_TOKEN,
+// SLACK_BOT_TOKEN, WP_APP_PASSWORD, RAILWAY_RESTORE_TOKEN, MCP_API_KEY and the
+// rest. Replaced by the shared allowlist builder, which constructs the child
+// environment from scratch rather than filtering process.env.
+        env: buildScriptEnv({ scriptKey: scriptName, extra: { SELF_MODEL_DB_PATH: dbPath } }) }
   );
   if (result.error) {
     return { ok: false, reason: "subprocess_error",

@@ -16,6 +16,10 @@
 import { readFileSync, existsSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { log } from "../utils/logger.js";
+import { safeFetch } from "../utils/safeFetch.js";
+
+// v12.28.0 (TNX-C-009): hard ceiling on media fetched for upload to WordPress.
+const MAX_MEDIA_DOWNLOAD_BYTES = parseInt(process.env.MAX_MEDIA_DOWNLOAD_BYTES || "26214400", 10);
 import { truncate } from "../utils/helpers.js";
 import { getWordPressCredentials } from "../utils/credentialStore.js";
 import { CONNECTOR_USER_AGENT } from "../config.js";
@@ -160,11 +164,28 @@ export const wpSetFeaturedImageToolDefinition = {
  */
 async function downloadImageBuffer(imageUrl) {
   log("info", `Downloading image from URL for WP upload: ${imageUrl}`);
-  const resp = await fetch(imageUrl, {
-    headers: { "User-Agent": CONNECTOR_USER_AGENT },
+// v12.28.0 (TNX-C-009) -- SSRF guard.
+//
+// This download path fetched a caller-supplied URL with `redirect: "follow"` and no
+// address validation of any kind. Combined with the previously unauthenticated
+// MCP surface (TNX-C-001), it let an anonymous caller use the connector as a
+// proxy into the private network: cloud instance metadata at 169.254.169.254,
+// the connector's own routes on localhost, and the Gateway Service and Postgres
+// on the internal network.
+//
+// safeFetch resolves the hostname, refuses every non-public address range for
+// both IPv4 and IPv6, pins the validated IP for the actual connection so DNS
+// rebinding cannot swap it at connect time, and revalidates every redirect hop
+// rather than only the initial URL. See src/utils/safeFetch.js.
+  const resp = await safeFetch(imageUrl, {
+    headers:  { "User-Agent": CONNECTOR_USER_AGENT },
+    maxBytes: MAX_MEDIA_DOWNLOAD_BYTES,
   });
   if (!resp.ok) {
-    throw new Error(`Failed to download image from ${imageUrl}: ${resp.status} ${resp.statusText}`);
+    throw new Error(`Failed to download image from ${imageUrl}: ${resp.status}`);
+  }
+  if (resp.truncated) {
+    throw new Error(`Image at ${imageUrl} exceeds the ${MAX_MEDIA_DOWNLOAD_BYTES} byte upload limit.`);
   }
 
   const buffer = Buffer.from(await resp.arrayBuffer());

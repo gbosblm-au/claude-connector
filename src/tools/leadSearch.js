@@ -5,6 +5,7 @@ import { CONNECTOR_USER_AGENT } from "../config.js";
 import { clamp, truncate } from "../utils/helpers.js";
 import { log } from "../utils/logger.js";
 
+import { safeFetch } from "../utils/safeFetch.js";
 const DISCOVERY_QUERY_BUILDERS = [
   (query) => query,
   (query) => `${query} official website contact email phone`,
@@ -978,22 +979,32 @@ async function fetchAndExtractPage(url) {
   }
 }
 
+// v12.28.0 (TNX-C-009) -- SSRF guard.
+//
+// This research fetch fetched a caller-supplied URL with `redirect: "follow"` and no
+// address validation of any kind. Combined with the previously unauthenticated
+// MCP surface (TNX-C-001), it let an anonymous caller use the connector as a
+// proxy into the private network: cloud instance metadata at 169.254.169.254,
+// the connector's own routes on localhost, and the Gateway Service and Postgres
+// on the internal network.
+//
+// safeFetch resolves the hostname, refuses every non-public address range for
+// both IPv4 and IPv6, pins the validated IP for the actual connection so DNS
+// rebinding cannot swap it at connect time, and revalidates every redirect hop
+// rather than only the initial URL. See src/utils/safeFetch.js.
 async function fetchWithTimeout(url, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await fetch(url, {
-      headers: {
-        "User-Agent": CONNECTOR_USER_AGENT,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
-      },
-      redirect: "follow",
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+  // Lead research follows company websites and sitemaps discovered from search
+  // results, so the URL is externally controlled even though no MCP caller
+  // typed it directly. That is exactly the case safeFetch exists for.
+  return safeFetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": CONNECTOR_USER_AGENT,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+    },
+    timeoutMs,
+    maxBytes: 5 * 1024 * 1024,
+  });
 }
 
 function extractPageSignals(pageUrl, html) {

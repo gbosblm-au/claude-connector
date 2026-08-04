@@ -8,7 +8,11 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = "node src/server-http.js"
-healthcheckPath = "/health"
+# v12.28.0 (TNX-H-004): pointed at readiness, not the old decorative /health.
+# The previous target returned the literal string "ok" without verifying
+# anything, so an instance whose /data volume had failed to mount kept
+# receiving traffic and the restart policy could never fire.
+healthcheckPath = "/health/ready"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
