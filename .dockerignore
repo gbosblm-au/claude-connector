@@ -48,6 +48,13 @@ scripts/**/node_modules
 **/*.spec.js
 **/*.log
 
+# TNX-M-017: committed Python bytecode. The archive contained
+# deploy/__pycache__/brain_scan.cpython-312.pyc while this image installs
+# Python 3.11, so it could never have been loaded. Excluded under any name.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
 # Credential material must never reach an image, under any filename, even if a
 # future !rule above would otherwise admit it. Docker evaluates rules in order,
 # so these trailing lines win.

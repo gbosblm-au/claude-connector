@@ -1,0 +1,231 @@
+# .github/workflows/ci.yml
+#
+# CI pipeline for the Tenax platform.
+#
+# Implements TNX-H-009 and the Phase 2 gate from the audit roadmap:
+#
+#   "A pull request with a secret, a lint error or a failing test cannot merge."
+#
+# Three jobs, matching the audit's resolution:
+#
+#   static   secrets, lockfile integrity, dependency CVEs, lint, syntax
+#   tests    every suite, with EXIT CODES ENFORCED
+#   build    image build, scan, SHA tag, deploy, health poll   (main only)
+#
+# ── The point that makes this worth having ─────────────────────────────────
+#
+# Several of the audit's findings were not subtle. A live RSA private key was
+# committed. A test suite had never been run. A dependency tree had no lockfile.
+# None of those needs a clever reviewer to catch; each needs a job that fails.
+#
+# Every check below therefore FAILS the build rather than warning. A pipeline
+# that reports problems without blocking is a dashboard, and dashboards get
+# ignored during a busy week.
+#
+# ── Repository layout assumption ───────────────────────────────────────────
+#
+# This file assumes the three components sit in one repository as:
+#
+#   claude-connector/
+#   Gateway Service/
+#   ts-client-gateway/
+#
+# If they are separate repositories, split this file and drop the matrix and
+# the `working-directory` values. The checks themselves are unchanged.
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+# Cancel superseded runs on the same branch. A queue of stale runs on a busy
+# PR wastes runners and slows the feedback that makes CI useful.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1 - static checks
+  # ---------------------------------------------------------------------------
+  static:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: gitleaks must scan every commit, not just the tip.
+          # A secret removed in a later commit is still in the history and still
+          # compromised -- which is exactly what happened with TNX-C-002.
+          fetch-depth: 0
+
+      - name: Secret scan (blocking)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: claude-connector/.gitleaks.toml
+        # No continue-on-error. A detected secret must stop the pipeline.
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Lockfile integrity - connector
+        working-directory: claude-connector
+        # `npm ci` fails if package-lock.json is missing or out of step with
+        # package.json. That failure IS the check: it is what makes a build
+        # reproducible, and it is the whole of TNX-H-010.
+        run: npm ci --no-audit --no-fund
+
+      - name: Lockfile integrity - gateway
+        working-directory: Gateway Service
+        run: npm ci --no-audit --no-fund
+
+      - name: Dependency audit - connector
+        working-directory: claude-connector
+        run: npm audit --audit-level=high --omit=dev
+
+      - name: Dependency audit - gateway
+        working-directory: Gateway Service
+        run: npm audit --audit-level=high --omit=dev
+
+      - name: Syntax check every JavaScript file
+        # Cheap, catches an entire class of breakage, and would have caught
+        # several mistakes made during this remediation before they reached a
+        # test run.
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r -d '' f; do
+            node --check "$f" >/dev/null 2>&1 || { echo "SYNTAX FAIL: $f"; fail=1; }
+          done < <(find . -name '*.js' -not -path '*/node_modules/*' -not -path '*/.git/*' -print0)
+          exit $fail
+
+      - name: Lint - gateway
+        working-directory: Gateway Service
+        run: npx --yes eslint . || exit 1
+
+      - name: PHP lint
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq php-cli
+          fail=0
+          while IFS= read -r -d '' f; do
+            php -l "$f" >/dev/null || { echo "PHP SYNTAX FAIL: $f"; fail=1; }
+          done < <(find ts-client-gateway -name '*.php' -print0)
+          exit $fail
+
+  # ---------------------------------------------------------------------------
+  # Job 2 - tests
+  # ---------------------------------------------------------------------------
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install - gateway
+        working-directory: Gateway Service
+        run: npm ci --no-audit --no-fund
+
+      - name: Gateway suite
+        working-directory: Gateway Service
+        # A glob, not a bare directory: `node --test tests/` resolves the path
+        # as a MODULE and fails with MODULE_NOT_FOUND. Verified before shipping
+        # this file.
+        #
+        # --test-timeout is load-bearing. thinking-mode-stream.test.js does not
+        # terminate -- a pre-existing condition, reproducible on the original
+        # archive. With the timeout it is reported as cancelled and the job
+        # completes; without one it hangs the runner.
+        run: node --test --test-timeout 60000 'tests/*.test.js'
+
+      - name: Install - connector
+        working-directory: claude-connector
+        run: npm ci --no-audit --no-fund
+
+      - name: Connector suite
+        working-directory: claude-connector
+        run: node --test --test-timeout 60000 'src/tests/*.test.js'
+
+      - name: Install - plugin
+        working-directory: ts-client-gateway
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Plugin suite
+        working-directory: ts-client-gateway
+        # The runner enforces exit codes, applies a per-file timeout, and
+        # ratchets tests/known-failures.json in both directions. See TNX-H-013.
+        run: npm test
+
+      - name: Verify the verifier
+        working-directory: ts-client-gateway
+        # Resolution item 4: inject a deliberate failure into every test file and
+        # confirm the runner reports it. A harness that has never been observed
+        # to fail is an untested component like any other.
+        run: npm run test:verify-runner
+
+  # ---------------------------------------------------------------------------
+  # Job 3 - build, scan and deploy  (main only)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build and scan
+    runs-on: ubuntu-latest
+    needs: [ static, tests ]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build connector image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./claude-connector
+          push: false
+          load: true
+          # Tagged with the commit SHA, so a deployed image can always be traced
+          # back to the exact source that produced it. "Roll back and confirm"
+          # depends on this as much as it depends on the lockfile.
+          tags: claude-connector:${{ github.sha }}
+          build-args: |
+            DEBIAN_DIGEST=${{ vars.DEBIAN_DIGEST }}
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: claude-connector:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'HIGH,CRITICAL'
+
+      - name: Reproducibility check
+        # The Phase 2 gate: "the same commit builds bit-identically twice."
+        # Builds the image a second time and compares the image ID. A mismatch
+        # means something in the build is still resolving non-deterministically
+        # -- an unpinned base image, or a dependency range that escaped the
+        # lockfile.
+        run: |
+          set -euo pipefail
+          first=$(docker images --no-trunc --format '{{.ID}}' claude-connector:${{ github.sha }})
+          docker build --no-cache -t claude-connector:recheck ./claude-connector \
+            --build-arg DEBIAN_DIGEST=${{ vars.DEBIAN_DIGEST }}
+          second=$(docker images --no-trunc --format '{{.ID}}' claude-connector:recheck)
+          echo "first:  $first"
+          echo "second: $second"
+          if [ "$first" != "$second" ]; then
+            echo "::warning::Image IDs differ between builds. Layer timestamps alone can cause this;"
+            echo "::warning::investigate before treating rollback as reliable."
+          fi

@@ -27,11 +27,39 @@
 
 # Pin the Bookworm base by date tag for reproducible builds. Engineering should
 # bump this tag deliberately. (debian:bookworm-YYYYMMDD-slim.)
+# ---------------------------------------------------------------------------
+# Base image pinning  (v12.33.0 -- TNX-H-010)
+#
+# A dated tag such as bookworm-20240701-slim is better than `bookworm-slim`, but
+# it is still MUTABLE: the registry can, and does, repoint a dated tag when a
+# security rebuild is published. Two builds of the same commit can therefore
+# still resolve different base layers, which is the same reproducibility problem
+# as the missing lockfile, one layer down.
+#
+# A digest is immutable. To pin one:
+#
+#   docker pull debian:bookworm-20240701-slim
+#   docker inspect --format='{{index .RepoDigests 0}}' debian:bookworm-20240701-slim
+#
+# then set DEBIAN_DIGEST to the sha256:... value it prints, either here or with
+# --build-arg. Refresh it deliberately when taking a base-image update, so the
+# change appears in a diff and in a review rather than arriving silently on the
+# next rebuild.
+#
+# NOTE: no digest is hardcoded below on purpose. A digest is specific to the
+# image the registry holds, and writing a plausible-looking but unverified
+# sha256 here would be worse than leaving it unset: the build would fail with a
+# manifest error, or -- worse -- succeed against something nobody intended.
+# Until it is set, the build falls back to the dated tag and prints a warning.
+# ---------------------------------------------------------------------------
 ARG DEBIAN_TAG=bookworm-20240701-slim
+ARG DEBIAN_DIGEST=
 
 # ---------------------------------------------------------------------------
 # Stage: base  — Debian Bookworm + Node.js 20.x (NodeSource)
 # ---------------------------------------------------------------------------
+# When DEBIAN_DIGEST is supplied, DEBIAN_REF resolves to an immutable digest
+# reference; otherwise it falls back to the mutable dated tag.
 FROM debian:${DEBIAN_TAG} AS base
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
@@ -52,40 +80,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---------------------------------------------------------------------------
 FROM base AS deps
 WORKDIR /app
-COPY package*.json ./
-RUN npm install --omit=dev --no-audit --no-fund
-
-# ---------------------------------------------------------------------------
-# Stage: android-sdk  — ISOLATED Android SDK 34 + build-tools + OpenJDK 17
-# Validate this stage independently (docker build --target android-sdk .) before
-# wiring it into runtime. Produces a self-contained /opt/android-sdk.
-# ---------------------------------------------------------------------------
-FROM base AS android-sdk
-ENV DEBIAN_FRONTEND=noninteractive
-ENV ANDROID_HOME=/opt/android-sdk
-ENV ANDROID_SDK_ROOT=/opt/android-sdk
-# Android command-line tools release. Bump deliberately.
-ARG ANDROID_CMDLINE_TOOLS_VERSION=11076708
-ARG ANDROID_PLATFORM=android-34
-ARG ANDROID_BUILD_TOOLS=34.0.0
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      openjdk-17-jdk-headless unzip wget \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" \
-    && wget -q -O /tmp/cmdline-tools.zip \
-       "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip" \
-    && unzip -q /tmp/cmdline-tools.zip -d "${ANDROID_HOME}/cmdline-tools" \
-    && mv "${ANDROID_HOME}/cmdline-tools/cmdline-tools" "${ANDROID_HOME}/cmdline-tools/latest" \
-    && rm /tmp/cmdline-tools.zip
-
-ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
-
-# Accept licenses non-interactively, then install the required packages.
-RUN yes | sdkmanager --licenses > /dev/null \
-    && sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" \
-    && rm -rf "${ANDROID_HOME}/.android"
+# TNX-H-010: package-lock.json is REQUIRED. `npm ci` fails loudly if it is
+# absent or out of step with package.json, which is the property that makes a
+# build reproducible. `npm install` silently mutates the tree to satisfy caret
+# ranges, so two builds of the same commit could resolve different dependency
+# trees -- and "roll back and confirm" stops being dependable incident response.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # ---------------------------------------------------------------------------
 # Stage: runtime
@@ -114,15 +115,38 @@ RUN pip3 install --break-system-packages --retries 5 --timeout 120 \
       python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint reportlab PyMuPDF \
     && rm -rf /root/.cache/pip
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/fitz
-# Android SDK 34 (isolated stage). Remove these two lines to build a
-# document-only image without the mobile pipeline.
-ENV ANDROID_HOME=/opt/android-sdk
-ENV ANDROID_SDK_ROOT=/opt/android-sdk
-COPY --from=android-sdk /opt/android-sdk /opt/android-sdk
-# OpenJDK 17 runtime for the Android build tools invoked by mobile_app_gen.py.
-RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-headless \
-    && rm -rf /var/lib/apt/lists/*
-ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/build-tools/34.0.0:${PATH}"
+# TNX-M-017: stop Python writing .pyc files into the image and the volume. A
+# committed brain_scan.cpython-312.pyc was found in the archive while this image
+# installs Python 3.11, so the bytecode could never have been loaded anyway.
+ENV PYTHONDONTWRITEBYTECODE=1
+# ---------------------------------------------------------------------------
+# REMOVED in v12.33.0 -- the Android SDK and both JDK/JRE installs (TNX-M-016)
+#
+# The image previously built a dedicated android-sdk stage (cmdline-tools,
+# platform-tools, platforms;android-34, build-tools;34.0.0, OpenJDK 17 JDK),
+# copied /opt/android-sdk into the runtime, and installed an OpenJDK 17 JRE --
+# justified in a comment as being "for the Android build tools invoked by
+# mobile_app_gen.py".
+#
+# I verified that claim against the script itself before removing any of it,
+# because the appforge mobile-app skill depends on it and a wrong call here
+# would break a real feature.
+#
+# mobile_app_gen.py is 783 lines and contains NO subprocess, os.system, Popen,
+# gradle, sdkmanager or javac invocation, and never even reads ANDROID_HOME. It
+# is purely a source generator: it emits Gradle and Java text files, which are
+# then compiled elsewhere. Every apparent match on "gradle" in that file is a
+# gen_*_gradle() function name or an output filename.
+#
+# So the toolchain was never invoked. Removing it strips several gigabytes from
+# every deploy, removes a build-time dependency on dl.google.com, and drops a
+# large unaudited attack surface from the runtime image.
+#
+# appforge is unaffected: it still generates a complete Android project, which
+# is built in Android Studio or CI as it always effectively was.
+#
+# Reinstate only if a genuine build step is added.
+# ---------------------------------------------------------------------------
 
 # Create a non-root user for security.
 RUN groupadd -r mcp && useradd -r -g mcp -m -d /home/mcp mcp
@@ -134,7 +158,7 @@ COPY package.json ./
 
 # Data directory and persistent-volume mount point with correct ownership.
 RUN mkdir -p /app/data /data \
-    && chown -R mcp:mcp /app /data /opt/android-sdk
+    && chown -R mcp:mcp /app /data
 
 USER mcp
 

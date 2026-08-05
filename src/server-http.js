@@ -1868,7 +1868,7 @@ app.get("/memory/admin/dump", (req, res) => {
   const header = req.headers["authorization"] || "";
   const match = /^Bearer\s+(.+)$/i.exec(header);
   const supplied = match ? match[1].trim() : "";
-  if (!supplied || supplied !== MEMORY_AUTH_TOKEN) {
+  if (!constantTimeEquals(supplied, MEMORY_AUTH_TOKEN)) {
     res.status(401).json({
       error: "Authorization header missing or invalid.",
       code: "AUTH_REQUIRED",
@@ -2146,7 +2146,7 @@ app.post("/upload/connections", async (req, res) => {
     res.status(403).json({ error: "Upload disabled. Set UPLOAD_API_KEY in Railway Variables." });
     return;
   }
-  if ((req.headers["x-upload-key"] || "") !== UPLOAD_API_KEY) {
+  if (!constantTimeEquals(String(req.headers["x-upload-key"] || ""), UPLOAD_API_KEY)) {
     res.status(401).json({ error: "Invalid upload key" });
     return;
   }
@@ -2653,7 +2653,7 @@ app.post("/restore-skill", async (req, res) => {
     return;
   }
 
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
     return;
   }
@@ -2705,7 +2705,7 @@ app.post("/restore-books", async (req, res) => {
     return;
   }
 
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
     return;
   }
@@ -2757,7 +2757,7 @@ app.post("/restore-profiles", async (req, res) => {
     return;
   }
 
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
     return;
   }
@@ -2796,7 +2796,7 @@ app.post("/restore-modules", async (req, res) => {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
   }
   const providedToken = req.headers["x-railway-restore-token"] || "";
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
   }
   try {
@@ -2823,7 +2823,7 @@ app.post("/restore-personality", async (req, res) => {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
   }
   const providedToken = req.headers["x-railway-restore-token"] || "";
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
   }
   try {
@@ -2851,7 +2851,7 @@ app.post("/restore-dispatch-rules", async (req, res) => {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
   }
   const providedToken = req.headers["x-railway-restore-token"] || "";
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
   }
   try {
@@ -2879,7 +2879,7 @@ app.post("/restore-archive", async (req, res) => {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
   }
   const providedToken = req.headers["x-railway-restore-token"] || "";
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
   }
   try {
@@ -2906,7 +2906,7 @@ app.post("/restore-references", async (req, res) => {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
   }
   const providedToken = req.headers["x-railway-restore-token"] || "";
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
   }
   try {
@@ -2933,7 +2933,7 @@ app.post("/restore-scripts", async (req, res) => {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
   }
   const providedToken = req.headers["x-railway-restore-token"] || "";
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token header." });
   }
   try {
@@ -2964,7 +2964,7 @@ app.get("/tools", (req, res) => {
   if (!RAILWAY_RESTORE_TOKEN) {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Cannot authenticate tool manifest requests." });
   }
-  if (token !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(token, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
   }
 
@@ -3023,7 +3023,7 @@ app.post("/tool-call", mcpRateLimiter, async (req, res) => {
   if (!RAILWAY_RESTORE_TOKEN) {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Cannot authenticate tool-call requests." });
   }
-  if (token !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(token, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
   }
 
@@ -3441,7 +3441,7 @@ app.post("/set-modular-mode", (req, res) => {
     return res.status(503).json({ error: "Skill volume not configured (SKILL_FILE_PATH not set)." });
   }
   const token = req.headers["x-railway-restore-token"] || "";
-  if (!RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN) {
+  if (!RAILWAY_RESTORE_TOKEN || !constantTimeEquals(token, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
   }
   const body    = req.body || {};
@@ -3491,7 +3491,7 @@ app.get("/brain-data", async (req, res) => {
   if (!RAILWAY_RESTORE_TOKEN) {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set. Cannot authenticate brain-data requests." });
   }
-  if (token !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(token, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
   }
 
@@ -3563,7 +3563,7 @@ app.post('/brain-scan', async (req, res) => {
 
 app.get("/brain-data/status", (req, res) => {
   const token = (req.query.token || req.headers["x-railway-restore-token"] || "").toString().trim();
-  if (!RAILWAY_RESTORE_TOKEN || token !== RAILWAY_RESTORE_TOKEN) {
+  if (!RAILWAY_RESTORE_TOKEN || !constantTimeEquals(token, RAILWAY_RESTORE_TOKEN)) {
     return res.status(401).json({ error: "Invalid or missing X-Railway-Restore-Token." });
   }
   const paths = getBrainScanPaths();
@@ -3609,7 +3609,7 @@ app.get("/skill-export", (req, res) => {
   }
 
   const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
   }
 
@@ -3719,7 +3719,7 @@ app.post("/ti-skill-compile", async (req, res) => {
   }
 
   const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
   }
 
@@ -3776,7 +3776,7 @@ app.post("/ti-skill-check-scope", async (req, res) => {
     return res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set.", hint: "Set RAILWAY_RESTORE_TOKEN to enable this endpoint." });
   }
   const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
-  if (providedToken !== RAILWAY_RESTORE_TOKEN) {
+  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
     return res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
   }
 
