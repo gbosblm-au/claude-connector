@@ -3437,31 +3437,31 @@ app.post('/data/upload-binary', (_req, res) => {
   });
 });
 // GET /tools — tool manifest for Tenax gateway discovery (v2.4.4+)
-app.get('/tools', async (req, res) => {
-  const MODULAR_TOOL_NAMES = new Set([
-    "skill_compile", "skill_load_specialist", "skill_recompile",
-    "personality_write", "dispatch_rule_add", "module_write",
-  ]);
-  const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
-  const modularTools = isModularEnabled()
-    ? [
-        skillCompileToolDefinition,
-        skillLoadSpecialistToolDefinition,
-        skillRecompileToolDefinition,
-        personalityWriteToolDefinition,
-        dispatchRuleAddToolDefinition,
-        moduleWriteToolDefinition,
-      ]
-    : [];
-  const allTools = [...baseTools, ...modularTools];
-
-  // Apply tenant write-tool filtering (same as MCP handler)
-  const tenantId = req.headers['x-tenant-id'] || null;
-  if (tenantId && tenantId !== 'ava') {
-    return res.json({ tools: allTools.filter(t => !SYSTEM_WRITE_TOOLS.has(t.name)) });
-  }
-  return res.json({ tools: allTools });
-});
+// ---------------------------------------------------------------------------
+// REMOVED in v12.35.0 -- a second GET /tools registration (TNX-M-002)
+//
+// `GET /tools` was registered TWICE. Express dispatches to the first match, so
+// this second async handler was unreachable dead code from the moment it was
+// added.
+//
+// I compared them before deleting rather than assuming the later one was the
+// intended replacement, because the audit notes "the two implementations
+// differ, so it is unclear which was intended". The live handler is a strict
+// superset:
+//
+//                              live (kept)   second (removed)
+//   X-Railway-Restore-Token    yes           NO AUTH AT ALL
+//   modular tool swapping      yes           yes
+//   tenant write-tool filter   yes           yes
+//   MCP -> Anthropic schema    yes           no
+//
+// So the dead one added nothing and would have removed authentication had the
+// registration order ever been reversed -- which a routine reordering of this
+// 3,500-line file could have done silently.
+//
+// A boot assertion now fails the process if any method/path pair is registered
+// twice, so this cannot recur unnoticed.
+// ---------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------
 // 404

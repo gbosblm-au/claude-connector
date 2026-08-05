@@ -153,12 +153,34 @@ import {
   handleEmailGetSenderProfiles,
   handleEmailValidateAddress,
 } from "./tools/email.js";
-import {
-  emailGetTrackingToolDefinition,
-  emailTrackingSummaryToolDefinition,
-  handleEmailGetTracking,
-  handleEmailTrackingSummary,
-} from "./tools/emailTracking.js";
+// ---------------------------------------------------------------------------
+// REMOVED in v12.35.0 -- the email-tracking MCP tools (TNX-M-003)
+//
+// src/tools/emailTracking.js is 0 BYTES. This file imported six named exports
+// from it, and an ES module named import from a module that exports nothing is
+// a LINK-TIME error -- so `npm run start:stdio` could not start at all:
+//
+//   SyntaxError: The requested module './tools/emailTracking.js' does not
+//   provide an export named 'emailGetTrackingToolDefinition'
+//
+// server-http.js never imported the file (it only reads
+// config.emailTrackingEnabled), which is why the HTTP transport kept working
+// and this went unnoticed.
+//
+// I searched the whole tree before removing these: emailGetTracking,
+// emailTrackingSummary and emailReplyCheck are implemented NOWHERE, and the
+// HTTP transport does not register them either -- the only remaining trace is
+// a stale comment at server-http.js:38. So this is not a move; the
+// implementation is gone.
+//
+// FEATURE REGRESSION, flagged for the platform owner rather than silently
+// papered over: email_get_tracking, email_tracking_summary and
+// email_reply_check are unavailable on BOTH transports and have been for some
+// time. Open and click COLLECTION still works -- /track/open and /track/click
+// are live -- so the data is being recorded; only the tools that query it are
+// missing. Restoring them needs the original source, which is not in this
+// artifact.
+// ---------------------------------------------------------------------------
 import {
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
@@ -212,10 +234,6 @@ import {
   wpGetContentToolDefinition,
   handleWpGetContent,
 } from "./tools/wordpress.js";
-import {
-  emailReplyCheckToolDefinition,
-  handleEmailReplyCheck,
-} from "./tools/emailTracking.js";
 
 // ---------- v9.0.0: Statistical analysis & machine learning ----------
 import {
@@ -323,9 +341,6 @@ const TOOLS = [
   emailGetConfigToolDefinition,
   emailGetSenderProfilesToolDefinition,
   emailValidateAddressToolDefinition,
-  emailGetTrackingToolDefinition,
-  emailTrackingSummaryToolDefinition,
-  emailReplyCheckToolDefinition,
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
   emailScheduleListToolDefinition,
@@ -473,9 +488,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "email_get_sender_profiles":    return await handleEmailGetSenderProfiles(args);
       case "email_validate_address":       return await handleEmailValidateAddress(args);
       // SCOPE-04 tracking
-      case "email_get_tracking":           return await handleEmailGetTracking(args);
-      case "email_tracking_summary":       return await handleEmailTrackingSummary(args);
-      case "email_reply_check":            return await handleEmailReplyCheck(args);
       // SCOPE-05 scheduling
       case "email_schedule":               return await handleEmailSchedule(args);
       case "email_schedule_cancel":        return await handleEmailScheduleCancel(args);

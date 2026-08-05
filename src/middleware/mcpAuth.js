@@ -465,6 +465,53 @@ export function auditRouteCoverage( app ) {
 }
 
 /**
+ * Detect a method/path pair registered more than once.
+ *
+ * TNX-M-002 resolution. `GET /tools` was registered twice; Express dispatches
+ * to the first match, so the second handler was unreachable dead code. The two
+ * differed, and the later one had NO authentication -- so a routine reordering
+ * of this 3,500-line file could have silently swapped an authenticated handler
+ * for an unauthenticated one.
+ *
+ * Duplicate registration is almost never intentional, and when it is (an
+ * explicit fall-through chain) the handlers are adjacent and obvious. Failing
+ * the boot is the right response because the alternative is code that looks
+ * live, is reviewed as live, and never runs.
+ *
+ * @param {import('express').Application} app
+ * @returns {{ ok: boolean, duplicates: string[] }}
+ */
+export function findDuplicateRoutes( app ) {
+  const stack = app?._router?.stack || app?.router?.stack;
+  if ( ! Array.isArray( stack ) ) return { ok: true, duplicates: [] };
+
+  /** @type {Map<string, number>} */
+  const seen = new Map();
+
+  for ( const layer of stack ) {
+    if ( ! layer.route ) continue;
+    const paths = Array.isArray( layer.route.path ) ? layer.route.path : [ layer.route.path ];
+
+    for ( const p of paths ) {
+      // route.methods is { get: true, post: true, ... }
+      for ( const method of Object.keys( layer.route.methods || {} ) ) {
+        // Express registers app.all() as every method at once; counting those
+        // as duplicates of a specific handler would be a false positive.
+        if ( method === '_all' ) continue;
+        const key = `${ method.toUpperCase() } ${ p }`;
+        seen.set( key, ( seen.get( key ) || 0 ) + 1 );
+      }
+    }
+  }
+
+  const duplicates = [ ...seen.entries() ]
+    .filter( ( [ , n ] ) => n > 1 )
+    .map( ( [ key, n ] ) => `${ key } (registered ${ n } times)` );
+
+  return { ok: duplicates.length === 0, duplicates };
+}
+
+/**
  * Boot-time wrapper. Runs the coverage audit and throws on failure.
  *
  * @param {import('express').Application} app
@@ -479,6 +526,15 @@ export function assertAllRoutesCovered( app ) {
       ? result.reason
       : `The following routes are reachable without authentication:\n  - ${ result.uncovered.join( '\n  - ' ) }`;
     throw new Error( `Route coverage assertion failed.\n${ detail }` );
+  }
+
+  // TNX-M-002: a duplicate registration means one handler is unreachable.
+  const dupes = findDuplicateRoutes( app );
+  if ( ! dupes.ok ) {
+    throw new Error(
+      'These routes are registered more than once, so all but the first are unreachable:\n  - ' +
+      dupes.duplicates.join( '\n  - ' )
+    );
   }
 
   return { checked: result.checked };

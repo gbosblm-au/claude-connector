@@ -65,6 +65,14 @@ scripts/**/node_modules
 **/id_rsa*
 **/service-account*.json
 **/*credentials*.json
+# TNX-M-004: a live 53 KB SQLite database (_memory_) was committed in the
+# artifact, created by a path misconfiguration -- the intended path is
+# /data/memory.db. Its two rows were test fixtures, but a database written to
+# the wrong path is not something to rely on being harmless next time.
+_memory_
+**/*.db
+**/*.sqlite
+**/*.sqlite3
 **/*secret*.json
 .env
 .env.*

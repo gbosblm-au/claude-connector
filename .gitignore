@@ -1,0 +1,35 @@
+# .gitignore
+#
+# TNX-M-004: a live SQLite database was committed in the artifact. This file did
+# not exist, so nothing prevented it.
+
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Databases written to a wrong path. The intended memory store is /data/memory.db,
+# outside the repository; anything matching these inside it is a misconfiguration.
+_memory_
+*.db
+*.sqlite
+*.sqlite3
+
+# Credential material, under any name.
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*service-account*.json
+*credentials*.json
+*secret*.json
+
+# Python bytecode (TNX-M-017).
+__pycache__/
+*.pyc
+*.pyo
+
+# Build and scratch artefacts.
+*.log
+.DS_Store
