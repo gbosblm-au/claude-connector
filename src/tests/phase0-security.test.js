@@ -953,3 +953,224 @@ describe( 'Auth gate: every self-authenticated route is exempt from the MCP key'
     else process.env.MCP_API_KEY = prev;
   } );
 } );
+
+// ---------------------------------------------------------------------------
+// SPEC-TNX-150BLOCK-2026-08-05 -- automated large-build hard-block rule
+//
+// Any single interactive write (script_write, reference_write, module_write)
+// over CHUNK_LIMIT_LINES is blocked and must be decomposed first.
+//
+// The rule existed in the Build Robustness Protocol as advice. Advice depends
+// on the author remembering, and large single writes of 300-900 lines
+// repeatedly dropped out mid-write, truncating deliverables. The failure was
+// silent: it surfaced later when a dependent step failed on a file that had
+// never been fully written.
+// ---------------------------------------------------------------------------
+
+describe( 'SPEC-TNX-150BLOCK: line counting', () => {
+  test( 'a trailing newline does not add a line', async () => {
+    // Spec 5.2. This matters because the number reported to the caller must
+    // match what they see when they open the file to check.
+    const { countLines } = await import( '../utils/chunkGuard.js' );
+    assert.equal( countLines( 'a\nb' ),  2 );
+    assert.equal( countLines( 'a\nb\n' ), 2 );
+    assert.equal( countLines( 'a' ),     1 );
+    assert.equal( countLines( '' ),      0 );
+    assert.equal( countLines( 'a\r\nb' ), 2, 'CRLF is one line break, not two' );
+  } );
+
+  test( 'the boundary is strictly greater than the limit', async () => {
+    const { countLines } = await import( '../utils/chunkGuard.js' );
+    const build = ( n ) => Array.from( { length: n }, ( _, i ) => `line ${ i }` ).join( '\n' );
+    assert.equal( countLines( build( 150 ) ), 150 );
+    assert.equal( countLines( build( 151 ) ), 151 );
+  } );
+} );
+
+describe( 'SPEC-TNX-150BLOCK: decomposition suggestions', () => {
+  test( 'part names follow DATA_PART_NAMING and a builder is proposed', async () => {
+    const { suggestDecomposition } = await import( '../utils/chunkGuard.js' );
+    const s = suggestDecomposition( 'journey_data.py', 400, 150 );
+
+    assert.ok( s.parts >= 3 );
+    assert.equal( s.part_files[ 0 ], 'journey_data_part01.py' );
+    assert.equal( s.builder, 'journey_data_build.py' );
+    assert.ok( s.lines_per_part <= 150, 'every proposed part must fit under the limit' );
+  } );
+
+  test( 'a file with no extension still produces usable names', async () => {
+    const { suggestDecomposition } = await import( '../utils/chunkGuard.js' );
+    const s = suggestDecomposition( 'Makefile', 300, 150 );
+    assert.equal( s.part_files[ 0 ], 'Makefile_part01' );
+  } );
+} );
+
+describe( 'SPEC-TNX-150BLOCK: configuration', () => {
+  test( 'enforcement is disabled ONLY by an explicit false', async () => {
+    // Spec 6. A typo must fail safe toward enforcement, not away from it,
+    // otherwise a misconfiguration silently removes the guard.
+    const prev = process.env.CHUNK_ENFORCE_SCRIPTS;
+
+    for ( const value of [ 'false', 'FALSE', '0', 'no', 'off' ] ) {
+      process.env.CHUNK_ENFORCE_SCRIPTS = value;
+      const { chunkConfig } = await import( `../utils/chunkGuard.js?c=${ Date.now() }${ value }` );
+      assert.equal( chunkConfig().scripts, false, `"${ value }" should disable` );
+    }
+
+    for ( const value of [ 'typo', 'true', '1', 'yes', '' ] ) {
+      process.env.CHUNK_ENFORCE_SCRIPTS = value;
+      const { chunkConfig } = await import( `../utils/chunkGuard.js?e=${ Date.now() }${ value }` );
+      assert.equal( chunkConfig().scripts, true, `"${ value }" should leave enforcement on` );
+    }
+
+    if ( prev === undefined ) delete process.env.CHUNK_ENFORCE_SCRIPTS;
+    else process.env.CHUNK_ENFORCE_SCRIPTS = prev;
+  } );
+
+  test( 'an invalid limit falls back to 150 rather than disabling the block', async () => {
+    const prev = process.env.CHUNK_LIMIT_LINES;
+    for ( const bad of [ 'abc', '-5', '0' ] ) {
+      process.env.CHUNK_LIMIT_LINES = bad;
+      const { chunkConfig } = await import( `../utils/chunkGuard.js?l=${ Date.now() }${ bad }` );
+      assert.equal( chunkConfig().limit, 150, `"${ bad }" must not disable the guard` );
+    }
+    if ( prev === undefined ) delete process.env.CHUNK_LIMIT_LINES;
+    else process.env.CHUNK_LIMIT_LINES = prev;
+  } );
+} );
+
+describe( 'SPEC-TNX-150BLOCK: the guard decision', () => {
+  const build = ( n ) => Array.from( { length: n }, ( _, i ) => `line ${ i }` ).join( '\n' );
+
+  test( 'exactly at the limit is permitted; one over is blocked', async () => {
+    const { checkChunkLimit } = await import( '../utils/chunkGuard.js' );
+
+    assert.equal( checkChunkLimit( { tool: 'script_write', filename: 'a.py', content: build( 150 ) } ).allowed, true );
+
+    const blocked = checkChunkLimit( { tool: 'script_write', filename: 'a.py', content: build( 151 ) } );
+    assert.equal( blocked.allowed, false );
+    assert.equal( blocked.rejection.code, 'CHUNK_LIMIT_EXCEEDED' );
+    assert.equal( blocked.rejection.line_count, 151 );
+    assert.equal( blocked.rejection.limit, 150 );
+    assert.equal( blocked.rejection.target, 'a.py' );
+    // Spec 9: a deterministic failure. Retrying with identical arguments will
+    // fail identically, so the caller must decompose instead.
+    assert.equal( blocked.rejection.retryable, false );
+    assert.ok( blocked.rejection.suggested_decomposition );
+  } );
+
+  test( 'a tool outside the three interactive writers is not evaluated', async () => {
+    const { checkChunkLimit } = await import( '../utils/chunkGuard.js' );
+    // archive_write, memory_write and skill_write_addition are exempt per
+    // spec 3.2, and script_execute may run an arbitrarily large on-disk file.
+    for ( const tool of [ 'archive_write', 'memory_write', 'skill_write_addition', 'script_execute' ] ) {
+      assert.equal(
+        checkChunkLimit( { tool, filename: 'x', content: build( 5000 ) } ).allowed,
+        true, `${ tool } must be exempt`
+      );
+    }
+  } );
+} );
+
+describe( 'SPEC-TNX-150BLOCK: end to end through the tool handlers', () => {
+  const build = ( n ) => Array.from( { length: n }, ( _, i ) => `line ${ i }` ).join( '\n' );
+
+  /**
+   * @returns {Promise<{ dir: string, mod: any }>}
+   */
+  async function withSkillRoot() {
+    const { mkdtempSync, mkdirSync } = await import( 'node:fs' );
+    const { tmpdir } = await import( 'node:os' );
+    const { join } = await import( 'node:path' );
+
+    const root = mkdtempSync( join( tmpdir(), 'chunk-' ) );
+    for ( const d of [ 'scripts', 'references', 'modules', 'archive' ] ) {
+      mkdirSync( join( root, 'ava', d ), { recursive: true } );
+    }
+
+    process.env.SKILL_FILE_PATH = join( root, 'SKILL.md' );
+    const mod = await import( `../tools/skill-content.js?root=${ Date.now() }${ Math.random() }` );
+    return { dir: root, mod };
+  }
+
+  /** @param {any} r @returns {object} */
+  const parse = ( r ) => JSON.parse( r.content[ 0 ].text );
+
+  test( 'an oversized script_write is rejected and nothing is written', async () => {
+    const { existsSync } = await import( 'node:fs' );
+    const { join } = await import( 'node:path' );
+    const { dir, mod } = await withSkillRoot();
+
+    const r = await mod.handleScriptWrite( { filename: 'big.py', content: build( 151 ) } );
+
+    assert.equal( r.isError, true );
+    assert.equal( parse( r ).code, 'CHUNK_LIMIT_EXCEEDED' );
+    // Spec 5.3: the rejected payload is NOT written and NOT backed up.
+    assert.equal( existsSync( join( dir, 'ava', 'scripts', 'big.py' ) ), false );
+  } );
+
+  test( 'a write at exactly the limit is permitted and lands intact', async () => {
+    const { existsSync, readFileSync } = await import( 'node:fs' );
+    const { join } = await import( 'node:path' );
+    const { dir, mod } = await withSkillRoot();
+
+    const r = await mod.handleScriptWrite( { filename: 'ok.py', content: build( 150 ) } );
+
+    assert.equal( parse( r ).success, true );
+    const file = join( dir, 'ava', 'scripts', 'ok.py' );
+    assert.equal( existsSync( file ), true );
+    assert.equal( readFileSync( file, 'utf8' ).split( '\n' ).length, 150 );
+  } );
+
+  test( 'reference_write and module_write are blocked the same way', async () => {
+    const { mod } = await withSkillRoot();
+
+    const ref = await mod.handleReferenceWrite( { filename: 'spec.md', content: build( 400 ) } );
+    assert.equal( ref.isError, true );
+    assert.equal( parse( ref ).suggested_decomposition.part_files[ 0 ], 'spec_part01.md' );
+
+    const modw = await mod.handleModuleWrite( { filename: 'mod.md', content: build( 200 ) } );
+    assert.equal( modw.isError, true );
+    assert.equal( parse( modw ).code, 'CHUNK_LIMIT_EXCEEDED' );
+  } );
+
+  test( 'archive_write of any size is exempt', async () => {
+    const { mod } = await withSkillRoot();
+    const r = await mod.handleArchiveWrite( { filename: 'record.md', content: build( 900 ) } );
+    assert.equal( parse( r ).success, true );
+  } );
+
+  test( 'the decomposition the guard proposes actually works', async () => {
+    const { mod } = await withSkillRoot();
+    for ( let i = 1; i <= 3; i += 1 ) {
+      const r = await mod.handleScriptWrite( {
+        filename: `journey_data_part0${ i }.py`,
+        content:  build( 140 ),
+      } );
+      assert.equal( parse( r ).success, true, `part ${ i } should write` );
+    }
+  } );
+
+  test( 'REGRESSION GUARD: bulk restore is never blocked', async () => {
+    // The guard lives in the interactive handlers, NOT in writeContentFile,
+    // because that function is also the write path for the /restore-* bulk
+    // recovery endpoints. Blocking there would fail any snapshot restore
+    // containing a file over the limit -- the same class of break as the
+    // v12.28.0 auth-gate gap that stopped connector snapshot push.
+    const { existsSync, readFileSync } = await import( 'node:fs' );
+    const { join } = await import( 'node:path' );
+    const { dir, mod } = await withSkillRoot();
+
+    const result = await mod.handleScriptRestoreFromWp( {
+      files:  { 'restored_big.py': build( 600 ) },
+      source: 'test',
+    } );
+
+    assert.equal( result.success, true );
+    assert.equal( result.files_restored, 1 );
+
+    const file = join( dir, 'ava', 'scripts', 'restored_big.py' );
+    assert.equal( existsSync( file ), true );
+    assert.equal( readFileSync( file, 'utf8' ).split( '\n' ).length, 600 );
+  } );
+} );

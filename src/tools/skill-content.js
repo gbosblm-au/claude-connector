@@ -48,6 +48,8 @@ import { join, basename, dirname } from 'node:path';
 // directory boundary test and why symlink refusal is a separate, necessary
 // control on top of any lexical check.
 import { resolveContained } from '../utils/pathContainment.js';
+// SPEC-TNX-150BLOCK: hard block on oversized interactive writes.
+import { checkChunkLimit } from '../utils/chunkGuard.js';
 import { log } from '../utils/logger.js';
 import { deriveModuleEntry, writeModuleFragment } from './manifest-fragments.js';
 
@@ -107,6 +109,24 @@ function requireContent(content) {
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Logger shim for the chunk guard.
+ *
+ * skill-content.js has no logger import of its own, and adding one would pull
+ * app wiring into a module that is deliberately standalone. Rejections are
+ * audit-relevant (spec 12), so they go to stderr with a stable prefix that is
+ * greppable in aggregated logs.
+ *
+ * @param {string} level
+ * @param {string} message
+ * @returns {void}
+ */
+function chunkLog(level, message) {
+  const line = `[${new Date().toISOString()}] [${String(level).toUpperCase()}] ${message}`;
+  if (level === 'error' || level === 'warn') console.error(line);
+  else console.log(line);
+}
 
 function getContentPaths() {
   const skillFilePath = process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md';
@@ -476,6 +496,32 @@ export async function handleModuleWrite(args) {
   let cleanPath;
   try {
     requireContent(content);
+
+    // ── SPEC-TNX-150BLOCK: hard block on oversized interactive writes ──────
+    //
+    // Checked BEFORE any filesystem work, so a rejected payload is never
+    // written and never backed up (spec 5.3). Returned as a normal tool error
+    // rather than a throw, so the caller receives the structured suggestion
+    // instead of a stack trace.
+    //
+    // The guard is here in the interactive handler and NOT in writeContentFile,
+    // because that function is also the write path for the /restore-* bulk
+    // recovery endpoints. Blocking there would fail any snapshot restore
+    // containing a file over the limit.
+    {
+      const chunkCheck = checkChunkLimit( {
+        tool:     'module_write',
+        filename: firstStringKey(args, 'filename', 'path') || 'unknown',
+        content,
+        log:      chunkLog,
+      } );
+      if ( ! chunkCheck.allowed ) {
+        return {
+          content: [ { type: 'text', text: JSON.stringify( chunkCheck.rejection, null, 2 ) } ],
+          isError: true,
+        };
+      }
+    }
     cleanPath = validateContentPath(file, ['md', 'json']);
   } catch (err) {
     if (err instanceof ToolValidationError) {
@@ -695,6 +741,32 @@ export async function handleReferenceWrite(args) {
     const { content, change_note } = args;
     const filename = firstStringKey(args, 'filename', 'path');
     requireContent(content);
+
+    // ── SPEC-TNX-150BLOCK: hard block on oversized interactive writes ──────
+    //
+    // Checked BEFORE any filesystem work, so a rejected payload is never
+    // written and never backed up (spec 5.3). Returned as a normal tool error
+    // rather than a throw, so the caller receives the structured suggestion
+    // instead of a stack trace.
+    //
+    // The guard is here in the interactive handler and NOT in writeContentFile,
+    // because that function is also the write path for the /restore-* bulk
+    // recovery endpoints. Blocking there would fail any snapshot restore
+    // containing a file over the limit.
+    {
+      const chunkCheck = checkChunkLimit( {
+        tool:     'reference_write',
+        filename: firstStringKey(args, 'filename', 'path') || 'unknown',
+        content,
+        log:      chunkLog,
+      } );
+      if ( ! chunkCheck.allowed ) {
+        return {
+          content: [ { type: 'text', text: JSON.stringify( chunkCheck.rejection, null, 2 ) } ],
+          isError: true,
+        };
+      }
+    }
     const clean  = validateContentPath(filename, ['md', 'txt', 'json']);
     const paths  = getContentPaths();
     const result = await writeContentFile(paths.referencesDir, 'references', clean, content, change_note);
@@ -734,6 +806,32 @@ export async function handleScriptWrite(args) {
     const { content, change_note } = args;
     const filename = firstStringKey(args, 'filename', 'path');
     requireContent(content);
+
+    // ── SPEC-TNX-150BLOCK: hard block on oversized interactive writes ──────
+    //
+    // Checked BEFORE any filesystem work, so a rejected payload is never
+    // written and never backed up (spec 5.3). Returned as a normal tool error
+    // rather than a throw, so the caller receives the structured suggestion
+    // instead of a stack trace.
+    //
+    // The guard is here in the interactive handler and NOT in writeContentFile,
+    // because that function is also the write path for the /restore-* bulk
+    // recovery endpoints. Blocking there would fail any snapshot restore
+    // containing a file over the limit.
+    {
+      const chunkCheck = checkChunkLimit( {
+        tool:     'script_write',
+        filename: firstStringKey(args, 'filename', 'path') || 'unknown',
+        content,
+        log:      chunkLog,
+      } );
+      if ( ! chunkCheck.allowed ) {
+        return {
+          content: [ { type: 'text', text: JSON.stringify( chunkCheck.rejection, null, 2 ) } ],
+          isError: true,
+        };
+      }
+    }
     const clean  = validateContentPath(filename, ['py', 'sh', 'js', 'mjs', 'cjs', 'ts', 'txt', 'md', 'json']);
     const paths  = getContentPaths();
     const result = await writeContentFile(paths.scriptsDir, 'scripts', clean, content, change_note);
