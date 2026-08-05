@@ -2293,6 +2293,47 @@ function ensureUploadDir() {
   }
 }
 
+/**
+ * Upload categories permitted to have their own subdirectory.
+ *
+ * v12.34.0 (Stage 2a): homework submissions land in their own folder rather
+ * than mixing with chat attachments, so retention, review and cleanup can treat
+ * them separately.
+ *
+ * An ALLOWLIST, not a sanitiser. The category reaches a filesystem path, and
+ * this endpoint is on the unauthenticated public allowlist (TNX-C-001 residual
+ * risk), so a caller-supplied path segment is exactly the input that must not
+ * be merely escaped. Anything not on this list falls back to the shared root.
+ */
+const UPLOAD_CATEGORIES = new Set([ 'homework' ]);
+
+/**
+ * Resolve the directory for an upload category.
+ *
+ * Even with the allowlist above, the result is passed through resolveContained
+ * so a future edit that widens the list cannot produce a path outside the
+ * upload root. Two independent controls, because the cost of the second is a
+ * single function call.
+ *
+ * @param {unknown} category
+ * @returns {{ dir: string, category: string }}
+ */
+function resolveUploadDir(category) {
+  const raw = String(category == null ? '' : category).trim().toLowerCase();
+  if (!raw || !UPLOAD_CATEGORIES.has(raw)) {
+    return { dir: USER_DATA_UPLOAD_DIR, category: '' };
+  }
+
+  const contained = resolveContained(USER_DATA_UPLOAD_DIR, raw);
+  if (!contained) {
+    log('warn', `upload: category "${raw}" did not resolve inside the upload root; using the root`);
+    return { dir: USER_DATA_UPLOAD_DIR, category: '' };
+  }
+
+  if (!existsSync(contained)) mkdirSync(contained, { recursive: true, mode: 0o755 });
+  return { dir: contained, category: raw };
+}
+
 // ---------------------------------------------------------------------------
 // Upload retention sweeper  (v12.12.0)
 //
@@ -2520,7 +2561,7 @@ if (UPLOAD_SWEEP_ENABLED) {
 app.post('/data/upload', async (req, res) => {
   try {
     ensureUploadDir();
-    const { filename, content_base64, mime_type, ttl_hours } = req.body || {};
+    const { filename, content_base64, mime_type, ttl_hours, category } = req.body || {};
 
     if (!filename || !content_base64) {
       return res.status(400).json({ error: 'filename and content_base64 are required' });
@@ -2563,7 +2604,11 @@ app.post('/data/upload', async (req, res) => {
     const timestamp = Date.now();
     const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
     const storedName = `${timestamp}_${safeName}`;
-    const filepath = pathJoin(USER_DATA_UPLOAD_DIR, storedName);
+    // v12.34.0 (Stage 2a): an allowlisted category gets its own subdirectory.
+    // Unknown or absent categories keep the existing behaviour exactly, so no
+    // current caller changes.
+    const { dir: targetDir, category: usedCategory } = resolveUploadDir(category);
+    const filepath = pathJoin(targetDir, storedName);
 
     writeFileSync(filepath, buffer);
 
@@ -2574,6 +2619,7 @@ app.post('/data/upload', async (req, res) => {
       created_at: new Date().toISOString(),
       expires_at: new Date(Date.now() + ttl * 60 * 60 * 1000).toISOString(),
       ttl_hours: ttl,
+      category: usedCategory || 'chat',
     };
     writeFileSync(filepath + '.meta.json', JSON.stringify(meta, null, 2));
 
