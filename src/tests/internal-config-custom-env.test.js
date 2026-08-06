@@ -466,7 +466,8 @@ describe( 'v12.37.0: /internal/config/env', () => {
 
 describe( 'v12.37.0: the connector builds download links, the model does not', () => {
   const saved = {};
-  const KEYS  = [ 'CONNECTOR_URL', 'DOCUMENT_DOWNLOAD_TOKEN', 'RAILWAY_PUBLIC_DOMAIN', 'DOWNLOADS_DIR' ];
+  const KEYS  = [ 'CONNECTOR_URL', 'DOCUMENT_DOWNLOAD_TOKEN', 'RAILWAY_PUBLIC_DOMAIN', 'DOWNLOADS_DIR',
+                  'ENABLE_SIGNED_LINKS', 'SIGNED_URL_SECRET' ];
 
   before( async () => {
     for ( const k of KEYS ) saved[ k ] = process.env[ k ];
@@ -510,12 +511,15 @@ describe( 'v12.37.0: the connector builds download links, the model does not', (
     assert.equal( connectorBaseUrl(), '', 'no source configured must yield empty, not "undefined"' );
   } );
 
-  test( 'links carry DOCUMENT_DOWNLOAD_TOKEN and never RAILWAY_RESTORE_TOKEN', async () => {
+  test( 'legacy links carry DOCUMENT_DOWNLOAD_TOKEN and never RAILWAY_RESTORE_TOKEN', async () => {
     const { mkdtempSync, writeFileSync } = await import( 'node:fs' );
     const { tmpdir } = await import( 'node:os' );
     const { join }   = await import( 'node:path' );
 
     const dir = mkdtempSync( join( tmpdir(), 'dl-test-' ) );
+    // TNX-FEAT-SIGNEDURLS made signed links the default. This test locks the
+    // legacy shape, which ENABLE_SIGNED_LINKS=false must still produce exactly.
+    process.env.ENABLE_SIGNED_LINKS     = 'false';
     process.env.DOWNLOADS_DIR           = dir;
     process.env.CONNECTOR_URL           = 'https://connector.example.com';
     process.env.DOCUMENT_DOWNLOAD_TOKEN = 'doc-token';
@@ -541,12 +545,13 @@ describe( 'v12.37.0: the connector builds download links, the model does not', (
     assert.equal( JSON.stringify( links ).includes( 'restore-token-full-connector-control' ), false );
   } );
 
-  test( 'a token containing URL-significant characters is encoded', async () => {
+  test( 'a legacy token containing URL-significant characters is encoded', async () => {
     const { mkdtempSync, writeFileSync } = await import( 'node:fs' );
     const { tmpdir } = await import( 'node:os' );
     const { join }   = await import( 'node:path' );
 
     const dir = mkdtempSync( join( tmpdir(), 'dl-enc-' ) );
+    process.env.ENABLE_SIGNED_LINKS     = 'false';
     process.env.DOWNLOADS_DIR           = dir;
     process.env.CONNECTOR_URL           = 'https://c.example';
     process.env.DOCUMENT_DOWNLOAD_TOKEN = 'a/b+c=d e&f';
@@ -588,7 +593,11 @@ describe( 'v12.37.0: the connector builds download links, the model does not', (
     } );
 
     assert.deepEqual( links.map( ( l ) => l.filename ), [ 'Real.docx' ] );
-    assert.equal( warnings.length, 3, 'each refused name must be reported, not dropped silently' );
+
+    // Count only the refusal warnings. Signed mode also appends an expiry
+    // notice, which is informational and not a refusal.
+    const refusals = warnings.filter( ( w ) => w.includes( 'no link produced' ) );
+    assert.equal( refusals.length, 3, 'each refused name must be reported, not dropped silently' );
   } );
 
   test( 'a missing downloads directory yields no links and no throw', async () => {
@@ -603,12 +612,13 @@ describe( 'v12.37.0: the connector builds download links, the model does not', (
     assert.deepEqual( warnings, [] );
   } );
 
-  test( 'an unconfigured token is reported rather than producing a tokenless link', async () => {
+  test( 'in legacy mode an unconfigured token is reported rather than producing a tokenless link', async () => {
     const { mkdtempSync, writeFileSync } = await import( 'node:fs' );
     const { tmpdir } = await import( 'node:os' );
     const { join }   = await import( 'node:path' );
 
     const dir = mkdtempSync( join( tmpdir(), 'dl-notok-' ) );
+    process.env.ENABLE_SIGNED_LINKS = 'false';
     process.env.DOWNLOADS_DIR = dir;
     process.env.CONNECTOR_URL = 'https://c.example';
     delete process.env.DOCUMENT_DOWNLOAD_TOKEN;

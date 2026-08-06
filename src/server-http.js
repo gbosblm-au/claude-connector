@@ -61,6 +61,8 @@ import {
 import { resolveContained, isSafeFilename }                        from './utils/pathContainment.js';
 // v12.37.0: internal configuration bridge (GET|POST /internal/config/env).
 import { createInternalConfigHandler }                             from './utils/internalConfig.js';
+// TNX-FEAT-SIGNEDURLS: per-file HMAC signed download links.
+import { verifySignedRequest, signedLinksEnabled, resolveSigningSecret, linkExpirySeconds } from './utils/signedUrls.js';
 // v12.28.0 (TNX-H-004 / TNX-H-006): process guards, HTTP timeout tuning,
 // graceful drain and readiness checks. The connector previously had none of
 // these; the gateway had all of them.
@@ -3218,6 +3220,101 @@ function documentTokenValid( supplied ) {
   return { ok: m1 || m2, configured: true };
 }
 
+/**
+ * Whether the legacy global DOCUMENT_DOWNLOAD_TOKEN is still accepted on
+ * /download and /preview while signed links are enabled.
+ *
+ * Defaults to true so that enabling signed links does not instantly break every
+ * link already sitting in a user's chat history, a bookmark, or the WordPress
+ * UI. Set ALLOW_LEGACY_DOWNLOAD_TOKEN=false once those have aged out.
+ *
+ * IMPORTANT: while this is true the global-blast-radius problem is only half
+ * solved, because a leaked token still opens every file. Completing the
+ * migration means turning it off.
+ *
+ * @returns {boolean}
+ */
+function legacyDownloadTokenAllowed() {
+  return String( process.env.ALLOW_LEGACY_DOWNLOAD_TOKEN || 'true' ).trim().toLowerCase() !== 'false';
+}
+
+/**
+ * Authorise a request for a document.  (TNX-FEAT-SIGNEDURLS)
+ *
+ * Order of evaluation, and why:
+ *
+ *   1. If the request carries `exp` or `sig`, it is a signed request and is
+ *      judged only as one. It never falls through to the token path, because a
+ *      tampered or expired signature that then succeeded on a token would make
+ *      expiry unenforceable for anyone holding the token.
+ *   2. Otherwise the legacy token path applies, subject to the two flags above.
+ *
+ * The filename passed in MUST be the validated, normalised name, not
+ * req.params.filename. Verifying the signature against the raw parameter would
+ * let an unnormalised variant satisfy a signature issued for a different file.
+ *
+ * @param {import('express').Request} req
+ * @param {string} safeFilename Validated single path segment.
+ * @returns {{ ok: true } | { ok: false, status: number, error: string }}
+ */
+function authoriseDocumentRequest( req, safeFilename ) {
+  const hasSignedParams = Boolean(
+    String( req.query?.exp || '' ).trim() || String( req.query?.sig || '' ).trim()
+  );
+
+  if ( signedLinksEnabled() && hasSignedParams ) {
+    const verdict = verifySignedRequest( {
+      filename: safeFilename,
+      exp:      req.query.exp,
+      sig:      req.query.sig,
+      log,
+    } );
+
+    if ( verdict.ok ) return { ok: true };
+
+    // 403 rather than 401 across the board: 401 invites a client to retry with
+    // credentials, and there are none to supply. The reason is named because a
+    // user whose link has simply aged out needs to be told to request a fresh
+    // one, not left guessing. Naming it discloses nothing an attacker could not
+    // determine by reading the expiry out of the URL they already hold.
+    const messages = {
+      expired:       'This download link has expired. Ask for a new one.',
+      bad_signature: 'Invalid download link signature.',
+      malformed:     'Malformed download link. Both exp and sig are required.',
+      missing:       'Malformed download link. Both exp and sig are required.',
+    };
+
+    return { ok: false, status: 403, error: messages[ verdict.reason ] || 'Forbidden.' };
+  }
+
+  if ( signedLinksEnabled() && ! legacyDownloadTokenAllowed() ) {
+    return {
+      ok:     false,
+      status: 403,
+      error:  'This connector requires a signed download link. Ask for a new link.',
+    };
+  }
+
+  const tokenCk = documentTokenValid( extractDocumentToken( req ) );
+
+  if ( ! tokenCk.configured ) {
+    return {
+      ok:     false,
+      status: 503,
+      error:  'No download token configured. Set DOCUMENT_DOWNLOAD_TOKEN in Railway Variables, or use a signed link.',
+    };
+  }
+
+  if ( ! tokenCk.ok ) {
+    return { ok: false, status: 401, error: 'Invalid or missing token.' };
+  }
+
+  return { ok: true };
+}
+
+/** Configured signed-link lifetime, read once for the boot log line. */
+const LINK_EXPIRY_SECONDS_CONFIGURED = linkExpirySeconds();
+
 /** Base directory for downloadable and previewable documents. */
 const DOWNLOADS_BASE = '/data/downloads';
 
@@ -3246,22 +3343,24 @@ const PREVIEW_EXTRACT_SCRIPT = process.env.PREVIEW_EXTRACT_SCRIPT
 app.get( '/download/:filename', ( req, res ) => {
   res.setHeader( 'Referrer-Policy', 'no-referrer' );
 
-  const token   = extractDocumentToken( req );
-  const tokenCk = documentTokenValid( token );
-
-  if ( ! tokenCk.configured ) {
-    return res.status( 503 ).json( { error: 'No download token configured. Set DOCUMENT_DOWNLOAD_TOKEN in Railway Variables.' } );
-  }
-  if ( ! tokenCk.ok ) {
-    return res.status( 401 ).json( { error: 'Invalid or missing token.' } );
-  }
-
   // v12.28.0 (TNX-C-010 item 2): basename() removes directory separators but
   // preserves quotes, semicolons, backticks, $, pipes and spaces. Re-validate
   // against a strict single-segment pattern in addition to basename().
+  //
+  // TNX-FEAT-SIGNEDURLS: this now runs BEFORE authorisation, because the
+  // signature is computed over the normalised filename. Verifying against the
+  // raw parameter would let an unnormalised variant satisfy a signature issued
+  // for a different file. Only filename syntax is disclosed ahead of the auth
+  // check; existence is still checked afterwards, so this is not an enumeration
+  // oracle.
   const safeName = basename( String( req.params.filename || '' ) );
   if ( ! isSafeFilename( safeName ) ) {
     return res.status( 400 ).json( { error: 'Invalid filename.' } );
+  }
+
+  const auth = authoriseDocumentRequest( req, safeName );
+  if ( ! auth.ok ) {
+    return res.status( auth.status ).json( { error: auth.error } );
   }
 
   // v12.28.0 (TNX-C-005 item 5): boundary-correct containment plus symlink
@@ -3333,22 +3432,23 @@ app.get( '/preview/:filename', async ( req, res ) => {
   };
   applyPreviewHeaders();
 
-  const token   = extractDocumentToken( req );
-  const tokenCk = documentTokenValid( token );
-
-  if ( ! tokenCk.configured ) {
-    return res.status( 503 ).json( { error: 'No download token configured.' } );
-  }
-  if ( ! tokenCk.ok ) {
-    return res.status( 401 ).json( { error: 'Invalid or missing token.' } );
-  }
-
   // v12.28.0 (TNX-C-010 item 2): strict single-segment validation on top of
   // basename(). This is the control that makes the execFileSync call below
   // safe even against a filename that was created before this release.
+  //
+  // TNX-FEAT-SIGNEDURLS: moved ahead of authorisation for the same reason as on
+  // /download -- the signature is computed over the normalised filename.
   const safeName = basename( String( req.params.filename || '' ) );
   if ( ! isSafeFilename( safeName ) ) {
     return res.status( 400 ).json( { error: 'Invalid filename.' } );
+  }
+
+  // Preview and download are the same document served two ways, so they share
+  // one authorisation path and one signature. A link signed for a file is valid
+  // for both routes, which is correct: neither grants access the other does not.
+  const auth = authoriseDocumentRequest( req, safeName );
+  if ( ! auth.ok ) {
+    return res.status( auth.status ).json( { error: auth.error } );
   }
 
   const ext   = extname( safeName ).toLowerCase();
@@ -4106,6 +4206,29 @@ try {
   console.error("[FATAL] Connector authentication is not configured.");
   console.error(err.message);
   process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Signed download links  (TNX-FEAT-SIGNEDURLS)
+//
+// The secret is resolved at boot rather than lazily on the first download, so
+// that a missing SIGNED_URL_SECRET or an unwritable /data volume is reported in
+// the deployment log while an operator is still watching, instead of surfacing
+// hours later as links that stopped working after a restart.
+// ---------------------------------------------------------------------------
+if (signedLinksEnabled()) {
+  try {
+    resolveSigningSecret(log);
+    log("info",
+      `Signed download links: ENABLED | expiry ${LINK_EXPIRY_SECONDS_CONFIGURED}s | ` +
+      `legacy token accepted: ${String(process.env.ALLOW_LEGACY_DOWNLOAD_TOKEN || "true").trim().toLowerCase() !== "false"}`);
+  } catch (err) {
+    log("error", `Signed download links could not be initialised: ${err.message}`);
+  }
+} else {
+  log("warn",
+    "Signed download links: DISABLED (ENABLE_SIGNED_LINKS=false). Generated links carry the " +
+    "global DOCUMENT_DOWNLOAD_TOKEN, never expire, and one leaked link exposes every document.");
 }
 
 try {

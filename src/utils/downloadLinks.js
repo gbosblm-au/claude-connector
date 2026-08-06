@@ -37,6 +37,9 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { extname } from 'node:path';
 import { resolveContained, isSafeFilename } from './pathContainment.js';
+// TNX-FEAT-SIGNEDURLS: per-file HMAC signatures replace the global token in
+// generated links. See src/utils/signedUrls.js.
+import { signedLinksEnabled, buildSignedQuery, linkExpirySeconds } from './signedUrls.js';
 
 /**
  * Directory served by GET /download/:filename.
@@ -153,29 +156,42 @@ export function snapshotDownloads() {
 /**
  * Build a single link record.
  *
+ * Two link shapes exist:
+ *
+ *   signed  ?exp=<unix_seconds>&sig=<hex>   (default)
+ *   legacy  ?token=<DOCUMENT_DOWNLOAD_TOKEN> (ENABLE_SIGNED_LINKS=false)
+ *
+ * The legacy shape is retained only as the rollout escape hatch. It has
+ * unlimited lifetime and global blast radius, which is what the signed shape
+ * exists to remove.
+ *
  * @param {string} filename Single path segment, already validated.
  * @param {string} base     Normalised connector base URL.
- * @param {string} token    Download token.
+ * @param {string} query    Pre-built query string, including the leading '?'.
  * @param {number} sizeBytes
- * @returns {{ filename: string, download_url: string, preview_url?: string, size_bytes: number }}
+ * @param {number|undefined} expiresAt Unix seconds, for signed links only.
+ * @returns {{ filename: string, download_url: string, preview_url?: string,
+ *             size_bytes: number, expires_at?: string, expires_in_seconds?: number }}
  */
-function buildLink( filename, base, token, sizeBytes ) {
-  // encodeURIComponent on the segment and on the token. isSafeFilename already
-  // restricts the name to [A-Za-z0-9._-], so this is belt and braces there, but
-  // the token is operator-supplied and may legitimately contain characters that
-  // are not query-safe.
+function buildLink( filename, base, query, sizeBytes, expiresAt ) {
   const segment = encodeURIComponent( filename );
-  const qs      = `?token=${ encodeURIComponent( token ) }`;
 
-  /** @type {{ filename: string, download_url: string, preview_url?: string, size_bytes: number }} */
+  /** @type {any} */
   const link = {
     filename,
-    download_url: `${ base }/download/${ segment }${ qs }`,
+    download_url: `${ base }/download/${ segment }${ query }`,
     size_bytes:   sizeBytes,
   };
 
   if ( PREVIEWABLE.has( extname( filename ).toLowerCase() ) ) {
-    link.preview_url = `${ base }/preview/${ segment }${ qs }`;
+    link.preview_url = `${ base }/preview/${ segment }${ query }`;
+  }
+
+  if ( Number.isFinite( expiresAt ) ) {
+    // Surfaced so the caller can tell the user the link is time limited rather
+    // than letting them discover it as an unexplained 403 an hour later.
+    link.expires_at         = new Date( expiresAt * 1000 ).toISOString();
+    link.expires_in_seconds = Math.max( 0, expiresAt - Math.floor( Date.now() / 1000 ) );
   }
 
   return link;
@@ -233,8 +249,15 @@ export function buildDownloadLinks( opts = {} ) {
     return { links: [], warnings };
   }
 
-  if ( ! token ) {
-    warnings.push( 'DOCUMENT_DOWNLOAD_TOKEN is not set on the connector service, so no download URL could be built.' );
+  // TNX-FEAT-SIGNEDURLS: the legacy global token is only consulted when signed
+  // links are switched off. When they are on, DOCUMENT_DOWNLOAD_TOKEN is not
+  // required for link generation at all.
+  const signed = signedLinksEnabled();
+
+  if ( ! signed && ! token ) {
+    warnings.push(
+      'ENABLE_SIGNED_LINKS is false and DOCUMENT_DOWNLOAD_TOKEN is not set, so no download ' +
+      'URL could be built. Either set the token or leave signed links enabled.' );
     return { links: [], warnings };
   }
 
@@ -250,9 +273,28 @@ export function buildDownloadLinks( opts = {} ) {
   for ( const name of names ) {
     const full = resolveContained( downloadsBase(), name );
     if ( ! full ) continue;
+
     let size = 0;
     try { size = statSync( full ).size; } catch { continue; }
-    links.push( buildLink( name, base, token, size ) );
+
+    if ( signed ) {
+      try {
+        const { exp, query } = buildSignedQuery( { filename: name } );
+        links.push( buildLink( name, base, query, size, exp ) );
+      } catch ( err ) {
+        // A signing failure must not silently degrade to an unsigned or
+        // token-bearing link. Report it and produce nothing for this file.
+        warnings.push( `${ name }: could not be signed (${ err.message }); no link produced.` );
+      }
+      continue;
+    }
+
+    links.push( buildLink( name, base, `?token=${ encodeURIComponent( token ) }`, size, undefined ) );
+  }
+
+  if ( signed && links.length > 0 ) {
+    warnings.push(
+      `Links expire after ${ linkExpirySeconds() } seconds. Tell the user the link is time limited.` );
   }
 
   return { links, warnings };
