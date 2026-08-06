@@ -59,6 +59,8 @@ import {
 }                                                                  from './middleware/mcpAuth.js';
 // v12.28.0 (TNX-C-005 / TNX-C-010): boundary-correct path containment.
 import { resolveContained, isSafeFilename }                        from './utils/pathContainment.js';
+// v12.37.0: internal configuration bridge (GET|POST /internal/config/env).
+import { createInternalConfigHandler }                             from './utils/internalConfig.js';
 // v12.28.0 (TNX-H-004 / TNX-H-006): process guards, HTTP timeout tuning,
 // graceful drain and readiness checks. The connector previously had none of
 // these; the gateway had all of them.
@@ -1857,6 +1859,42 @@ app.get(["/health/ready", "/health"], async (req, res) => {
     timestamp: new Date().toISOString(),
   });
 });
+
+// ---------------------------------------------------------------------------
+// INTERNAL CONFIG BRIDGE  (v12.37.0)
+//
+// GET|POST /internal/config/env
+//
+// Publishes a narrow, code-bounded set of runtime values so the session
+// orchestrator can learn the connector's own public URL without it being
+// hardcoded into a skill file.
+//
+// The logic lives in utils/internalConfig.js so the authentication path can be
+// unit tested without binding a listener. That file also carries the full
+// rationale for why the default published set is CONNECTOR_URL alone.
+//
+// AUTHENTICATION
+// --------------
+// X-Railway-Restore-Token via constantTimeEquals(), which hashes both operands
+// to a fixed 32 bytes first. That detail is load-bearing: crypto.timingSafeEqual
+// throws on a length mismatch and the resulting 500 would disclose the expected
+// token length. The route is listed in SELF_AUTHENTICATED_ROUTES in
+// middleware/mcpAuth.js for the same reason /tool-call is -- the gateway holds
+// this token and has no way to hold MCP_API_KEY.
+//
+// Both methods are registered because the documented session-start protocol
+// issues a POST while the semantics are a read. Accepting both avoids a silent
+// 404 that would present as "the orchestrator never cached the config".
+// ---------------------------------------------------------------------------
+
+const handleInternalConfigEnv = createInternalConfigHandler({
+  getRestoreToken:    () => RAILWAY_RESTORE_TOKEN,
+  constantTimeEquals,
+  log,
+});
+
+app.get("/internal/config/env", mcpRateLimiter, handleInternalConfigEnv);
+app.post("/internal/config/env", mcpRateLimiter, handleInternalConfigEnv);
 
 // -----------------------------------------------------------------------
 // v10.0.0: Persistent Memory admin export

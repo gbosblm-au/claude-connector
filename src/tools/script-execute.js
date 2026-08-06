@@ -39,6 +39,10 @@ import { resolveContained } from '../utils/pathContainment.js';
 // v12.28.0 (TNX-C-004): shared minimal-environment builder. One implementation,
 // used by all five modules in this component that spawn a subprocess.
 import { buildScriptEnv as sharedBuildScriptEnv } from '../utils/scriptEnv.js';
+// v12.37.0: the connector builds document download URLs itself rather than
+// handing CONNECTOR_URL and DOCUMENT_DOWNLOAD_TOKEN to the model. See the
+// rationale at the top of src/utils/downloadLinks.js.
+import { buildDownloadLinks, snapshotDownloads } from '../utils/downloadLinks.js';
 
 const SCRIPTS_BASE = process.env.SCRIPTS_DIR
   ? resolvePath( process.env.SCRIPTS_DIR )
@@ -63,19 +67,172 @@ const SCRIPTS_BASE = process.env.SCRIPTS_DIR
  * Build the minimal environment for a script spawned by this tool.
  *
  * Thin wrapper preserving this module's original call signature so the unit
- * tests and any external caller keep working.
+ * tests and any external caller keep working. The third parameter is additive
+ * and optional, so every existing two-argument call site is unaffected.
  *
  * @param {string} outputDir      Temp directory the script writes results into.
  * @param {string} [scriptKey=''] Script path relative to SCRIPTS_BASE.
+ * @param {Record<string,string>} [extra={}]
+ *        Already-sanitised caller-supplied variables. MUST be the output of
+ *        sanitizeCustomEnv(); never pass raw tool input here.
  * @returns {Record<string, string>} Environment for the child process.
  */
-function buildScriptEnv( outputDir, scriptKey = '' ) {
-  return sharedBuildScriptEnv( { outputDir, scriptKey } );
+function buildScriptEnv( outputDir, scriptKey = '', extra = {} ) {
+  return sharedBuildScriptEnv( { outputDir, scriptKey, extra } );
 }
 
 // Exported for the unit tests, which assert that no credential name can reach
 // a spawned script through this function.
 export { buildScriptEnv };
+
+// ---------------------------------------------------------------------------
+// custom_env  (v12.37.0)
+//
+// Callers may pass a small set of non-inherited, caller-supplied variables into
+// the sandbox so that a script can call back into the connector (CONNECTOR_URL,
+// DOCUMENT_DOWNLOAD_TOKEN) or open the shared database (DATABASE_URL).
+//
+// WHY THIS IS AN ALLOWLIST AND NOT A PASS-THROUGH
+// -----------------------------------------------
+// The obvious implementation is `Object.assign(env, input.custom_env)`. That is
+// a sandbox escape, not a convenience:
+//
+//   custom_env: { "PYTHONSTARTUP": "/tmp/x.py" }   -- executes attacker code
+//   custom_env: { "PYTHONPATH": "/tmp" }           -- shadows any import
+//   custom_env: { "LD_PRELOAD": "/tmp/evil.so" }   -- hijacks the loader
+//   custom_env: { "PATH": "/tmp/bin" }             -- hijacks every subprocess
+//
+// custom_env is attacker-reachable in exactly the same way script_path is: it
+// arrives as tool input, and tool input on this connector originates from a
+// language model's output, which is influenced by untrusted document content.
+// So the same posture applies -- validate the name against a fixed list rather
+// than trying to enumerate the dangerous ones.
+//
+// The names below are the ceiling. SCRIPT_CUSTOM_ENV_KEYS narrows or widens it
+// for an operator who needs a different set, but a name still has to be
+// explicitly configured; there is no wildcard.
+// ---------------------------------------------------------------------------
+
+/**
+ * Names accepted in custom_env when SCRIPT_CUSTOM_ENV_KEYS is unset.
+ *
+ * DOCUMENT_DOWNLOAD_TOKEN is deliberately NOT here. A script has no reason to
+ * hold it: the connector builds the download URL after the script exits and
+ * returns it in `download_links`, so the token never has to travel through the
+ * caller and back.
+ *
+ * DATABASE_URL is accepted for the Postgres recall scripts, but the preferred
+ * route is still the SCRIPT_ENV_MANIFEST grant in utils/scriptEnv.js, which
+ * injects it server-side and never routes the DSN through a model context.
+ */
+const DEFAULT_CUSTOM_ENV_KEYS = [
+  'CONNECTOR_URL',
+  'DATABASE_URL',
+];
+
+/** Maximum accepted length of a single custom_env value, in characters. */
+const CUSTOM_ENV_MAX_VALUE_LENGTH = 4096;
+
+/** Maximum number of custom_env entries accepted in one call. */
+const CUSTOM_ENV_MAX_KEYS = 16;
+
+/**
+ * Valid POSIX-ish environment variable name. Deliberately upper-case only:
+ * every name this feature is meant to carry is upper-case, and the narrower
+ * pattern removes any question about case-insensitive collisions with the base
+ * environment on a case-folding platform.
+ */
+const CUSTOM_ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+/**
+ * Resolve the configured custom_env allowlist.
+ *
+ * Read on each call rather than cached at module load so that a test (or a
+ * platform that mutates process.env after import) sees the current value. The
+ * list is tiny, so there is no measurable cost.
+ *
+ * @returns {Set<string>} Permitted custom_env names.
+ */
+function customEnvAllowlist() {
+  const raw = String( process.env.SCRIPT_CUSTOM_ENV_KEYS || '' ).trim();
+  const names = raw
+    ? raw.split( ',' ).map( ( n ) => n.trim() ).filter( Boolean )
+    : DEFAULT_CUSTOM_ENV_KEYS;
+
+  // A configured name that is not a valid variable name is dropped rather than
+  // silently widening the filter.
+  return new Set( names.filter( ( n ) => CUSTOM_ENV_NAME_PATTERN.test( n ) ) );
+}
+
+/**
+ * Validate caller-supplied custom_env down to a safe { name: value } map.
+ *
+ * Rejections are collected and returned rather than thrown, so that a caller
+ * passing one bad key still gets a useful execution plus an explicit list of
+ * what was dropped. A silent drop would be the worst outcome here: a script
+ * would run without the variable it needs and fail somewhere unrelated.
+ *
+ * @param {unknown} candidate Raw `custom_env` value from tool input.
+ * @returns {{ env: Record<string,string>, rejected: string[] }}
+ */
+export function sanitizeCustomEnv( candidate ) {
+  /** @type {Record<string,string>} */
+  const env = {};
+  /** @type {string[]} */
+  const rejected = [];
+
+  if ( candidate === undefined || candidate === null ) return { env, rejected };
+
+  if ( typeof candidate !== 'object' || Array.isArray( candidate ) ) {
+    return { env, rejected: [ 'custom_env must be a JSON object of string values.' ] };
+  }
+
+  const allowed = customEnvAllowlist();
+  const entries = Object.entries( candidate );
+
+  if ( entries.length > CUSTOM_ENV_MAX_KEYS ) {
+    return {
+      env,
+      rejected: [ `custom_env carries ${ entries.length } keys; the maximum is ${ CUSTOM_ENV_MAX_KEYS }.` ],
+    };
+  }
+
+  for ( const [ key, value ] of entries ) {
+    if ( ! CUSTOM_ENV_NAME_PATTERN.test( key ) ) {
+      rejected.push( `${ key }: not a valid environment variable name (expected ^[A-Z][A-Z0-9_]{0,63}$).` );
+      continue;
+    }
+
+    if ( ! allowed.has( key ) ) {
+      rejected.push(
+        `${ key }: not permitted. Add it to SCRIPT_CUSTOM_ENV_KEYS to allow it. ` +
+        `Currently permitted: ${ [ ...allowed ].join( ', ' ) || '(none)' }.`
+      );
+      continue;
+    }
+
+    if ( typeof value !== 'string' ) {
+      rejected.push( `${ key }: value must be a string, received ${ Array.isArray( value ) ? 'array' : typeof value }.` );
+      continue;
+    }
+
+    // A NUL byte truncates the variable at the execve boundary, so a value
+    // containing one does not mean in the child what it means here.
+    if ( value.includes( '\0' ) ) {
+      rejected.push( `${ key }: value contains a NUL byte.` );
+      continue;
+    }
+
+    if ( value.length > CUSTOM_ENV_MAX_VALUE_LENGTH ) {
+      rejected.push( `${ key }: value is ${ value.length } characters; the maximum is ${ CUSTOM_ENV_MAX_VALUE_LENGTH }.` );
+      continue;
+    }
+
+    env[ key ] = value;
+  }
+
+  return { env, rejected };
+}
 
 const MIME_MAP = {
   '.pdf':  'application/pdf',
@@ -122,6 +279,17 @@ export const TOOL_DEFINITION = {
         items:       { type: 'string' },
         description: 'List of output file paths relative to the script\'s output directory to return as base64 attachments. E.g. ["output.pdf", "summary.csv"]',
       },
+      download_files: {
+        type:        'array',
+        items:       { type: 'string' },
+        description: 'Filenames the script wrote into the downloads directory that should be turned into shareable links, e.g. ["Quarterly_Report.docx"]. Usually unnecessary: any file the script creates or modifies in that directory is linked automatically. The tool returns a ready-made download_url in its result, so never construct a download URL yourself and never ask for the download token.',
+      },
+      custom_env: {
+        type:                 'object',
+        additionalProperties: { type: 'string' },
+        description:
+          'Optional environment variables to inject into the script process. Only an allowlisted set of names is accepted; every other name is refused and reported in custom_env_rejected. Values must be strings. Not needed for download links, which the connector builds server-side.',
+      },
     },
     required: [ 'script_path' ],
   },
@@ -138,7 +306,19 @@ export async function handleScriptExecute( toolInput ) {
     input_data,
     timeout_seconds = 60,
     return_files    = [],
+    download_files  = [],
+    custom_env,
   } = toolInput || {};
+
+  // v12.37.0: validated before any filesystem work so that a malformed
+  // custom_env is reported without side effects.
+  const { env: customEnv, rejected: customEnvRejected } = sanitizeCustomEnv( custom_env );
+
+  if ( customEnvRejected.length > 0 ) {
+    // Names only. The values are the whole point of the feature being
+    // sensitive, so they never reach a log line.
+    console.error( `[script_execute] custom_env entries refused: ${ customEnvRejected.join( ' | ' ) }` );
+  }
 
   // ── Validate script_path ────────────────────────────────────────────────
   if ( ! script_path || typeof script_path !== 'string' ) {
@@ -202,6 +382,13 @@ export async function handleScriptExecute( toolInput ) {
   cmdArgs.push( '--output', outputDir );
   if ( Array.isArray( args ) )        cmdArgs.push( ...args );
 
+  // ── Snapshot the downloads directory ────────────────────────────────────
+  // Taken before execution so that files the script creates or overwrites can
+  // be identified afterwards by diff. This requires no cooperation from the
+  // script, which matters because the scripts on the volume predate this
+  // feature and none of them report what they wrote.
+  const downloadsBefore = snapshotDownloads();
+
   // ── Execute ─────────────────────────────────────────────────────────────
   // start declared before try so it is accessible in the catch / finally blocks
   const start  = Date.now();
@@ -237,7 +424,12 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
       // is constructed from scratch rather than filtered from process.env, so a
       // newly added secret is excluded by default rather than included by
       // default.
-      env:       buildScriptEnv( outputDir, String( script_path ) ),
+      //
+      // v12.37.0: the third argument carries caller-supplied variables that
+      // have already passed sanitizeCustomEnv(). They are applied by
+      // scriptEnv.js AFTER the base environment and are still subject to its
+      // PROTECTED set, so this is two independent filters rather than one.
+      env:       buildScriptEnv( outputDir, String( script_path ), customEnv ),
     } );
 
     // ✨ NEW: check for spawnSync-level errors (e.g. ENOENT)
@@ -281,6 +473,25 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
       }
     }
 
+    // ── Build download links ────────────────────────────────────────────
+    // Wrapped because link construction is a convenience layered on top of
+    // execution. A failure here must surface as a missing link, never as a
+    // failed script run whose output the caller then discards.
+    let downloadLinks    = [];
+    let downloadWarnings = [];
+
+    try {
+      const built      = buildDownloadLinks( { before: downloadsBefore, declared: download_files } );
+      downloadLinks    = built.links;
+      downloadWarnings = built.warnings;
+    } catch ( linkErr ) {
+      downloadWarnings = [ `Download links could not be built: ${ linkErr.message }` ];
+    }
+
+    for ( const w of downloadWarnings ) {
+      console.error( `[script_execute] download link warning: ${ w }` );
+    }
+
     return {
       stdout:            stdout.slice( 0, 50_000 ),   // cap at 50KB
       stderr:            stderr.slice( 0, 50_000 ),
@@ -289,6 +500,16 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
       execution_time_ms: elapsed,
       timed_out:         signal === 'SIGTERM',
       files:             files.length ? files : undefined,
+      // v12.37.0: finished, ready-to-render URLs. The download token is
+      // embedded here by the connector; the caller must not be asked for it and
+      // must not attempt to assemble these strings itself.
+      download_links:    downloadLinks.length ? downloadLinks : undefined,
+      download_warnings: downloadWarnings.length ? downloadWarnings : undefined,
+      // v12.37.0: names only, never values. A caller that asked for a variable
+      // and did not get it needs to know which one, otherwise the script fails
+      // with an unrelated KeyError and the cause is invisible.
+      custom_env_applied:  Object.keys( customEnv ).length ? Object.keys( customEnv ) : undefined,
+      custom_env_rejected: customEnvRejected.length ? customEnvRejected : undefined,
     };
 
   } catch ( err ) {

@@ -120,7 +120,29 @@ export function buildScriptEnv( opts = {} ) {
   // Caller-supplied non-secret values (database paths, output locations).
   // Applied before manifest grants and validated so they cannot overwrite the
   // base entries that keep the child's execution environment predictable.
-  const PROTECTED = new Set( [ 'PATH', 'HOME', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'NODE_OPTIONS' ] );
+  // v12.37.0: the original set covered the loader and Node hijack vectors but
+  // omitted the Python ones, which matters now that script_execute forwards
+  // caller-supplied values through `extra` (the custom_env feature).
+  //
+  // PYTHONPATH, PYTHONHOME and PYTHONEXECUTABLE relocate the interpreter's
+  // module search; PYTHONSTARTUP is executed verbatim by an interactive
+  // interpreter; PYTHONUSERBASE moves the user site directory. Any of them
+  // lets a caller who can set an environment variable execute code of their
+  // choosing inside the sandbox, which is the same class of defect as
+  // LD_PRELOAD. BASH_ENV and ENV are the shell equivalents, included because a
+  // spawned script may itself shell out.
+  //
+  // Note that PYTHONPATH is still propagated from process.env above. That path
+  // is operator-controlled (Railway/mise sets it) and is a different trust
+  // source from a caller-supplied value, so protecting it here blocks the
+  // override without breaking interpreter discovery.
+  const PROTECTED = new Set( [
+    'PATH', 'HOME',
+    'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT',
+    'NODE_OPTIONS',
+    'PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONEXECUTABLE', 'PYTHONUSERBASE',
+    'BASH_ENV', 'ENV', 'IFS',
+  ] );
   for ( const [ key, value ] of Object.entries( extra || {} ) ) {
     if ( PROTECTED.has( key ) ) {
       console.error( `[scriptEnv] Refusing to let a caller override ${ key }.` );

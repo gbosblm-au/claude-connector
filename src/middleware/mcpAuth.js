@@ -130,6 +130,17 @@ const SELF_AUTHENTICATED_ROUTES = [
   { exact: '/tools' },
   { exact: '/tool-call' },
 
+  // v12.37.0: internal config bridge. Publishes a fixed, code-bounded set of
+  // runtime values (CONNECTOR_URL, DOCUMENT_DOWNLOAD_TOKEN, DATABASE_URL) to
+  // the session orchestrator, which forwards them into script_execute as
+  // custom_env. Verifies RAILWAY_RESTORE_TOKEN with constantTimeEquals()
+  // before reading any variable, and returns 401 otherwise.
+  //
+  // Exempt from MCP_API_KEY for the same reason /tool-call is: the caller is
+  // the gateway, which holds the restore token and has no way to hold the
+  // connector key. Registered for both GET and POST; the path is identical.
+  { exact: '/internal/config/env' },
+
   // Skill and content restore targets used by the plugin's provisioning and
   // Disaster Recovery pushes.
   { exact: '/restore-skill' },

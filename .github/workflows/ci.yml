@@ -216,6 +216,21 @@ jobs:
         # a browser behaviour JSDOM does not reproduce at all.
         run: npm run test:e2e
 
+      - name: Build the front-end bundle
+        working-directory: ts-client-gateway
+        # Phase 3 item 1. --report asserts the payload gate, so a change that
+        # pushes the first-load bundle back over 300 KB compressed fails the
+        # build rather than being noticed later.
+        run: npm run build:report
+
+      - name: Browser tests against the MINIFIED bundle
+        working-directory: ts-client-gateway
+        # Minification is behaviour-preserving in theory. In practice terser
+        # renames identifiers and rewrites control flow, and this bundle defines
+        # globals the PHP-rendered HTML calls by name. Running the same tests
+        # against the built output is the only way to know the transform held.
+        run: npm run test:e2e:built
+
       - name: Verify the verifier
         working-directory: ts-client-gateway
         # Resolution item 4: inject a deliberate failure into every test file and
