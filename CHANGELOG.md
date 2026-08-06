@@ -1,5 +1,26 @@
 # Claude Connector - Changelog
 
+## v12.36.0 - 2026-08-06
+
+### Neural Core scans are manual trigger only
+
+The boot scan is removed, so a deployment no longer spawns brain_scan.py. The
+dormant debounce scheduler (scheduleBrainScan) and its RESCAN_TRIGGERS allowlist
+are deleted so automatic scanning cannot return by accident. GET /brain-data no
+longer scans implicitly when the data file is absent; only ?rescan=1 does.
+
+Scans now run from POST /brain-scan, GET /brain-data?rescan=1, an operator-run
+POST /volume-restore, or script_execute. /brain-data/status reports the policy
+and the provenance of the last scan.
+
+Also fixes an authentication bypass in POST /brain-scan: the token guard failed
+OPEN when neither DOCUMENT_DOWNLOAD_TOKEN nor RAILWAY_RESTORE_TOKEN was set, so
+any unauthenticated caller could spawn Python on the volume. It now fails closed,
+compares in constant time, and no longer 500s on a duplicated query parameter.
+
+Pairs with ts-client-gateway v5.81.0, which removes the 15-minute cron. Full
+detail: CHANGELOG-v12.36.0.md.
+
 ## v12.22.0 - 2026-07-24
 
 ### Volume snapshot and restore endpoints

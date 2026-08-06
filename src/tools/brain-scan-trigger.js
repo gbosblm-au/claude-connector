@@ -1,35 +1,53 @@
 /**
- * brain-scan-trigger.js  (connector v12.10.0)
+ * brain-scan-trigger.js  (connector v12.36.0)
  *
- * Keeps ava_brain_data.json current, and records what the last compile loaded.
+ * Runs brain_scan.py on demand, and records what the last compile loaded.
  *
- * Two jobs:
+ * TRIGGER POLICY (v12.36.0): MANUAL ONLY.
+ * ---------------------------------------------------------------------------
+ * A scan runs when, and only when, a human asks for one. There is no boot
+ * scan, no timer, no debounce queue, and no tool-completion hook that starts a
+ * scan. The complete set of paths that can start brain_scan.py is:
  *
- *   1. onToolCompleted(name, args, result)
- *      Called after every successful tool dispatch. When a tool changed the
- *      shape of the architecture (module_write, skill_write, skill_merge_
- *      additions, dispatch_rule_add and friends), it schedules a rescan.
- *      When skill_compile ran, it records the loaded module set so the
- *      visualiser can light up what is live this session.
+ *   · POST /brain-scan                        operator or admin button
+ *   · GET  /brain-data?rescan=1               the gateway's Refresh button
+ *   · POST /volume-restore  (scan=1, default) part of an operator-run restore
+ *   · script_execute on brain_scan.py         run it directly
  *
- *   2. runBrainScan()
- *      Spawns brain_scan.py detached, debounced, never more than one at a time.
- *      A rescan of ~130 modules takes a few seconds, and no tool call should
- *      ever wait on it, so this deliberately does not return the scan result:
- *      the scan writes a file, and the file is what the gateway reads.
+ * Everything else reads whatever ava_brain_data.json is already on the volume,
+ * or reports honestly that no scan exists yet.
  *
- *   3. writeToolCatalog(tools)
+ * What was removed in v12.36.0, and why
+ * ---------------------------------------------------------------------------
+ *   · bootScanIfMissing()  - spawned Python ~15s after every deploy or restart
+ *                            whenever the volume had no scan. That is a
+ *                            deployment-time trigger, which this policy forbids.
+ *   · scheduleBrainScan()  - a 20s debounced rescan timer, plus the
+ *     RESCAN_TRIGGERS set    RESCAN_TRIGGERS allowlist it fired for. Both were
+ *                            already unreachable in v12.35.0 (nothing called
+ *                            scheduleBrainScan), so removing them changes no
+ *                            observable behaviour. They are deleted rather than
+ *                            left dormant so a future edit to onToolCompleted
+ *                            cannot silently reintroduce an automatic trigger.
+ *
+ * Jobs this module still does:
+ *
+ *   1. runBrainScan({ force, trigger })
+ *      Spawns brain_scan.py, never more than one at a time. Callers may await
+ *      the returned promise; a second caller arriving mid-scan joins the
+ *      in-flight one rather than starting a competing process.
+ *
+ *   2. writeToolCatalog(tools)
  *      Writes the connector's own live tool registry to the volume at boot, so
  *      the scanner reads a catalogue that cannot disagree with the connector
- *      that produced it. The scanner makes no network calls.
+ *      that produced it. This writes ONE small JSON file. It spawns nothing and
+ *      is not a scan; it only makes the catalogue correct for whenever a manual
+ *      scan is next requested. The scanner makes no network calls.
  *
- * Scan triggers, in full (v12.11.0):
- *   · a tool that changed the architecture           -> debounced rescan
- *   · skill_compile                                  -> compile record + rescan
- *   · boot, only when no scan exists on disk         -> one catch-up scan
- *   · someone clicks Refresh in the gateway          -> GET /brain-data?rescan=1
- * There is no periodic rescan. Nothing changes the volume without going through
- * a tool, so a timer would only ever confirm what the hooks already know.
+ *   3. onToolCompleted(name, args, result)
+ *      Called after every successful tool dispatch. It records the module set
+ *      loaded by skill_compile so the visualiser can light up what is live this
+ *      session. It NEVER starts a scan.
  *
  * Failure policy: a scan failure is logged and dropped. The Neural Core is an
  * observability surface. It must never be able to fail a module write.
@@ -78,28 +96,43 @@ const CONNECTOR_VERSION = (() => {
   }
 })();
 
-/** Tools that change the architecture and therefore invalidate the scan. */
-const RESCAN_TRIGGERS = new Set([
-  'module_write',
-  'skill_write',
-  'skill_write_addition',
-  'skill_merge_additions',
-  'skill_recompile',
-  'skill_rollback',
-  'dispatch_rule_add',
-  'reference_write',
-  'script_write',
-  'archive_write',
-  'personality_write',
-]);
-
-/** Wait this long after a change before scanning: a burst of writes = one scan. */
-const DEBOUNCE_MS = 20000;
+// v12.36.0: RESCAN_TRIGGERS (the tool-name allowlist that invalidated the scan)
+// and DEBOUNCE_MS (the 20s coalescing window) are deleted along with
+// scheduleBrainScan(). They existed only to serve automatic rescans. Nothing
+// referenced them once scheduleBrainScan() was removed, and leaving an unused
+// allowlist behind is an invitation to wire it back up by accident.
 
 /** Hard ceiling on scanner runtime. */
 const SCAN_TIMEOUT_MS = 120000;
 
-/** Enabled unless explicitly switched off. */
+/**
+ * The trigger policy this module implements, surfaced through
+ * getBrainScanPaths() so /brain-data/status can state it rather than leaving
+ * an operator to infer it from the absence of log lines.
+ */
+const TRIGGER_POLICY = 'manual-only';
+
+/**
+ * Every path permitted to start a scan, for diagnostics. Kept beside
+ * TRIGGER_POLICY so the documented list and the reported list are one thing.
+ */
+const MANUAL_TRIGGERS = Object.freeze([
+  'POST /brain-scan',
+  'GET /brain-data?rescan=1',
+  'POST /volume-restore (scan=1)',
+  'script_execute brain_scan.py',
+]);
+
+/**
+ * Enabled unless explicitly switched off.
+ *
+ * BRAIN_SCAN_ENABLED=false is a hard kill switch: it disables even the manual
+ * triggers, which is what you want while debugging a scanner that is wedging
+ * the volume. It is NOT the control for automatic scanning, because as of
+ * v12.36.0 there is no automatic scanning to control.
+ *
+ * @returns {boolean}
+ */
 function isEnabled() {
   return process.env.BRAIN_SCAN_ENABLED !== 'false';
 }
@@ -108,12 +141,20 @@ function isEnabled() {
 // State
 // ---------------------------------------------------------------------------
 
-let pendingTimer = null;
 let scanRunning = false;
 let scanQueued = false;
+/** Label of the trigger that queued a rerun, carried into that rerun. */
+let queuedTrigger = null;
 /** The in-flight scan, so a second caller can wait on it instead of being told no. */
 let inFlight = null;
 let lastScanStarted = 0;
+let lastScanFinished = 0;
+/** Who asked for the current or most recent scan. Null until one is requested. */
+let lastScanTrigger = null;
+/** Outcome of the most recent completed scan: true, false, or null if none. */
+let lastScanOk = null;
+/** Total scans started since boot. Zero on a healthy idle instance. */
+let scanCount = 0;
 let logFn = () => {};
 
 /**
@@ -129,31 +170,52 @@ export function setBrainScanLogger(fn) {
 // ---------------------------------------------------------------------------
 
 /**
- * Run brain_scan.py once, detached from the caller.
+ * Run brain_scan.py once.
+ *
+ * This is the ONLY function in the connector that starts the scanner, and as of
+ * v12.36.0 every one of its callers is a manual action: POST /brain-scan,
+ * GET /brain-data?rescan=1, and the operator-run POST /volume-restore. Nothing
+ * calls it on a timer, at boot, or from a tool-completion hook. Adding such a
+ * caller would defeat the manual-only policy, so any new call site needs the
+ * same scrutiny as adding a cron job.
  *
  * @param {object} [options]
  * @param {boolean} [options.force] Rescan even when the output looks fresh.
+ * @param {string} [options.trigger] Short label naming who asked, recorded for
+ *   diagnostics and logged. Defaults to 'unspecified'.
  * @returns {Promise<boolean>} true when the scan exited 0.
  */
 export async function runBrainScan(options = {}) {
+  const trigger = (typeof options.trigger === 'string' && options.trigger.trim())
+    ? options.trigger.trim().slice(0, 120)
+    : 'unspecified';
+
   if (!isEnabled()) {
-    logFn('info', 'brain_scan: disabled by BRAIN_SCAN_ENABLED=false');
+    logFn('info', `brain_scan: disabled by BRAIN_SCAN_ENABLED=false (requested by ${trigger})`);
     return false;
   }
   if (!existsSync(SCANNER_PATH)) {
-    logFn('warn', `brain_scan: scanner not found at ${SCANNER_PATH} - skipping`);
+    logFn('warn', `brain_scan: scanner not found at ${SCANNER_PATH} - skipping (requested by ${trigger})`);
     return false;
   }
   if (scanRunning) {
-    // A scan is already up. A reader (GET /brain-data on a volume with no scan)
-    // should wait for it rather than be told the scan failed; a writer should
-    // queue a rerun so its change is not lost inside the current pass.
-    if (options.force) scanQueued = true;
+    // A scan is already up. A reader (GET /brain-data?rescan=1 arriving while an
+    // operator's POST /brain-scan is still running) should wait for it rather
+    // than be told the scan failed; a caller that needs a guaranteed-fresh pass
+    // queues one rerun so its request is not lost inside the current pass.
+    if (options.force) {
+      scanQueued = true;
+      queuedTrigger = trigger;
+    }
+    logFn('info', `brain_scan: already running (requested by ${trigger}) - joining the in-flight scan`);
     return inFlight || false;
   }
 
   scanRunning = true;
+  scanCount += 1;
   lastScanStarted = Date.now();
+  lastScanTrigger = trigger;
+  logFn('info', `brain_scan: starting (trigger: ${trigger}${options.force ? ', forced' : ''})`);
 
   const args = [SCANNER_PATH, '--ava-dir', AVA_DIR];
   if (options.force) args.push('--force');
@@ -167,10 +229,23 @@ export async function runBrainScan(options = {}) {
       settled = true;
       scanRunning = false;
       inFlight = null;
+      lastScanFinished = Date.now();
+      lastScanOk = ok;
       if (note) logFn(ok ? 'info' : 'warn', `brain_scan: ${note}`);
       if (scanQueued) {
+        // One coalesced rerun for the request that arrived mid-scan. This is a
+        // continuation of a manual request that was already made, not a new
+        // automatic trigger: it cannot fire unless a caller asked while a scan
+        // was in flight.
         scanQueued = false;
-        setTimeout(() => { runBrainScan({ force: true }); }, 500);
+        const rerunTrigger = `${queuedTrigger || 'unspecified'} (queued rerun)`;
+        queuedTrigger = null;
+        const rerunTimer = setTimeout(() => {
+          runBrainScan({ force: true, trigger: rerunTrigger }).catch((err) => {
+            logFn('warn', `brain_scan: queued rerun failed: ${err.message}`);
+          });
+        }, 500);
+        if (typeof rerunTimer.unref === 'function') rerunTimer.unref();
       }
       resolveScan(ok);
     };
@@ -232,41 +307,38 @@ export async function runBrainScan(options = {}) {
   return inFlight;
 }
 
+// ---------------------------------------------------------------------------
+// REMOVED in v12.36.0: bootScanIfMissing()
+//
+// It ran a catch-up scan 15 seconds after every boot whenever the volume had no
+// ava_brain_data.json, or had an empty one. On Railway, where a redeploy is a
+// fresh container, that made "deploy" a scan trigger, which is exactly what
+// this change exists to stop.
+//
+// The behaviour it provided is not lost, only made explicit: a volume with no
+// scan now reports that honestly through GET /brain-data and /brain-data/status,
+// and one click of Refresh in the gateway (or POST /brain-scan) produces the
+// scan. An operator decides when Python runs.
+//
+// describeScanState() below gives callers the same "is there a usable scan on
+// disk" answer that bootScanIfMissing() used to act on, without acting on it.
+// ---------------------------------------------------------------------------
+
 /**
- * Run one catch-up scan at boot, but only when no scan exists to serve.
+ * Report whether a usable scan exists on the volume, without starting one.
  *
- * A scan that already exists is almost always current: every path that changes
- * the volume goes through a tool, and every one of those tools schedules a
- * rescan. Spawning Python on every restart to rediscover that costs ~3 seconds
- * and produces a byte-identical file.
- *
- * The gap this leaves: a volume changed out of band - a DR restore through
- * POST /restore-modules, or a direct write to the Railway volume - is not
- * noticed until the next tool-triggered scan or a click of Refresh. That is the
- * accepted trade for not spawning Python on every restart. `force: true` from
- * either of those paths still picks it up.
- *
- * @returns {Promise<boolean>} true when a scan ran.
+ * @returns {{present: boolean, size: number, empty: boolean, error: string|null}}
  */
-export async function bootScanIfMissing() {
-  if (!isEnabled()) return false;
-  if (!existsSync(SCANNER_PATH)) return false;
-
+export function describeScanState() {
   try {
-    if (existsSync(BRAIN_DATA_PATH)) {
-      const { size } = statSync(BRAIN_DATA_PATH);
-      if (size > 0) {
-        logFn('info', `brain_scan: scan present (${size} bytes) - no boot scan needed`);
-        return false;
-      }
-      logFn('warn', 'brain_scan: scan on disk is empty - rescanning');
+    if (!existsSync(BRAIN_DATA_PATH)) {
+      return { present: false, size: 0, empty: false, error: null };
     }
+    const { size } = statSync(BRAIN_DATA_PATH);
+    return { present: true, size, empty: size === 0, error: null };
   } catch (err) {
-    logFn('warn', `brain_scan: cannot stat ${BRAIN_DATA_PATH}: ${err.message} - rescanning`);
+    return { present: false, size: 0, empty: false, error: err.message };
   }
-
-  logFn('info', 'brain_scan: no scan on disk - running one');
-  return runBrainScan({ force: true });
 }
 
 /**
@@ -334,24 +406,20 @@ export function writeToolCatalog(tools, version) {
   }
 }
 
-/**
- * Schedule a debounced rescan. Repeated calls inside the debounce window
- * collapse into one scan.
- *
- * @returns {void}
- */
-export function scheduleBrainScan() {
-  if (!isEnabled()) return;
-  if (pendingTimer) clearTimeout(pendingTimer);
-  pendingTimer = setTimeout(() => {
-    pendingTimer = null;
-    runBrainScan({ force: true }).catch((err) => {
-      logFn('warn', `brain_scan: scheduled run failed: ${err.message}`);
-    });
-  }, DEBOUNCE_MS);
-  // Do not hold the process open for a cosmetic rescan.
-  if (typeof pendingTimer.unref === 'function') pendingTimer.unref();
-}
+// ---------------------------------------------------------------------------
+// REMOVED in v12.36.0: scheduleBrainScan()
+//
+// It set a 20-second debounced timer that called runBrainScan({ force: true }).
+// No caller remained in v12.35.0 -- onToolCompleted() had already stopped
+// invoking it -- so this deletion changes no observable behaviour today. It is
+// removed rather than left in place because a dormant "schedule a scan"
+// function is the single easiest way for an automatic trigger to return: one
+// well-meaning line in onToolCompleted() and the policy is silently undone.
+//
+// If a future change genuinely needs a scan after a specific event, call
+// runBrainScan({ force: true, trigger: '<name>' }) directly and deliberately, so
+// the new trigger shows up in a diff and in /brain-data/status.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Compile record
@@ -413,8 +481,14 @@ function parseToolResult(result) {
  * Post-dispatch hook. Wrapped in its own try/catch by the caller, and again
  * here, because nothing in this file is allowed to fail a tool call.
  *
+ * This hook is RECORD-ONLY and must stay that way. It writes last_compile.json
+ * after skill_compile so the visualiser can mark loaded modules live. It does
+ * not start a scan, and it must not be changed to start one: a tool call is not
+ * a manual trigger, and a hook that scans turns ordinary use of the connector
+ * back into an automatic scan schedule.
+ *
  * @param {string} name   Tool name.
- * @param {object} args   Tool input.
+ * @param {object} args   Tool input. Unused; kept for hook-signature stability.
  * @param {object} result MCP-format result.
  * @returns {void}
  */
@@ -451,5 +525,15 @@ export function getBrainScanPaths() {
     lastScanStarted: lastScanStarted || null,
     connectorVersion: CONNECTOR_VERSION,
     enabled: isEnabled(),
+    // v12.36.0 trigger policy and provenance.
+    triggerPolicy: TRIGGER_POLICY,
+    manualTriggers: MANUAL_TRIGGERS,
+    automaticTriggers: [],
+    bootScanEnabled: false,
+    scheduledScanEnabled: false,
+    lastScanTrigger,
+    lastScanFinished: lastScanFinished || null,
+    lastScanOk,
+    scanCount,
   };
 }

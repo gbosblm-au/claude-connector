@@ -427,10 +427,13 @@ import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 // Neural Core (v12.10.0): keeps ava_brain_data.json current and records what
 // each compile loaded. Observability only - it can never fail a tool call.
+// v12.36.0: bootScanIfMissing is gone. It was the deployment-time scan trigger.
+// describeScanState replaces the part of it that was worth keeping: reporting
+// whether a scan exists, without spawning one to make it exist.
 import {
   onToolCompleted as brainScanOnToolCompleted,
   runBrainScan,
-  bootScanIfMissing,
+  describeScanState,
   writeToolCatalog,
   getBrainScanPaths,
   setBrainScanLogger,
@@ -3545,15 +3548,23 @@ app.get("/brain-data", async (req, res) => {
   const wantsRescan = ["1", "true", "yes"].includes(String(req.query.rescan || "").toLowerCase());
 
   try {
-    if (wantsRescan || !existsSync(paths.dataPath)) {
+    // v12.36.0: a plain read NEVER starts a scanner.
+    //
+    // This block used to also fire when the data file was simply absent, so an
+    // ordinary page load of the Neural Core could spawn Python. That is not a
+    // manual trigger: the visitor did not ask for a scan, they asked for a
+    // picture. Under the manual-only policy the only thing that starts the
+    // scanner here is an explicit ?rescan=1, which is what the gateway's
+    // Refresh button sends.
+    if (wantsRescan) {
       if (!paths.scannerPresent) {
         return res.status(404).json({
           error: "brain_scan.py is not deployed to " + paths.scriptsDir + ".",
           hint: "Upload brain_scan.py and brain_tools_catalog.json to the scripts directory, then retry.",
         });
       }
-      log("info", `[/brain-data] running scanner (${wantsRescan ? "rescan requested" : "no scan on disk"})`);
-      const ok = await runBrainScan({ force: wantsRescan });
+      log("info", "[/brain-data] running scanner (rescan explicitly requested)");
+      const ok = await runBrainScan({ force: true, trigger: "GET /brain-data?rescan=1" });
       if (!ok && !existsSync(paths.dataPath)) {
         return res.status(503).json({
           error: "brain_scan.py did not produce " + paths.dataPath + ".",
@@ -3563,7 +3574,16 @@ app.get("/brain-data", async (req, res) => {
     }
 
     if (!existsSync(paths.dataPath)) {
-      return res.status(404).json({ error: "No architecture scan on this volume yet.", path: paths.dataPath });
+      // Honest empty state rather than a silent background scan. The gateway
+      // surfaces this message to the operator, and one Refresh fixes it.
+      return res.status(404).json({
+        error: "No architecture scan on this volume yet.",
+        path: paths.dataPath,
+        trigger_policy: paths.triggerPolicy,
+        hint: paths.scannerPresent
+          ? "Scans are manual only as of connector v12.36.0. Retry with ?rescan=1, press Refresh in the Neural Core, or POST /brain-scan."
+          : "brain_scan.py is not on the volume. Upload it to " + paths.scriptsDir + ", then request a scan with ?rescan=1.",
+      });
     }
 
     const body = readFileSync(paths.dataPath, "utf8");
@@ -3582,26 +3602,72 @@ app.get("/brain-data", async (req, res) => {
 // ---------------------------------------------------------------------------
 
 
-// POST /brain-scan — trigger a neural core scan on demand (v12.23.0)
-// Called by WordPress CRON job. Gated by the document download token.
+// ---------------------------------------------------------------------------
+// POST /brain-scan — trigger a Neural Core scan on demand (v12.23.0)
+//
+// v12.36.0: this is now the PRIMARY manual trigger. It was previously called on
+// a 15-minute WordPress cron; that schedule has been removed from the plugin,
+// and this endpoint is instead driven by the "Run scan now" button on the
+// Neural Core Scan admin screen, or by an operator with curl.
+//
+// Three defects were fixed here at the same time, because promoting an endpoint
+// to "the way scans happen" means it has to hold up on its own:
+//
+//   1. AUTH BYPASS. The guard was `if (allowedToken && token !== allowedToken)`.
+//      With neither DOCUMENT_DOWNLOAD_TOKEN nor RAILWAY_RESTORE_TOKEN set,
+//      allowedToken was '' and the condition short-circuited to false, so ANY
+//      unauthenticated caller could spawn Python on the volume, repeatedly. It
+//      now fails closed with 503 when no token is configured.
+//   2. TIMING. `token !== allowedToken` is a short-circuiting comparison and
+//      leaks position-of-first-difference. Every other privileged route here
+//      uses constantTimeEquals; this one now does too.
+//   3. TYPE CRASH. `req.query.token` is an ARRAY when a caller sends
+//      ?token=a&token=b, and .trim() on an array throws, turning a malformed
+//      request into a 500. Coerced with String() first, matching /brain-data.
+// ---------------------------------------------------------------------------
 app.post('/brain-scan', async (req, res) => {
-  const token = (req.query.token || req.headers['x-scan-token'] || '').trim();
+  const token = String(req.query.token || req.headers['x-scan-token'] || '').trim();
   const allowedToken = process.env.DOCUMENT_DOWNLOAD_TOKEN || process.env.RAILWAY_RESTORE_TOKEN || '';
 
-  if (allowedToken && token !== allowedToken) {
+  if (!allowedToken) {
+    return res.status(503).json({
+      ok: false,
+      error: 'Neither DOCUMENT_DOWNLOAD_TOKEN nor RAILWAY_RESTORE_TOKEN is set, so this endpoint cannot authenticate callers and is disabled.',
+    });
+  }
+  if (!constantTimeEquals(token, allowedToken)) {
     return res.status(403).json({ ok: false, error: 'Invalid or missing scan token.' });
   }
 
+  const paths = getBrainScanPaths();
+  if (!paths.enabled) {
+    return res.status(503).json({
+      ok: false,
+      error: 'Scanning is disabled by BRAIN_SCAN_ENABLED=false.',
+    });
+  }
+  if (!paths.scannerPresent) {
+    return res.status(404).json({
+      ok: false,
+      error: 'brain_scan.py is not deployed to ' + paths.scriptsDir + '.',
+      hint: 'Upload brain_scan.py to the scripts directory, then retry.',
+    });
+  }
+
   try {
-    const ok = await runBrainScan({ force: true });
+    const startedAt = Date.now();
+    const ok = await runBrainScan({ force: true, trigger: 'POST /brain-scan' });
     res.json({
       ok,
       timestamp: new Date().toISOString(),
+      duration_ms: Date.now() - startedAt,
+      trigger_policy: paths.triggerPolicy,
       note: ok
         ? 'Brain scan completed successfully.'
         : 'Brain scan did not complete. Check connector logs for details.',
     });
   } catch (err) {
+    log('error', `[/brain-scan] ${err.message}`);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -3624,12 +3690,24 @@ app.get("/brain-data/status", (req, res) => {
   } catch (err) {
     log("warn", `[/brain-data/status] cannot read scan: ${err.message}`);
   }
+  // v12.36.0: describeScanState() reports the on-disk state without acting on
+  // it. Under the old boot scan, "no scan present" was a transient condition
+  // the connector fixed for you; it is now a standing fact an operator needs to
+  // see, so status reports it explicitly alongside the trigger policy.
+  const scanState = describeScanState();
+
   return res.json({
     ...paths,
-    dataPresent: existsSync(paths.dataPath),
+    dataPresent: scanState.present && !scanState.empty,
+    dataFileSize: scanState.size,
+    dataFileEmpty: scanState.empty,
+    dataFileError: scanState.error,
     lastCompilePresent: existsSync(paths.lastCompilePath),
     scanTimestamp,
     nodeCount,
+    scanRequiredAction: (scanState.present && !scanState.empty)
+      ? null
+      : 'No usable scan on this volume. Scans are manual only: POST /brain-scan, GET /brain-data?rescan=1, or press Refresh in the Neural Core.',
   });
 });
 
@@ -4077,14 +4155,25 @@ httpServer.listen(PORT, HOST, () => {
     log("error", `Scheduler boot failed: ${err.message}`);
   }
 
-  // ── Neural Core scanner (v12.11.0) ──────────────────────────────────────
-  // Two jobs at boot: publish this connector's tool registry to the volume so
-  // the scanner never has to ask the network what tools exist, and run a scan
-  // only if there is none to serve.
+  // ── Neural Core scanner (v12.36.0 — MANUAL TRIGGER ONLY) ────────────────
+  // Boot does exactly one thing for the Neural Core now: it publishes this
+  // connector's tool registry to the volume, so the scanner never has to ask
+  // the network what tools exist. That is a single small JSON write. It spawns
+  // nothing.
   //
-  // There is no periodic rescan. Every path that changes the volume goes
-  // through a tool, and every one of those tools schedules its own rescan, so a
-  // timer could only ever confirm what the hooks already knew.
+  // The boot scan is GONE (v12.36.0). Previously, if the volume had no
+  // ava_brain_data.json, the connector spawned brain_scan.py 15 seconds after
+  // startup. On Railway every redeploy is a fresh container, so that made
+  // "deploy" a scan trigger. It no longer is. There is also no periodic
+  // rescan, and no tool-completion hook that scans.
+  //
+  // A scan now runs only when a person asks for one:
+  //   POST /brain-scan, GET /brain-data?rescan=1, POST /volume-restore
+  //   (scan=1, part of an operator-run restore), or script_execute directly.
+  //
+  // Consequence, stated plainly so it is not a surprise in an incident: a
+  // volume with no scan stays with no scan until somebody clicks Refresh.
+  // /brain-data and /brain-data/status both say so explicitly.
   try {
     setBrainScanLogger(log);
     const brainPaths = getBrainScanPaths();
@@ -4093,20 +4182,27 @@ httpServer.listen(PORT, HOST, () => {
         : brainPaths.scannerPresent ? `ENABLED (${brainPaths.scannerPath}) — GET /brain-data`
         : `not deployed (expected at ${brainPaths.scannerPath})`
     }`);
+    log("info", "Neural Core scan triggers: MANUAL ONLY (POST /brain-scan, GET /brain-data?rescan=1, POST /volume-restore). No boot scan, no cron, no tool-hook scan.");
 
     if (brainPaths.enabled) {
       // The catalogue is written even when the scanner is not deployed yet, so
       // it is already in place the moment someone uploads brain_scan.py.
       writeToolCatalog(buildEffectiveToolList());
 
-      if (brainPaths.scannerPresent) {
-        // Deferred so a scan cannot compete with startup for the CPU.
-        const bootTimer = setTimeout(() => {
-          bootScanIfMissing().catch((err) => {
-            log("warn", `brain_scan: boot scan failed: ${err.message}`);
-          });
-        }, 15000);
-        if (typeof bootTimer.unref === "function") bootTimer.unref();
+      // Report the scan state at boot instead of acting on it. An operator
+      // reading the logs after a deploy can see whether a manual scan is
+      // needed, which is the one piece of the old boot scan worth keeping.
+      const scanState = describeScanState();
+      if (!brainPaths.scannerPresent) {
+        log("info", "brain_scan: scanner not on the volume - nothing to scan with until it is uploaded");
+      } else if (scanState.error) {
+        log("warn", `brain_scan: cannot stat ${brainPaths.dataPath}: ${scanState.error}`);
+      } else if (!scanState.present) {
+        log("warn", "brain_scan: no scan on this volume. Run one manually (POST /brain-scan, or Refresh in the Neural Core) - the connector will NOT scan on its own.");
+      } else if (scanState.empty) {
+        log("warn", "brain_scan: the scan on disk is empty. Run one manually (POST /brain-scan, or Refresh in the Neural Core) - the connector will NOT rescan on its own.");
+      } else {
+        log("info", `brain_scan: scan present (${scanState.size} bytes) - serving it as-is`);
       }
     }
   } catch (err) {

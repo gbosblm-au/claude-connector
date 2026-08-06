@@ -540,6 +540,12 @@ export function registerVolumeSnapshotRoutes(app) {
       // Equivalent to the manual 'cd /data/skill/ava/scripts && python
       // brain_scan.py' step. A scan failure never fails the restore: the files
       // are already on the volume and the scan is an observability artefact.
+      //
+      // v12.36.0 note on the manual-only trigger policy: this call survives it,
+      // and is not an exception to it. A restore is an operator action started
+      // by a human pressing Restore, and `scan` defaults to '1' only within
+      // that action. Nothing here runs on a timer or at deploy. Pass scan=0 to
+      // restore without scanning.
       let scan = { requested: runScan, ran: false, ok: false, message: 'Not requested.' };
 
       if (runScan) {
@@ -554,7 +560,7 @@ export function registerVolumeSnapshotRoutes(app) {
           log('warn', `[volume-restore] ${scan.message}`);
         } else {
           try {
-            const ok = await runBrainScan({ force: true });
+            const ok = await runBrainScan({ force: true, trigger: 'POST /volume-restore' });
             scan = {
               requested: true,
               ran:       true,
