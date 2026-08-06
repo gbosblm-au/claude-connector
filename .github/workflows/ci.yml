@@ -129,6 +129,19 @@ jobs:
   tests:
     name: Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tenax_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -168,6 +181,40 @@ jobs:
         # The runner enforces exit codes, applies a per-file timeout, and
         # ratchets tests/known-failures.json in both directions. See TNX-H-013.
         run: npm test
+
+      - name: Integration tests (real Postgres)
+        working-directory: Gateway Service
+        # TNX-H-012: the interactions most likely to break in production --
+        # foreign keys, transactions, migration rollback, pool saturation --
+        # have no coverage anywhere else, because every other gateway test
+        # stubs the pool. This is also what caught initDb() being unable to
+        # bootstrap an empty database.
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/tenax_ci
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/tenax_ci
+          PGSSL: disable
+        run: |
+          npm run migrate:init
+          npm run test:integration
+
+      - name: Contract tests (gateway to connector)
+        working-directory: Gateway Service
+        # Neither side's own tests can catch a change to the shape they agree
+        # on, because each mocks the other.
+        env:
+          CONNECTOR_PATH: ${{ github.workspace }}/claude-connector
+        run: npm run test:contract
+
+      - name: Install Playwright browsers
+        working-directory: ts-client-gateway
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser tests against the real assembled bundle
+        working-directory: ts-client-gateway
+        # Replaces the JSDOM stub scaffolding. Chromium denies localStorage on
+        # about:blank, so the harness serves the bundle over a real origin --
+        # a browser behaviour JSDOM does not reproduce at all.
+        run: npm run test:e2e
 
       - name: Verify the verifier
         working-directory: ts-client-gateway
