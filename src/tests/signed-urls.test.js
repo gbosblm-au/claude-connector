@@ -62,14 +62,19 @@ describe( 'TNX-FEAT-SIGNEDURLS: a correctly signed request verifies', () => {
     assert.equal( verifySignedRequest( { filename: 'report.docx', exp, sig } ).ok, true );
   } );
 
-  test( 'the default lifetime is one hour', async () => {
+  test( 'the default lifetime is three days', async () => {
     const { buildSignedQuery, linkExpirySeconds } = await import( '../utils/signedUrls.js' );
 
-    assert.equal( linkExpirySeconds(), 3600 );
+    // 259200s = 3 days, calibrated to match DOWNLOADS_TTL_HOURS in
+    // server-http.js and DOCUMENT_TTL_DAYS in the Gateway Service. A link that
+    // expires before the sidebar row holding it produces dead buttons under a
+    // live countdown, which is why this is asserted rather than left implicit.
+    assert.equal( linkExpirySeconds(), 259200 );
 
     const now = 1_700_000_000;
     const { exp } = buildSignedQuery( { filename: 'a.pdf', now } );
-    assert.equal( exp, now + 3600 );
+    assert.equal( exp, now + 259200 );
+    assert.equal( ( exp - now ) / 86400, 3, 'the default must be exactly three days' );
   } );
 
   test( 'LINK_EXPIRY_SECONDS overrides the lifetime, with sane fallbacks', async () => {
@@ -82,13 +87,18 @@ describe( 'TNX-FEAT-SIGNEDURLS: a correctly signed request verifies', () => {
     // already expired at the moment they are issued.
     for ( const bad of [ '0', '-5', 'abc', '' ] ) {
       process.env.LINK_EXPIRY_SECONDS = bad;
-      assert.equal( mod.linkExpirySeconds(), 3600, `"${ bad }" must fall back to the default` );
+      assert.equal( mod.linkExpirySeconds(), 259200, `"${ bad }" must fall back to the default` );
     }
 
     // Capped, so a milliseconds value pasted into a seconds field cannot
     // silently restore the unlimited lifetime this feature removes.
     process.env.LINK_EXPIRY_SECONDS = '999999999';
     assert.equal( mod.linkExpirySeconds(), 30 * 24 * 3600 );
+
+    // The 3 day default sits well under the 30 day cap, so the cap does not
+    // interfere with it.
+    delete process.env.LINK_EXPIRY_SECONDS;
+    assert.ok( mod.linkExpirySeconds() < 30 * 24 * 3600 );
   } );
 } );
 

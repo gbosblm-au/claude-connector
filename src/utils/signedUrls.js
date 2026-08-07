@@ -39,8 +39,28 @@ import { createHmac, randomBytes, timingSafeEqual, createHash } from 'node:crypt
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-/** Default link lifetime in seconds. */
-const DEFAULT_EXPIRY_SECONDS = 3600;
+/**
+ * Default link lifetime in seconds. 259200 = 3 days.
+ *
+ * This value is one of three that must be calibrated together. A signed link is
+ * embedded in a document row by the Gateway Service at registration and served
+ * from the sidebar for as long as that row lives, so if the link lifetime is
+ * shorter than the row lifetime, every sidebar button dies while the countdown
+ * beside it still shows days remaining. That is not a visible failure until a
+ * user clicks, which is why it survived at the previous 1 hour default.
+ *
+ * The three, which are intended to match:
+ *   1. This value                      -- how long the HMAC in a link verifies.
+ *   2. DOWNLOADS_TTL_HOURS             -- when server-http.js deletes the file.
+ *   3. DOCUMENT_TTL_DAYS               -- when the Gateway Service expires the
+ *                                         sidebar row (routes/ti-documents.js).
+ *
+ * Changing one without the others reintroduces the mismatch. The file reaper
+ * should never be set BELOW this value: a live link pointing at a deleted file
+ * produces a 404, whereas an expired link pointing at a live file produces the
+ * intended "link expired" message.
+ */
+const DEFAULT_EXPIRY_SECONDS = 259200;
 
 /**
  * Lower bound on the secret length. 32 hex characters is 128 bits, which is the
@@ -81,6 +101,9 @@ export function signedLinksEnabled() {
 
 /**
  * Configured link lifetime in seconds.
+ *
+ * Defaults to 259200 (3 days), calibrated to match the download-file reaper and
+ * the Gateway Service document TTL. See DEFAULT_EXPIRY_SECONDS.
  *
  * A non-numeric, zero or negative value falls back to the default rather than
  * producing links that are already expired at the moment they are issued, which

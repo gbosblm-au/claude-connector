@@ -2549,7 +2549,23 @@ function sweepExpiredFiles({ dir, ttlHours, protected: protectedNames = new Set(
 // --- Retention policies -----------------------------------------------------
 
 const DOWNLOADS_DIR            = process.env.DOWNLOADS_DIR || '/data/downloads/';
-const DOWNLOADS_TTL_HOURS      = parseInt(process.env.DOWNLOADS_TTL_HOURS || String(14 * 24), 10);
+
+/**
+ * How long a generated artefact survives on the volume, in hours. 72 = 3 days.
+ *
+ * Calibrated to match the signed-link lifetime (LINK_EXPIRY_SECONDS, default
+ * 259200s = 3 days) and the Gateway Service sidebar row TTL (DOCUMENT_TTL_DAYS,
+ * default 3). All three are intended to expire together; see the
+ * DEFAULT_EXPIRY_SECONDS docblock in src/utils/signedUrls.js.
+ *
+ * Do not set this BELOW the link lifetime. The reaper keys off file mtime and
+ * links are minted at file-creation time, so an equal setting means the file
+ * outlives its link by up to one sweep interval (UPLOAD_SWEEP_INTERVAL_MS,
+ * default 15 minutes). That is the safe direction: a user who is late gets the
+ * intended "link expired" message rather than a 404 on a link that still looks
+ * valid. Setting it lower inverts that and produces the 404.
+ */
+const DOWNLOADS_TTL_HOURS      = parseInt(process.env.DOWNLOADS_TTL_HOURS || String(3 * 24), 10);
 
 /**
  * Files under /data/downloads that must survive the reaper.
@@ -2572,7 +2588,7 @@ function sweepExpiredUploads() {
   });
 }
 
-/** Sweeps /data/downloads on the 14d artefact policy. */
+/** Sweeps /data/downloads on the 3d artefact policy. */
 function sweepExpiredDownloads() {
   return sweepExpiredFiles({
     dir:       DOWNLOADS_DIR,
@@ -3312,6 +3328,64 @@ function authoriseDocumentRequest( req, safeFilename ) {
   return { ok: true };
 }
 
+/**
+ * Re-serialise the credential that authorised THIS request, so a link to the
+ * SAME file rendered inside a preview page carries a credential that is known
+ * to verify.  (CONN-V2-FIX-01)
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The signature payload is `${filename}:${exp}`, so a signature is valid for
+ * exactly one filename. Any code that mints, guesses or rewrites a second
+ * credential for the same file produces a link with the same expiry and a
+ * different, invalid signature -- the "Invalid download link signature."
+ * failure this fix addresses. The request that reached this handler already
+ * carries a credential that verified against `safeFilename`, so the correct
+ * and only safe move is to hand that exact credential onward unchanged.
+ *
+ * CALLER CONTRACT -- read before reusing this
+ * -------------------------------------------
+ * The returned query is valid ONLY for `safeFilename`. It must never be
+ * attached to a URL whose last path segment differs, because the signature is
+ * filename-scoped and the resulting link is guaranteed to be refused. Callers
+ * must not rewrite the extension (for example .html -> .docx) while carrying
+ * this query.
+ *
+ * This function must be called only AFTER authoriseDocumentRequest() has
+ * returned ok, so the values echoed here are already known to be well formed
+ * and to verify. Nothing new is signed and no privilege is created: the caller
+ * receives back precisely what they presented.
+ *
+ * @param {import('express').Request} req
+ * @returns {string} A query string beginning with '?', or '' when the request
+ *                   carried no propagatable credential.
+ */
+function sameFileAuthQuery( req ) {
+  const expRaw = String( req.query?.exp || '' ).trim();
+  const sigRaw = String( req.query?.sig || '' ).trim();
+
+  // Signed shape. The format guards are repeated rather than assumed: this
+  // function is one refactor away from being called on an unauthorised path,
+  // and echoing an unvalidated query parameter into an href is a reflected
+  // injection primitive. Both patterns below are strict allowlists.
+  if ( signedLinksEnabled() && expRaw && sigRaw ) {
+    if ( /^\d{1,15}$/.test( expRaw ) && /^[a-f0-9]{64}$/i.test( sigRaw ) ) {
+      return `?exp=${ expRaw }&sig=${ sigRaw.toLowerCase() }`;
+    }
+    return '';
+  }
+
+  // Legacy global-token shape. Only echoed when the token path is actually the
+  // one in force, so enabling signed links does not cause a token to be written
+  // into preview HTML that the /download route would then refuse.
+  const supplied = extractDocumentToken( req );
+  if ( supplied && documentTokenValid( supplied ).ok ) {
+    return `?token=${ encodeURIComponent( supplied ) }`;
+  }
+
+  return '';
+}
+
 /** Configured signed-link lifetime, read once for the boot log line. */
 const LINK_EXPIRY_SECONDS_CONFIGURED = linkExpirySeconds();
 
@@ -3451,6 +3525,23 @@ app.get( '/preview/:filename', async ( req, res ) => {
     return res.status( auth.status ).json( { error: auth.error } );
   }
 
+  // CONN-V2-FIX-01: the credential that authorised this request, re-serialised
+  // for reuse on the "Download Original" link below.
+  //
+  // Before this fix the three templates below interpolated a bare identifier
+  // `token` that was never declared in this handler or at module scope, so
+  // every request that reached them threw ReferenceError and returned 500.
+  // Even had it resolved, a `?token=` link is refused outright once
+  // ALLOW_LEGACY_DOWNLOAD_TOKEN=false, and carries a global credential into a
+  // page the user can save. Echoing the caller's own verified credential is
+  // correct on both counts.
+  //
+  // Every link built from authQuery below targets safeName itself, which is
+  // what keeps the signature valid: the payload is `${filename}:${exp}`, so
+  // changing the filename while keeping the query is precisely the defect
+  // being fixed.
+  const authQuery = sameFileAuthQuery( req );
+
   const ext   = extname( safeName ).toLowerCase();
   const dlDir = DOWNLOADS_BASE;
 
@@ -3504,11 +3595,17 @@ app.get( '/preview/:filename', async ( req, res ) => {
     } catch ( err ) {
       console.error( '[preview] extract error:', err.message );
       const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title></head><body style="font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center"><h2>${ esc(safeName) }</h2><p>Preview not available.</p><a href="/download/${ encodeURIComponent(safeName) }?token=${ encodeURIComponent(token) }" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Download File</a></body></html>` );
+      // esc() on authQuery turns the '&' between exp and sig into '&amp;', which
+      // is what an HTML attribute requires. Browsers tolerate a bare '&' here,
+      // but a validating parser is entitled to read '&sig' as an entity.
+      return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title></head><body style="font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center"><h2>${ esc(safeName) }</h2><p>Preview not available.</p><a href="/download/${ encodeURIComponent(safeName) }${ esc(authQuery) }" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Download File</a></body></html>` );
     }
 
-    const downloadUrl = `/download/${ safeName }?token=${ encodeURIComponent( token ) }`;
     const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    // Same filename, same credential. encodeURIComponent on the segment mirrors
+    // the download route's own basename handling; esc() makes the query safe to
+    // sit inside an href attribute.
+    const downloadUrl = `/download/${ encodeURIComponent( safeName ) }${ esc( authQuery ) }`;
     let bodyHtml = '';
     for ( const sec of extracted.sections || [] ) {
       if ( sec.type === 'heading' ) {
@@ -3537,7 +3634,7 @@ app.get( '/preview/:filename', async ( req, res ) => {
 
   // ── Non-docx: serve a simple download page ──────────────────────────────────
   const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}a{display:inline-block;color:#fff;padding:12px 24px;background:#2563eb;text-decoration:none;border-radius:6px}</style></head><body><h2>${ esc(safeName) }</h2><p>This file type cannot be previewed.</p><a href="/download/${ encodeURIComponent(safeName) }?token=${ encodeURIComponent(token) }" target="_parent">Download File</a></body></html>` );
+  return res.send( `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${ esc(safeName) }</title><style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;text-align:center}a{display:inline-block;color:#fff;padding:12px 24px;background:#2563eb;text-decoration:none;border-radius:6px}</style></head><body><h2>${ esc(safeName) }</h2><p>This file type cannot be previewed.</p><a href="/download/${ encodeURIComponent(safeName) }${ esc(authQuery) }" target="_parent">Download File</a></body></html>` );
 } );
 
 // ---------------------------------------------------------------------------
@@ -4174,7 +4271,7 @@ app.use((_req, res) => {
       trackOpen:             "GET /track/open?id=...",
       trackClick:            "GET /track/click?id=...&url=...",
       upload:                "POST /upload/connections",
-      previewDownload:       "GET /preview/:filename?token=...",
+      previewDownload:       "GET /preview/:filename?exp=...&sig=... (or ?token=... when ALLOW_LEGACY_DOWNLOAD_TOKEN is on)",
       webhook:               "POST /webhook",
     },
   });
