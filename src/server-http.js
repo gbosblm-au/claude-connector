@@ -82,6 +82,16 @@ import {
   handleTsGatewaySessionInit,
 } from './tools/gatewaySessionInit.js';
 
+// v12.40.0: Tenax UI Tools - Personal Chef and My Weight Loss Coach research briefs.
+// These build the recipe-scout brief; they do not perform the research themselves.
+// See the header of src/tools/personalChef.js for why.
+import {
+  personalChefFindToolDefinition,
+  weightLossAdaptToolDefinition,
+  handlePersonalChefFind,
+  handleWeightLossAdapt,
+} from "./tools/personalChef.js";
+
 // v12.5.0: Peer Review - health log tools (tenant mode) and check-in tools (owner mode)
 import {
   healthLogWriteToolDefinition,
@@ -697,6 +707,14 @@ if (MEMORY_ENABLED) {
 // Tool registry
 // -----------------------------------------------------------------------
 const TOOLS = [
+  // ---------- Tenax UI Tools: Personal Chef / Weight Loss Coach (v12.40.0) ----------
+  // Advertised unconditionally: both are plain request/response brief builders
+  // with no gateway credentials, no filesystem writes and no tenant coupling,
+  // so there is nothing for a mode guard to protect. They are also reachable
+  // from chat with no UI at all, which spec 8 explicitly requires.
+  personalChefFindToolDefinition,
+  weightLossAdaptToolDefinition,
+
   // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
   // Only advertised when TS_CLIENT_MODE=tenant. Authenticates the session
   // and returns the required next-step sequence including skill_compile.
@@ -1017,6 +1035,10 @@ async function dispatchToolCallCore(name, args, context = null) {
       switch (name) {
         // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
         case "ts_gateway_session_init": return await handleTsGatewaySessionInit(args);
+
+        // ---------- Tenax UI Tools (v12.40.0) ----------
+        case "personal_chef_find":          return await handlePersonalChefFind(args);
+        case "weight_loss_adapt":           return await handleWeightLossAdapt(args);
 
         case "web_search":                  return await handleWebSearch(args);
         case "news_search":                 return await handleNewsSearch(args);

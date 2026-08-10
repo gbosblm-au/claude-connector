@@ -269,6 +269,14 @@ import {
   handleNaiveBayes, handleAnomalyDetection, handleFeatureImportance,
 } from "./tools-stats/machineLearning.js";
 
+// v12.40.0: Tenax UI Tools - Personal Chef and My Weight Loss Coach research briefs.
+import {
+  personalChefFindToolDefinition,
+  weightLossAdaptToolDefinition,
+  handlePersonalChefFind,
+  handleWeightLossAdapt,
+} from "./tools/personalChef.js";
+
 import { getCurrentDateTime } from "./utils/helpers.js";
 import { log } from "./utils/logger.js";
 
@@ -278,6 +286,10 @@ const server = new Server(
 );
 
 const TOOLS = [
+  // Tenax UI Tools: Personal Chef / Weight Loss Coach (v12.40.0).
+  personalChefFindToolDefinition,
+  weightLossAdaptToolDefinition,
+
   webSearchToolDefinition,
   newsSearchToolDefinition,
   imageSearchToolDefinition,
@@ -429,6 +441,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   log("info", `CallTool: ${name}`);
   try {
     switch (name) {
+      // ---------- Tenax UI Tools (v12.40.0) ----------
+      case "personal_chef_find":          return await handlePersonalChefFind(args);
+      case "weight_loss_adapt":           return await handleWeightLossAdapt(args);
+
       case "web_search":                  return await handleWebSearch(args);
       case "news_search":                 return await handleNewsSearch(args);
       case "image_search":                return await handleImageSearch(args);
