@@ -536,6 +536,16 @@ import {
   handleScriptExecute,
   TOOL_DEFINITION as scriptExecuteToolDefinition,
 } from "./tools/script-execute.js";
+// SPEC-GTW-DOC-001: first-class document / pdf / xlsx / pptx render tools.
+// Additive. script_execute and every renderer script it can reach are
+// unchanged and remain available; see src/tools/render-tools.js for why.
+import {
+  RENDER_TOOL_DEFINITIONS,
+  RENDER_TOOL_NAMES,
+  dispatchRenderTool,
+  renderToolsEnabled,
+  renderToolsStatus,
+} from "./tools/render-tools.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -557,6 +567,13 @@ let MEMORY_ENABLED = Boolean(MEMORY_AUTH_TOKEN) || Boolean(config.avaMemoryWpUrl
 const SKILL_ENABLED = Boolean(config.skillFilePath);
 // Modular skill system - activated by SKILL_MODULAR_ENABLED=true AND SKILL_FILE_PATH set.
 const SKILL_MODULAR_ENABLED = SKILL_ENABLED && process.env.SKILL_MODULAR_ENABLED === "true";
+
+// SPEC-GTW-DOC-001 feature flag. Read once at startup, exactly as SKILL_ENABLED
+// is, so the advertised tool list and the dispatcher cannot disagree within a
+// single process lifetime. renderToolsEnabled() re-reads process.env on each
+// call, which is what the unit tests drive; the two agree because they read the
+// same variable and Railway restarts the service when a variable changes.
+const RENDER_TOOLS_ENABLED = renderToolsEnabled();
 
 // ---------------------------------------------------------------------------
 // Runtime modular mode helpers (v11.3.0)
@@ -930,6 +947,18 @@ const TOOLS = [
       ]
     : []),
 
+  // ---------- Gateway render tools (SPEC-GTW-DOC-001) ----------
+  // document_render / pdf_render / xlsx_render / pptx_render.
+  //
+  // Gated on RENDER_TOOLS_ENABLED as well as SKILL_ENABLED. Spec section 9
+  // requires the four tools ship behind a flag that defaults off for one
+  // release, so that the additive change can be verified in place before it
+  // becomes the advertised path. SKILL_ENABLED is required in addition
+  // because the renderers live on the same provisioned volume the skill tools
+  // need: advertising a tool that can only ever return scripts_dir_missing
+  // would be worse than not advertising it.
+  ...(SKILL_ENABLED && RENDER_TOOLS_ENABLED ? RENDER_TOOL_DEFINITIONS : []),
+
   // ---------- Modular Skill System (v11.0.0) ----------
   // Only advertised when SKILL_MODULAR_ENABLED=true (requires SKILL_FILE_PATH).
   // skill_compile replaces skill_read at session start when modular mode is active.
@@ -968,6 +997,34 @@ const TOOLS = [
   ...(MEMORY_ENABLED ? ALL_MEMORY_TOOL_DEFINITIONS : []),
 ];
 
+// ---------------------------------------------------------------------------
+// Name-collision guard  (SPEC-GTW-DOC-001)
+//
+// Registering a tool whose name already exists would place a second `case` in
+// dispatchToolCallCore for a name the switch already handles. JavaScript takes
+// the FIRST matching case, so the existing tool would keep working and the new
+// one would be silently unreachable -- or, if the new case were placed first,
+// the existing tool would be silently replaced. Neither failure produces an
+// error at any point; the only symptom is a tool that quietly does the wrong
+// thing, which is the exact class of defect this change is meant to remove.
+//
+// Checked at boot rather than in a test because the tool surface is assembled
+// from environment-dependent branches, so the set that actually ships is only
+// knowable in the running process.
+// ---------------------------------------------------------------------------
+{
+  const nonRenderNames = new Set(
+    TOOLS.filter((t) => t && t.name && !RENDER_TOOL_NAMES.has(t.name)).map((t) => t.name)
+  );
+  const collisions = [...RENDER_TOOL_NAMES].filter((n) => nonRenderNames.has(n));
+  if (collisions.length > 0) {
+    throw new Error(
+      `Render tool name collision: ${collisions.join(", ")} is already registered by another module. ` +
+      "Rename the render tool or remove the duplicate registration before starting the connector."
+    );
+  }
+}
+
 
 // -----------------------------------------------------------------------
 // dispatchToolCall  (v12.8.0)
@@ -999,7 +1056,13 @@ function buildEffectiveToolList() {
   ];
 
   const byName = new Map();
-  for (const tool of [...TOOLS, ...modularDefinitions]) {
+  // SPEC-GTW-DOC-001: the render definitions are spread in unconditionally,
+  // NOT gated on RENDER_TOOLS_ENABLED. This function describes what the
+  // connector can expose, which is what the Neural Core catalogue documents;
+  // the flag governs what this deployment currently advertises to a session.
+  // Gating here would make the four tools invisible to the scanner during the
+  // default-off release and then appear as brand new the day the flag flips.
+  for (const tool of [...TOOLS, ...modularDefinitions, ...RENDER_TOOL_DEFINITIONS]) {
     if (tool && typeof tool.name === "string" && tool.name && !byName.has(tool.name)) {
       byName.set(tool.name, tool);
     }
@@ -1223,6 +1286,20 @@ async function dispatchToolCallCore(name, args, context = null) {
         case "script_read":             return handleScriptRead(args);
         case "script_write":            return await handleScriptWrite(args);
         case "script_execute":          return await handleScriptExecute(args);
+
+        // ---------- Gateway render tools (SPEC-GTW-DOC-001) ----------
+        // Routed through one dispatcher rather than four cases so that the
+        // feature-flag check cannot be applied to three tools and forgotten on
+        // the fourth. dispatchRenderTool returns null for any name it does not
+        // own, which cannot happen here but keeps the contract explicit.
+        case "document_render":
+        case "pdf_render":
+        case "xlsx_render":
+        case "pptx_render": {
+          const _renderResult = await dispatchRenderTool(name, args);
+          if (_renderResult) return _renderResult;
+          throw new Error(`Unknown tool: ${name}`);
+        }
 
         // ---------- Ava User Profiles (v10.8.0) ----------
         case "profile_read":           return await handleProfileRead(args, context);
@@ -1880,6 +1957,12 @@ app.get(["/health/ready", "/health"], async (req, res) => {
     teamsEnabled: !!(config.teamsWebhookUrl),
     webhookEnabled: true,
     profilesEnabled: PROFILES_ENABLED,
+    // SPEC-GTW-DOC-001. Reported on the authenticated branch only, alongside
+    // the rest of the integration inventory. The renderer scripts live on the
+    // Railway volume and vanish on a snapshot revert (spec failure mode 4.5),
+    // so "which renderers are actually present right now" is the one question
+    // an operator needs answered before trusting a render call.
+    renderTools: renderToolsStatus(),
     timestamp: new Date().toISOString(),
   });
 });
