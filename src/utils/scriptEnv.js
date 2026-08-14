@@ -117,6 +117,15 @@ export function buildScriptEnv( opts = {} ) {
   if ( process.env.MISE_DATA_DIR ) env.MISE_DATA_DIR = process.env.MISE_DATA_DIR;
   if ( process.env.PYTHONPATH )    env.PYTHONPATH    = process.env.PYTHONPATH;
 
+  // Preserve document directory configuration. These are operator-controlled
+  // host settings, not secrets. Without them a connector deployment that
+  // overrides /data/downloads or /data/uploads silently reverts every spawned
+  // script to the compiled-in default, and the connector then diffs a
+  // different directory than the script wrote to -- producing an empty
+  // download set and a "no file produced" report for work that completed.
+  if ( process.env.DOCUMENT_DOWNLOADS_DIR ) env.DOCUMENT_DOWNLOADS_DIR = process.env.DOCUMENT_DOWNLOADS_DIR;
+  if ( process.env.DOCUMENT_UPLOADS_DIR )   env.DOCUMENT_UPLOADS_DIR   = process.env.DOCUMENT_UPLOADS_DIR;
+
   // Caller-supplied non-secret values (database paths, output locations).
   // Applied before manifest grants and validated so they cannot overwrite the
   // base entries that keep the child's execution environment predictable.

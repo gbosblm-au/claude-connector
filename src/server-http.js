@@ -547,6 +547,23 @@ import {
   renderToolsStatus,
 } from "./tools/render-tools.js";
 
+// SPEC-GTW-TOOL-001. Additive, exactly as the render tools were: script_execute
+// and the editor scripts it can reach are unchanged and remain available.
+import {
+  EDIT_TOOL_DEFINITIONS,
+  dispatchEditTool,
+  editToolsEnabled,
+  editToolsStatus,
+} from "./tools/edit-tools.js";
+
+// SPEC-GTW-TOOL-003. Additive on the same terms.
+import {
+  VALIDATION_TOOL_DEFINITIONS,
+  dispatchValidationTool,
+  validationToolsEnabled,
+  validationToolsStatus,
+} from "./tools/validation-tools.js";
+
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
@@ -574,6 +591,12 @@ const SKILL_MODULAR_ENABLED = SKILL_ENABLED && process.env.SKILL_MODULAR_ENABLED
 // call, which is what the unit tests drive; the two agree because they read the
 // same variable and Railway restarts the service when a variable changes.
 const RENDER_TOOLS_ENABLED = renderToolsEnabled();
+
+// SPEC-GTW-TOOL-001 and SPEC-GTW-TOOL-003 feature flags, read once at startup
+// for the same reason: the advertised tool list and the dispatcher must not
+// disagree within a single process lifetime.
+const EDIT_TOOLS_ENABLED = editToolsEnabled();
+const VALIDATION_TOOLS_ENABLED = validationToolsEnabled();
 
 // ---------------------------------------------------------------------------
 // Runtime modular mode helpers (v11.3.0)
@@ -959,6 +982,16 @@ const TOOLS = [
   // would be worse than not advertising it.
   ...(SKILL_ENABLED && RENDER_TOOLS_ENABLED ? RENDER_TOOL_DEFINITIONS : []),
 
+  // ---------- Gateway edit tools (SPEC-GTW-TOOL-001) ----------
+  // SKILL_ENABLED is required alongside the feature flag for the same reason it
+  // is above: the editors live on the provisioned volume, and advertising a
+  // tool that could only ever return scripts_dir_missing is worse than not
+  // advertising it.
+  ...(SKILL_ENABLED && EDIT_TOOLS_ENABLED ? EDIT_TOOL_DEFINITIONS : []),
+
+  // ---------- Gateway validation tools (SPEC-GTW-TOOL-003) ----------
+  ...(SKILL_ENABLED && VALIDATION_TOOLS_ENABLED ? VALIDATION_TOOL_DEFINITIONS : []),
+
   // ---------- Modular Skill System (v11.0.0) ----------
   // Only advertised when SKILL_MODULAR_ENABLED=true (requires SKILL_FILE_PATH).
   // skill_compile replaces skill_read at session start when modular mode is active.
@@ -1062,7 +1095,15 @@ function buildEffectiveToolList() {
   // the flag governs what this deployment currently advertises to a session.
   // Gating here would make the four tools invisible to the scanner during the
   // default-off release and then appear as brand new the day the flag flips.
-  for (const tool of [...TOOLS, ...modularDefinitions, ...RENDER_TOOL_DEFINITIONS]) {
+  for (const tool of [
+    ...TOOLS,
+    ...modularDefinitions,
+    ...RENDER_TOOL_DEFINITIONS,
+    // Included so a future name collision with an edit or validation tool is
+    // caught at startup rather than by whichever case the switch reaches first.
+    ...EDIT_TOOL_DEFINITIONS,
+    ...VALIDATION_TOOL_DEFINITIONS,
+  ]) {
     if (tool && typeof tool.name === "string" && tool.name && !byName.has(tool.name)) {
       byName.set(tool.name, tool);
     }
@@ -1298,6 +1339,27 @@ async function dispatchToolCallCore(name, args, context = null) {
         case "pptx_render": {
           const _renderResult = await dispatchRenderTool(name, args);
           if (_renderResult) return _renderResult;
+          throw new Error(`Unknown tool: ${name}`);
+        }
+
+        // ---------- Gateway edit tools (SPEC-GTW-TOOL-001) ----------
+        // Grouped through one dispatcher for the same reason as the renderers:
+        // a per-tool case is a per-tool opportunity to forget the flag check.
+        case "xlsx_edit":
+        case "docx_edit":
+        case "pptx_edit":
+        case "homework_render": {
+          const _editResult = await dispatchEditTool(name, args);
+          if (_editResult) return _editResult;
+          throw new Error(`Unknown tool: ${name}`);
+        }
+
+        // ---------- Gateway validation tools (SPEC-GTW-TOOL-003) ----------
+        case "code_syntax":
+        case "code_integrity":
+        case "erp_config_validator": {
+          const _validationResult = await dispatchValidationTool(name, args);
+          if (_validationResult) return _validationResult;
           throw new Error(`Unknown tool: ${name}`);
         }
 
@@ -1963,6 +2025,13 @@ app.get(["/health/ready", "/health"], async (req, res) => {
     // so "which renderers are actually present right now" is the one question
     // an operator needs answered before trusting a render call.
     renderTools: renderToolsStatus(),
+    // SPEC-GTW-TOOL-001 and SPEC-GTW-TOOL-003, reported for the same reason:
+    // these scripts sit on the same volume and disappear on the same snapshot
+    // revert, and the validators additionally live in a NESTED scripts/
+    // subdirectory, so "is the validator where the gateway thinks it is" is
+    // worth answering without having to make a failing call to find out.
+    editTools: editToolsStatus(),
+    validationTools: validationToolsStatus(),
     timestamp: new Date().toISOString(),
   });
 });

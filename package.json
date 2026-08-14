@@ -1,6 +1,6 @@
 {
   "name": "claude-connector",
-  "version": "12.41.0",
+  "version": "12.42.0",
   "description": "MCP server for Claude with persistent memory, real-time web search, news search, LinkedIn connections lookup, TrueSource outreach email send/tracking/scheduling, Google Drive/Calendar/Sheets integration, Slack/Teams messaging, inbound webhooks, WordPress publishing, image search/download, psychology assessment, plus comprehensive statistical analysis and machine learning + multi-tenant client gateway support",
   "type": "module",
   "main": "src/index.js",
@@ -17,7 +17,10 @@
     "generate-tool-catalog": "node scripts/generate-tool-catalog.mjs",
     "test:security": "node --test src/tests/phase0-security.test.js",
     "test:brain-scan": "node --test src/tests/brain-scan-manual-only.test.js",
-    "test:render-tools": "node --test src/tests/render-tools.test.js"
+    "test:render-tools": "node --test src/tests/render-tools.test.js",
+    "test:edit-tools": "node --test src/tests/edit-tools.test.js",
+    "test:validation-tools": "node --test src/tests/validation-tools.test.js",
+    "test:gateway-tools": "node --test src/tests/render-tools.test.js src/tests/edit-tools.test.js src/tests/validation-tools.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

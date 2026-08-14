@@ -93,6 +93,7 @@ import {
   writeFileSync,
   statSync,
   unlinkSync,
+  readdirSync,
 } from 'node:fs';
 import { resolve as resolvePath, basename, extname, join as joinPath } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -1355,9 +1356,41 @@ async function handleSpecRender( cfg, input ) {
     const { links, warnings, primary, preview } = collectOutputs( before, ext, declared );
 
     if ( links.length === 0 ) {
-      // Exit 0, success envelope, nothing on disk. This is the silent-success
-      // failure the change specification exists to remove, so it is reported as
-      // an error rather than as an empty success.
+      // Exit 0, success envelope, but no signed links. Distinguish the two
+      // causes, because they demand different operator actions:
+      //
+      //   1. No file at all on disk  -> genuine no_output_produced.
+      //   2. A file exists but buildDownloadLinks could not build a URL
+      //      (CONNECTOR_URL unset, token missing) -> partial: deliverable
+      //      exists locally, only the shareable link is unavailable.
+      //
+      // The following existence check runs against the same directory the
+      // connector diffs, so it cannot disagree about what was produced.
+      const dirExists = existsSync( downloadsBase() );
+      const produced = dirExists && readdirSync( downloadsBase() ).some( name => name.endsWith(ext) );
+
+      if ( produced ) {
+        const urlIssue = ! isNonEmptyString( process.env.CONNECTOR_URL )
+          ? 'CONNECTOR_URL_NOT_SET'
+          : 'DOWNLOAD_LINK_UNBUILDABLE';
+
+        return mcp( {
+          ok: true,
+          tool,
+          format: ext.replace( '.', '' ),
+          renderer: scriptFile,
+          spec_bytes: staged.bytes,
+          ...counts( spec ),
+          partial: true,
+          partial_reason: urlIssue,
+          message: `${ scriptFile } ran successfully and wrote a ${ ext } file to ${ downloadsBase() }, but a shareable link could not be built (CONNECTOR_URL is ${ process.env.CONNECTOR_URL ? 'set' : 'not set' }). The file is on disk and available through the downloads directory.`,
+          download_warnings: warnings.length ? warnings : undefined,
+          renderer_contract: envelope || undefined,
+          ...( ignored.length ? { ignored_parameters: ignored } : {} ),
+          execution_time_ms: run.elapsed_ms,
+        } );
+      }
+
       return failure( tool, 'no_output_produced',
         `${ scriptFile } reported success but wrote no file to ${ downloadsBase() }. ` +
         'Nothing can be delivered to the user.',
