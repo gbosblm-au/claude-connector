@@ -99,6 +99,12 @@ import { resolve as resolvePath, basename, extname, join as joinPath } from 'nod
 import { spawnSync } from 'node:child_process';
 
 import { resolveContained, isSafeFilename } from '../utils/pathContainment.js';
+
+// CONN-GUARD-001: the integrity guard runs at the boundary, before any handler
+// does work. Registering the schemas is a side effect of this import, which is
+// why it is imported for effect even where only the wrapper is named.
+import { guardToolCall } from './tool-call-guard.js';
+import './render-schemas.js';
 import { buildScriptEnv } from '../utils/scriptEnv.js';
 import { buildDownloadLinks, snapshotDownloads, downloadsBase } from '../utils/downloadLinks.js';
 
@@ -1154,6 +1160,31 @@ async function handleSpecRender( cfg, input ) {
   const { tool, scriptFile, validate, ext, counts } = cfg;
   const args = isPlainObject( input ) ? input : {};
 
+  // ---- Step 0: CONN-GUARD-001 §3.1, the interception point.
+  //
+  // Placed here rather than in each of the three handlers because this is the
+  // single line every spec-renderer call passes through, before any work is
+  // done. A handler added later inherits the guard by routing through
+  // handleSpecRender, which is what §3.1 means by renderer-class-wide.
+  //
+  // It sits ABOVE the pre-check at step 2, which stays as the second layer and
+  // the renderer's own validate_spec as the third. Nothing is removed: the
+  // pre-check works, and the guard adds what it cannot do -- telling a missing
+  // payload apart from a malformed one, returning a RETRY directive instead of
+  // an error, and recording the rejection telemetry §3.4 asks for.
+  //
+  // NOT applied to a dry run. A dry run does not dispatch to the renderer at
+  // all -- it asks "would this spec be accepted?" and the honest answer is a
+  // VERDICT, not a rejection. Turning it into one broke the established
+  // contract that a dry run returns isError:false with valid:false, which is
+  // what lets a caller check a spec without treating the check as a failure.
+  // The failure class this guard exists to prevent -- an empty call reaching
+  // the renderer -- cannot occur on a path that never reaches it.
+  if ( args.dry_run !== true ) {
+    const rejection = guardToolCall( { tool, input, modelId: args.__model_id } );
+    if ( rejection ) return mcp( rejection, true );
+  }
+
   // ---- Step 1: T10. The schemas carry no script path, so any such key is
   // caller noise or an injection attempt. Either way it is ignored, and said.
   const ignored = detectInjectionKeys( args );
@@ -1750,6 +1781,21 @@ export const RENDER_TOOL_DEFINITIONS = [
 export const RENDER_TOOL_NAMES = new Set( RENDER_TOOL_DEFINITIONS.map( ( t ) => t.name ) );
 
 // ---------------------------------------------------------------------------
+// CONN-GUARD-001 §3.1: the interception point.
+//
+// The guard is applied by WRAPPING each handler rather than by asking each one
+// to call it. A handler added later that forgot the call would be silently
+// unguarded, and a missing guard is invisible until the day it matters.
+//
+// It sits ABOVE the existing pre-check, which stays in place as the second
+// layer §3.1 describes, with the renderer's own validate_spec as the third.
+// Nothing is removed: the pre-check is a known quantity that works, and the
+// guard adds what it cannot do -- distinguishing a missing payload from a
+// malformed one, issuing a RETRY directive instead of an error, and recording
+// the rejection telemetry the routing decision is measured against.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -1815,6 +1861,18 @@ export async function handlePptxRender( input = {} ) {
 export async function handlePdfRender( input = {} ) {
   const tool = 'pdf_render';
   const args = isPlainObject( input ) ? input : {};
+
+  // CONN-GUARD-001 §3.1. pdf_render does not route through handleSpecRender at
+  // its own boundary, so the guard is applied here directly. from_docx mode is
+  // exempted inside the guard -- it converts an existing document and carries
+  // no spec by design, and demanding one would block every PDF made from a
+  // file the user already has.
+  // Dry runs are exempt for the reason given in handleSpecRender: a verdict
+  // request is not a dispatch.
+  if ( args.dry_run !== true ) {
+    const rejection = guardToolCall( { tool, input, modelId: args.__model_id } );
+    if ( rejection ) return mcp( rejection, true );
+  }
 
   const ignored = detectInjectionKeys( args );
   if ( ignored.length > 0 ) {
