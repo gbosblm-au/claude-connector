@@ -117,6 +117,49 @@ export function buildScriptEnv( opts = {} ) {
   if ( process.env.MISE_DATA_DIR ) env.MISE_DATA_DIR = process.env.MISE_DATA_DIR;
   if ( process.env.PYTHONPATH )    env.PYTHONPATH    = process.env.PYTHONPATH;
 
+  // ── SPEC-AUDIT-REG-001: the invocation register ────────────────────────
+  //
+  // buildScriptEnv is the single environment builder every spawn site uses --
+  // render-tools, homeworkTools, nudgeTools, brain-scan and script-execute --
+  // which makes it the one place that can hook ALL script execution without
+  // touching any of them.
+  //
+  // The hook itself is scripts/sitecustomize.py, which CPython imports
+  // automatically at interpreter startup when its directory is on PYTHONPATH.
+  // That is what delivers the spec's "non-invasive ... no schema changes to
+  // scripts themselves" against 561 files: no script imports anything, no
+  // spawn site changes, and a script added tomorrow is registered on its first
+  // run.
+  //
+  // SECURITY. PYTHONPATH is a code-execution vector -- a caller-supplied value
+  // shadows any import -- and src/tests/internal-config-custom-env.test.js
+  // exists to prove a caller cannot set it. That guard is untouched: the entry
+  // added here is SERVER-controlled, derived from the connector's own scripts
+  // base, and is applied before the caller-supplied `extra` block below, which
+  // still rejects PYTHONPATH outright. The scripts base is already a directory
+  // the connector executes from, so putting it on the import path grants
+  // nothing that was not already granted.
+  if ( String( process.env.TENAX_AUDIT_REGISTER || '' ).toLowerCase() === 'true' ) {
+    const scriptsBase = process.env.TENAX_SCRIPTS_BASE || '/data/skill/ava/scripts';
+    env.TENAX_AUDIT_REGISTER = 'true';
+    env.TENAX_SCRIPTS_BASE   = scriptsBase;
+    if ( process.env.TENAX_AUDIT_REGISTER_PATH ) {
+      env.TENAX_AUDIT_REGISTER_PATH = process.env.TENAX_AUDIT_REGISTER_PATH;
+    }
+
+    // Caller classification (§Write Points). A spawn site that names its tool
+    // is a registered_tool invocation; one that does not is a direct call.
+    // Recorded rather than inferred, because the difference decides the
+    // verdict: a fallback-only script is a quarantine candidate and a
+    // tool-bound one never is.
+    env.TENAX_AUDIT_CALLER = opts.auditCaller || ( scriptKey ? 'registered_tool' : 'direct' );
+    if ( opts.auditTool || scriptKey ) env.TENAX_AUDIT_TOOL = String( opts.auditTool || scriptKey );
+    if ( opts.auditSession ) env.TENAX_AUDIT_SESSION = String( opts.auditSession );
+
+    // Prepended so the hook is found even when an operator PYTHONPATH is set.
+    env.PYTHONPATH = env.PYTHONPATH ? `${ scriptsBase }:${ env.PYTHONPATH }` : scriptsBase;
+  }
+
   // Preserve document directory configuration. These are operator-controlled
   // host settings, not secrets. Without them a connector deployment that
   // overrides /data/downloads or /data/uploads silently reverts every spawned

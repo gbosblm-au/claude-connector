@@ -150,6 +150,42 @@ conversational turn.
 
 ---
 
+## 4A. Amendment 3 — Guard validation depth (CONN-GUARD-001 §3.2)
+
+Adopted 2026-08-15. Full text: `protocol/conn-guard-001-amendment-1.docx`.
+
+CONN-GUARD-001 §3.2 required that "section/slide objects must carry a type and
+required fields per type". That clause is **withdrawn as written**, because the
+deployed renderers accept more than it describes and the guard sits in front of
+them — so a guard enforcing it converts working documents into validation
+errors.
+
+The governing instance: `spec_render_common.py` resolves a section type with
+`sec.get("type", "text")`, so a section with **no type** is valid and renders as
+text. Five further cases behave the same way (`divider`, `page_break`,
+`subheading`, a bare `text`, and the `paragraph` alias), all verified against
+the live validator.
+
+The amended rule:
+
+- title and a non-empty collection remain required (unchanged);
+- every collection entry must be a JSON object;
+- an entry is **not** required to carry a type, where the renderer defines a
+  default;
+- where a type IS present it must be a registered type, and any fields that
+  type declares required must be present;
+- everything beyond that is delegated to the renderer, which is the source of
+  truth for its own payload.
+
+The guard shipped in connector v12.43.0 already behaves this way, so the
+amendment brings the specification into line with the code rather than
+requiring a change to it.
+
+If a hard per-type gate is wanted later, the contract in §4 of the amendment is
+what it should be **generated** from — derived from the renderer constants at
+build time, never hand-copied. A hand-maintained second copy drifting from the
+renderer is precisely the failure this amendment removes.
+
 ## 5. Measurement
 
 The guard logs every rejection with the tool, the reason, the field and the

@@ -387,6 +387,48 @@ describe( 'REGRESSIONS: paths the guard must NOT intercept', () => {
   } );
 } );
 
+describe( 'CONN-GUARD-001 Amendment 1: validation depth', () => {
+  // The amended §3.2. Each of these is a spec the DEPLOYED renderer accepts,
+  // verified against spec_render_common.validate_spec. A guard enforcing the
+  // original clause would reject every one, turning working documents into
+  // validation errors -- a worse failure than the empty call it was written to
+  // prevent.
+
+  test( 'a section with NO type is accepted', () => {
+    // spec_render_common.py: stype = sec.get("type", "text"). The governing
+    // instance, and the one that makes the original clause unimplementable.
+    const input = { spec: { title: 'T', sections: [ { text: 'body copy' } ] } };
+    assert.equal( guardToolCall( { tool: 'document_render', input, logger: quiet } ), null );
+  } );
+
+  test( 'types with no required fields are accepted bare', () => {
+    for ( const type of [ 'divider', 'page_break', 'subheading', 'text', 'paragraph' ] ) {
+      const input = { spec: { title: 'T', sections: [ { type } ] } };
+      assert.equal( guardToolCall( { tool: 'document_render', input, logger: quiet } ), null, type );
+    }
+  } );
+
+  test( 'xlsx accepts the legacy data array in place of headers/rows', () => {
+    const input = { spec: { metadata: { title: 'Q3' }, sheets: [ { data: [ [ 'h' ], [ 1 ] ] } ] } };
+    assert.equal( guardToolCall( { tool: 'xlsx_render', input, logger: quiet } ), null );
+  } );
+
+  test( 'a pptx slide needs no type, and elements is optional', () => {
+    const input = { spec: { title: 'Deck', slides: [ {}, { elements: [ { text: 'x' } ] } ] } };
+    assert.equal( guardToolCall( { tool: 'pptx_render', input, logger: quiet } ), null );
+  } );
+
+  test( 'the structural rules that DID survive still bite', () => {
+    // The amendment narrowed the depth; it did not remove the guard. A
+    // non-object entry is not something any renderer accepts, so rejecting it
+    // cannot produce a false negative.
+    const input = { spec: { title: 'T', sections: [ 'not an object' ] } };
+    const r = guardToolCall( { tool: 'document_render', input, logger: quiet } );
+    assert.ok( r, 'a string entry is still rejected' );
+    assert.equal( r.faults[ 0 ].reason, 'wrong_type' );
+  } );
+} );
+
 describe( 'schema registry hygiene', () => {
   test( 'registration requires a tool and a collection', () => {
     assert.throws( () => registerRenderSchema( { collection: 'rows' } ), /tool is required/ );
