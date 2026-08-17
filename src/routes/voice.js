@@ -43,8 +43,12 @@ import rateLimit                  from 'express-rate-limit';
 import { voiceEnabled, gateState, benchmarkState,
          voiceAvailableFor, voiceAvailableForAsync,
          allowlistDiagnostics, currentAllowlistSource,
-         testUsers } from '../voice/voice-gate.js';
+         resolveIdentity, testUsers } from '../voice/voice-gate.js';
 import { allowlistConfigProblems } from '../voice/voice-allowlist.js';
+// v12.50.0: the transport credential. MCP_API_KEY (operator) or
+// RAILWAY_RESTORE_TOKEN (gateway). See src/voice/voice-auth.js for why the
+// gateway could not previously reach these routes at all.
+import { voiceCredential }        from '../voice/voice-auth.js';
 import { parseMultipart }         from '../voice/multipart.js';
 import { validateAudio, maxBytes,
          ACCEPTED_FORMATS }       from '../voice/audio-validate.js';
@@ -129,7 +133,22 @@ async function gate(req, res, next) {
  * transcription because the middleware order changed.
  */
 function requireAuth(req, res, next) {
-  const authed = !!(req.tsTenantId || req.user || req.userId || req.authenticated);
+  // v12.50.0: `req.authenticated` was never set by anything in this connector.
+  // mcpAuthMiddleware sets `req.mcpAuthenticated`, and tenantAuthMiddleware --
+  // the only thing that sets `req.tsTenantId` -- is mounted on /mcp alone, so
+  // it never runs for a voice request. The effect was that a correctly
+  // credentialled, correctly allowlisted operator still got
+  // 401 unauthenticated from POST /voice/transcribe and /voice/synthesize, and
+  // the only way past it was VOICE_ALLOW_UNAUTHENTICATED=true, which reads like
+  // switching authentication off to make a feature work.
+  //
+  // The list now names the flags that actually exist. voiceCredential runs
+  // ahead of this handler and sets req.voiceAuthenticated only when a
+  // configured credential matched, so this stays a real check rather than a
+  // formality: an anonymous caller on a connector with no credential
+  // configured at all still lands on the 401 below.
+  const authed = !!(req.voiceAuthenticated || req.mcpAuthenticated || req.tsTenantId
+                    || req.user || req.userId || req.authenticated);
   if (authed) { next(); return; }
 
   // The owner-mode connector is single-operator and already sits behind its own
@@ -158,7 +177,7 @@ export function registerVoiceRoutes(app) {
   // -------------------------------------------------------------------------
   // GET /voice/health   (Section 8.1)
   // -------------------------------------------------------------------------
-  app.get('/voice/health', async (req, res) => {
+  app.get('/voice/health', voiceCredential, async (req, res) => {
     // Health remains the one voice route that is never 404 (Section 8.1), so
     // the UI can learn in one cheap call that the feature is unavailable.
     //
@@ -195,6 +214,39 @@ export function registerVoiceRoutes(app) {
         if (problems.length) body.configuration_problems = problems;
       }
 
+      // v12.50.0. The masking above is right for an end user and actively
+      // misleading for the operator debugging it: `enabled:false` is returned
+      // whether the master switch is off or the caller simply is not
+      // allowlisted, so VOICE_ENABLED=true looks like a variable being ignored.
+      // That misdiagnosis cost real hours.
+      //
+      // So a caller presenting MCP_API_KEY -- the connector's own key, which
+      // already grants remote code execution here -- is told which of the two
+      // it was. The gateway holds the restore token, not this key, so nothing
+      // added here can reach a browser and the /ti-voice contract is unchanged.
+      if (req.voiceOperator) {
+        const identity = resolveIdentity(req);
+        body.operator_diagnostics = {
+          note: 'enabled:false above reports YOUR access, not the value of '
+            + 'VOICE_ENABLED. master_switch below is the variable.',
+          master_switch: voiceEnabled(),
+          denied_reason: !voiceEnabled() ? 'master_switch_off'
+            : (!identity.userId ? 'no_identity_header' : 'identity_not_allowlisted'),
+          identity_seen: {
+            user_id: identity.userId,
+            tenant_id: identity.tenantId,
+            source: identity.source,
+          },
+          // Counts and modes only. The entries themselves are account
+          // identifiers and never appear in a response or a log.
+          allowlist: allowlistDiagnostics(),
+          hint: 'A VOICE_TEST_USERS entry written <tenant_id>:<user_id> matches only '
+            + 'when BOTH headers are sent: X-Tenax-User-Id and X-Tenax-Tenant-Id. '
+            + 'The Gateway Service sends both from the verified JWT; a manual curl '
+            + 'must send both too.',
+        };
+      }
+
       res.json(body);
       return;
     }
@@ -205,6 +257,7 @@ export function registerVoiceRoutes(app) {
     } catch (err) {
       // Section 7: a failed engine must not take the connector down.
       engines = { sttReady: false, ttsReady: false, degraded: true, models: [],
+                  voices_installed: [],
                   stt_error: err.message, tts_error: null };
     }
 
@@ -221,6 +274,11 @@ export function registerVoiceRoutes(app) {
       stt_ready: !!engines.sttReady,
       tts_ready: !!engines.ttsReady,
       models_loaded: engines.models || [],
+      // v12.50.0. Which .onnx voices are actually on the volume, as opposed to
+      // which are licence-cleared in `catalogue` below. An empty list beside a
+      // populated catalogue is the state where TTS looks configured and cannot
+      // speak, so the two are reported side by side rather than conflated.
+      voices_installed: engines.voices_installed || [],
 
       // Everything below is additional diagnostics.
       degraded: !!engines.degraded,
@@ -250,6 +308,10 @@ export function registerVoiceRoutes(app) {
   // POST /voice/transcribe   (Section 8.2)
   // -------------------------------------------------------------------------
   app.post('/voice/transcribe',
+    // v12.50.0: the transport credential runs FIRST, ahead of the body
+    // parsers, so an unauthenticated caller cannot make the connector buffer a
+    // 25 MB audio body before being refused.
+    voiceCredential,
     gate,
     requireAuth,
     voiceLimiter,
@@ -340,6 +402,10 @@ export function registerVoiceRoutes(app) {
   // POST /voice/synthesize   (Section 8.3)
   // -------------------------------------------------------------------------
   app.post('/voice/synthesize',
+    // v12.50.0: the transport credential runs FIRST, ahead of the body
+    // parsers, so an unauthenticated caller cannot make the connector buffer a
+    // 25 MB audio body before being refused.
+    voiceCredential,
     gate,
     requireAuth,
     voiceLimiter,

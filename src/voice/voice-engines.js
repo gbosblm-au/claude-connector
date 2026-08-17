@@ -52,7 +52,7 @@
 
 import { spawn }                       from 'node:child_process';
 import { mkdtemp, rm, writeFile }      from 'node:fs/promises';
-import { existsSync }                  from 'node:fs';
+import { existsSync, readdirSync }     from 'node:fs';
 import { tmpdir }                      from 'node:os';
 import { join }                        from 'node:path';
 
@@ -107,6 +107,9 @@ const state = {
   sttError: null,
   ttsError: null,
   modelsLoaded: [],
+  // v12.50.0: .onnx voice models found on the volume. Distinct from the
+  // licence catalogue, which says what MAY be spoken, not what CAN be.
+  voicesInstalled: [],
   inFlight: 0,
   queue: [],
 };
@@ -198,24 +201,84 @@ export async function probeEngines() {
   // know the dependency is installed; no model is downloaded by --probe.
   try {
     const r = await run(PYTHON_BIN, [STT_HELPER, '--probe'], { timeout: 20_000 });
-    const parsed = r.code === 0 ? JSON.parse(r.stdout.toString('utf8') || '{}') : null;
-    state.sttReady = !!(parsed && parsed.ok);
-    state.sttError = state.sttReady ? null : (parsed && parsed.error) || r.stderr.slice(0, 400) || 'probe failed';
+
+    // v12.50.0: parse stdout WHATEVER the exit code.
+    //
+    // voice_stt.py::fail() writes {error, code} to STDOUT and exits non-zero.
+    // The previous version only parsed stdout when the exit code was 0, so on
+    // the one path where the message matters it threw the message away and
+    // reported the useless literal "probe failed" -- stderr is empty because
+    // the helper never writes there. An operator was then told the probe
+    // failed without being told why, for the exact failure the helper was
+    // written to explain.
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout.toString('utf8') || '{}'); } catch (e) { parsed = null; }
+
+    state.sttReady = !!(r.code === 0 && parsed && parsed.ok);
+    state.sttError = state.sttReady ? null : (
+      (parsed && parsed.error)
+      || r.stderr.slice(0, 400)
+      || `${PYTHON_BIN} ${STT_HELPER} --probe exited ${r.code} with no diagnostic`
+    );
     state.modelsLoaded = (parsed && Array.isArray(parsed.models_cached)) ? parsed.models_cached : [];
   } catch (err) {
     state.sttReady = false;
-    state.sttError = err.message;
+    // spawn itself failed: the interpreter is missing, or the helper path is
+    // wrong. Name both, because the message alone ("ENOENT") does not say which.
+    state.sttError = `${err.message} (VOICE_PYTHON_BIN=${PYTHON_BIN}, helper=${STT_HELPER})`;
   }
 
-  // TTS: does the Piper binary exist and answer? Run from PIPER_DIR so even the
-  // probe respects the directory boundary.
+  // TTS: is the Piper binary present, runnable, and does it have a voice model
+  // to run against? Run from PIPER_DIR so even the probe respects the directory
+  // boundary.
+  //
+  // v12.50.0: the probe was `piper --version`, which the pinned engine does not
+  // support. piper-tts 1.2.0 is an argparse CLI whose --model argument is
+  // REQUIRED, so any invocation without it exits 2 with a usage message:
+  //
+  //   piper: error: the following arguments are required: -m/--model
+  //
+  // The old probe therefore reported tts_ready:false on a perfectly healthy
+  // installation, and the connector reported itself degraded forever. --help is
+  // used instead: argparse answers it and exits 0 BEFORE required-argument
+  // validation runs, so it is a true "is this binary runnable" question.
+  state.voicesInstalled = installedVoices();
   try {
-    const r = await run(PIPER_BIN, ['--version'], { timeout: 15_000, cwd: existsSync(PIPER_DIR) ? PIPER_DIR : undefined });
-    state.ttsReady = r.code === 0;
-    state.ttsError = state.ttsReady ? null : (r.stderr.slice(0, 400) || `exit ${r.code}`);
+    const cwd = existsSync(PIPER_DIR) ? PIPER_DIR : undefined;
+
+    // An absolute path that does not exist gives a far clearer answer than
+    // waiting for ENOENT from spawn, which cannot say which variable was wrong.
+    if (PIPER_BIN.startsWith('/') && !existsSync(PIPER_BIN)) {
+      state.ttsReady = false;
+      state.ttsError = `Piper binary not found at ${PIPER_BIN}. Check VOICE_PIPER_BIN.`;
+    } else {
+      const r = await run(PIPER_BIN, ['--help'], { timeout: 15_000, cwd });
+      const output = `${r.stdout.toString('utf8')}${r.stderr}`;
+      // Exit 0 is the expected answer. A usage banner on a non-zero exit still
+      // proves the binary exists and executes, which is all this probe claims
+      // to establish, so it is accepted rather than reported as a fault.
+      const runnable = r.code === 0 || /usage:\s*piper/i.test(output);
+
+      if (!runnable) {
+        state.ttsReady = false;
+        state.ttsError = r.stderr.slice(0, 400) || `${PIPER_BIN} --help exited ${r.code}`;
+      } else if (!state.voicesInstalled.length) {
+        // Runnable but useless. Reporting ready here would mean the UI renders
+        // a speak button that 500s on first press, because synthesize() needs
+        // <VOICES_DIR>/<voice>.onnx and there is no such file. The voice
+        // CATALOGUE listing five licence-cleared voices is a statement about
+        // licensing, not about what has been downloaded onto the volume.
+        state.ttsReady = false;
+        state.ttsError = `Piper runs, but no .onnx voice model is installed in ${VOICES_DIR}. `
+          + 'Download at least one voice (with its .onnx.json config) onto the volume.';
+      } else {
+        state.ttsReady = true;
+        state.ttsError = null;
+      }
+    }
   } catch (err) {
     state.ttsReady = false;
-    state.ttsError = err.message;
+    state.ttsError = `${err.message} (VOICE_PIPER_BIN=${PIPER_BIN})`;
   }
 
   return {
@@ -223,9 +286,32 @@ export async function probeEngines() {
     ttsReady: !!state.ttsReady,
     degraded: !state.sttReady || !state.ttsReady,
     models: state.modelsLoaded.slice(),
+    voices_installed: state.voicesInstalled.slice(),
     stt_error: state.sttError,
     tts_error: state.ttsError,
   };
+}
+
+/**
+ * Voice models actually present on the volume.
+ *
+ * Filenames only, and only those ending .onnx, so this answers "what can Piper
+ * be asked to speak with right now" rather than "what is licence-cleared".
+ * Those two lists diverging is exactly the state that produced a healthy-looking
+ * catalogue beside a TTS engine that could not synthesise a single word.
+ *
+ * @returns {string[]} Voice ids (the filename without the .onnx suffix).
+ */
+export function installedVoices() {
+  try {
+    if (!VOICES_DIR || !existsSync(VOICES_DIR)) return [];
+    return readdirSync(VOICES_DIR)
+      .filter(f => f.endsWith('.onnx'))
+      .map(f => f.slice(0, -'.onnx'.length))
+      .sort();
+  } catch (err) {
+    return [];
+  }
 }
 
 /** Cached readiness without re-probing. */
@@ -233,6 +319,7 @@ export function engineState() {
   return {
     sttReady: !!state.sttReady,
     ttsReady: !!state.ttsReady,
+    voices_installed: (state.voicesInstalled || []).slice(),
     degraded: state.sttReady === null || state.ttsReady === null
       ? false
       : (!state.sttReady || !state.ttsReady),
@@ -249,7 +336,8 @@ export function engineState() {
 export function resetEngineState() {
   state.sttReady = null; state.ttsReady = null;
   state.sttError = null; state.ttsError = null;
-  state.modelsLoaded = []; state.inFlight = 0; state.queue = [];
+  state.modelsLoaded = []; state.voicesInstalled = [];
+  state.inFlight = 0; state.queue = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -430,5 +518,6 @@ export const config = Object.freeze({
 });
 
 export default {
-  probeEngines, engineState, resetEngineState, transcribe, synthesize, config,
+  probeEngines, engineState, resetEngineState, transcribe, synthesize,
+  installedVoices, config,
 };

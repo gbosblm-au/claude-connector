@@ -176,6 +176,32 @@ const SELF_AUTHENTICATED_ROUTES = [
   // NOTE: GET /export-all is deliberately NOT listed. It has no credential of
   // its own, so it correctly remains behind the MCP key.
   { exact: '/provision' },
+
+  // ── Tenax Voice (v12.50.0) ─────────────────────────────────────────────
+  //
+  // The caller in production is the Gateway Service (routes/ti-voice.js). It
+  // holds the per-tenant connector restore token, not MCP_API_KEY, so with
+  // these three paths behind the MCP gate every gateway call was answered 401
+  // before any voice code ran: /ti-voice/status reported
+  // 'connector_unreachable' and the mic button never rendered, whatever
+  // VOICE_ENABLED was set to.
+  //
+  // Exempt here, verified in src/voice/voice-auth.js, which accepts EITHER
+  // MCP_API_KEY (the operator) or RAILWAY_RESTORE_TOKEN (the gateway) with a
+  // constant-time comparison and 401s otherwise. Exactly the pattern the
+  // /restore-* and /volume-* routes above already follow.
+  //
+  // Exemption from the MCP key is not exemption from the feature gate. Both
+  // layers of voice-gate.js -- the VOICE_ENABLED master switch and the
+  // per-user VOICE_TEST_USERS allowlist -- still run on every request, and
+  // still answer 404 rather than 403 to anyone they refuse.
+  //
+  // These are `exact`, not a `/voice/` prefix. A prefix entry would exempt
+  // every future /voice/* route from authentication by default, which is the
+  // failure mode TNX-C-001 was about.
+  { exact: '/voice/health' },
+  { exact: '/voice/transcribe' },
+  { exact: '/voice/synthesize' },
 ];
 
 /** Cached digest of MCP_API_KEY. Populated by assertConfigured(). */
