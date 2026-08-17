@@ -1,0 +1,48 @@
+# src/voice/requirements-piper.txt
+#
+# Tenax Voice -- Piper (GPL-3.0). Specification Section 6.2.
+#
+# ###########################################################################
+# INSTALL THIS INTO ITS OWN PREFIX. NEVER INTO THE CONNECTOR'S site-packages.
+# ###########################################################################
+#
+# piper-tts is published by OHF-Voice/piper1-gpl under GPL-3.0-or-later, and it
+# depends on the espeak-ng phonemizer, which has always been GPL -- even during
+# the MIT era of the rhasspy wrapper. There is no version of standard Piper that
+# escapes the GPL exposure by choosing an older release.
+#
+# What DOES work is the process boundary: GPL copyleft attaches to the GPL
+# component and to work linked into it. It does not attach to a separate
+# proprietary application that invokes the GPL program as a subprocess and talks
+# to it over stdio. This is the standard "mere aggregation" boundary, and it is
+# how Home Assistant ships Piper inside a proprietary product ecosystem.
+#
+# The boundary is only real if the install is separate. Installing this
+# alongside faster-whisper would put GPL code in the same interpreter our MIT
+# helper imports from.
+#
+#   python3 -m venv /data/voice/piper/venv
+#   /data/voice/piper/venv/bin/pip install -r src/voice/requirements-piper.txt
+#   VOICE_PIPER_BIN=/data/voice/piper/venv/bin/piper
+#   VOICE_PIPER_DIR=/data/voice/piper
+#
+# Voices are downloaded from HuggingFace rhasspy/piper-voices into
+# /data/voice/piper/voices as <voice_id>.onnx plus <voice_id>.onnx.json.
+#
+# ---------------------------------------------------------------------------
+# BEFORE ANY COMMERCIAL RELEASE
+# ---------------------------------------------------------------------------
+#   1. Legal sign-off on this boundary (Open Item 1). Confirmed as required for
+#      commercial release; the internal POC proceeds on the boundary.
+#   2. Per-voice MODEL_CARD audit (compliance obligation 2). Voice licences are
+#      mixed and some are non-commercial. voice-catalog.js refuses every voice
+#      until this is done.
+#   3. Attribution for CC BY 4.0 voices in the About/settings page (obligation 3).
+#
+# DOCUMENTED FALLBACK if the boundary is rejected: piper-plus (MIT, ayutaz fork,
+# no espeak-ng, own G2P). The consequence, stated plainly because it is a locked
+# launch language: piper-plus covers JA/EN/ZH/KO/ES/FR/PT/SV and has NO
+# VIETNAMESE. Taking that path means Vietnamese TTS drops out entirely and needs
+# a dedicated Vietnamese engine (Open Item 4).
+
+piper-tts==1.2.0

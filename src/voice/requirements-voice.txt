@@ -1,0 +1,23 @@
+# src/voice/requirements-voice.txt
+#
+# Tenax Voice -- Python dependencies. Specification Sections 4, 6.3.
+#
+# ---------------------------------------------------------------------------
+# ONLY THE MIT HALF BELONGS IN THIS FILE
+# ---------------------------------------------------------------------------
+#
+# faster-whisper is MIT (engine and models) and is imported by voice_stt.py.
+#
+# piper-tts is DELIBERATELY ABSENT. It is GPL-3.0-or-later, and Section 6.2
+# locks the boundary: "never imported as a Python library into the connector's
+# import graph". Installing it here would put it in the same site-packages that
+# voice_stt.py imports from, which is the beginning of exactly the entanglement
+# the boundary exists to prevent.
+#
+# Piper is installed separately, into its own directory, and invoked as its own
+# OS process. See requirements-piper.txt.
+#
+# Install:  pip3 install --break-system-packages -r src/voice/requirements-voice.txt
+# (matching the Dockerfile's existing convention for Debian Bookworm)
+
+faster-whisper==1.1.1

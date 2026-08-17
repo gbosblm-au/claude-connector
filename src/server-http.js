@@ -127,6 +127,12 @@ import { execFileSync } from "child_process";
 import { registerExportRoute } from './routes/export.js';
 // v12.22.0: pre/post deployment volume snapshot and restore endpoints.
 import { registerVolumeSnapshotRoutes } from './routes/volume-snapshot.js';
+// Tenax Voice (SPEC Section 7). Importing the ROUTE module is always safe: it
+// pulls in the gate and the catalogue, which are plain data and pure functions.
+// No engine is imported and no child process is spawned at import time, so with
+// VOICE_ENABLED unset nothing about voice runs -- which is what Section 16
+// requires to be verifiable from the process list.
+import { registerVoiceRoutes } from './routes/voice.js';
 import express from "express";
 // v12.28.0 (TNX-C-001): express-rate-limit was a declared but unused dependency.
 import rateLimit from "express-rate-limit";
@@ -4417,6 +4423,7 @@ app.post("/ti-skill-check-scope", async (req, res) => {
 registerProvisionRoute(app);
 registerExportRoute(app);
 registerVolumeSnapshotRoutes(app);
+registerVoiceRoutes(app);
 
 app.use((_req, res) => {
   res.status(404).json({
