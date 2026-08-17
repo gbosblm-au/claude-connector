@@ -361,20 +361,34 @@ test('multipart reads one file and its fields, and refuses the rest', () => {
 // ===========================================================================
 // Compliance obligation 2: the per-voice licence audit.
 // ===========================================================================
-test('every voice is refused until its MODEL_CARD has been audited', () => {
-  // No MODEL_CARD has been read -- this code was written without network
-  // access to HuggingFace, and the specification records default voice NAMES,
-  // not their licences. So the honest state is that nothing may ship.
+test('a voice is refused until its MODEL_CARD has been audited', () => {
+  // UPDATED v12.50.0. This test previously asserted that NOTHING was usable,
+  // which was the honest state when no MODEL_CARD had been read. Two have now
+  // been read, so the assertion moves from "nothing ships" to the invariant it
+  // was always really protecting: nothing ships that has not been checked, and
+  // being checked is not the same as being allowed.
   const state = catalogState();
   assert.equal(state.audit_required, true, 'the audit is required by default');
-  assert.equal(state.usable, 0, 'no voice is usable until audited');
-  assert.equal(state.unaudited.length, VOICE_CATALOG.length);
 
-  for (const v of VOICE_CATALOG) {
+  const audited   = VOICE_CATALOG.filter(v => v.audited);
+  const unaudited = VOICE_CATALOG.filter(v => !v.audited);
+  assert.ok(audited.length > 0, 'the audit has actually been carried out on something');
+  assert.ok(unaudited.length > 0, 'and unread MODEL_CARDs are still recorded as unread');
+  assert.equal(state.unaudited.length, unaudited.length);
+
+  for (const v of unaudited) {
     const p = voicePermitted(v.voice_id);
-    assert.equal(p.ok, false, `${v.voice_id} is refused`);
+    assert.equal(p.ok, false, `${v.voice_id} is unaudited and must be refused`);
     assert.equal(p.reason, 'voice_unaudited');
     assert.ok(/MODEL_CARD/.test(p.message), 'and the refusal explains why');
+  }
+
+  for (const v of audited) {
+    const p = voicePermitted(v.voice_id);
+    // An audited voice is permitted only if the audit came back clean. This is
+    // the distinction the table exists to express.
+    assert.equal(p.ok, v.commercial_ok === true, `${v.voice_id} follows its audit result`);
+    if (!p.ok) assert.equal(p.reason, 'voice_non_commercial');
   }
 
   assert.equal(voicePermitted('made-up-voice').reason, 'unknown_voice');
@@ -382,10 +396,13 @@ test('every voice is refused until its MODEL_CARD has been audited', () => {
 
   // An allowlist, not a blocklist: a voice added to rhasspy/piper-voices
   // tomorrow is refused by default rather than used by default.
-  assert.equal(voicesForLanguage('en').length, 0);
+  assert.equal(state.usable, VOICE_CATALOG.filter(v => voicePermitted(v.voice_id).ok).length);
+  assert.deepEqual(voicesForLanguage('en').map(v => v.voice_id), ['en_US-kristin-medium'],
+    'English resolves to the audited, public-domain voice and to nothing else');
 
-  // Attribution can only list what has been audited. Inventing credits would be
-  // worse than a short page.
+  // Attribution lists only voices whose MODEL_CARD actually asks for it. Both
+  // audited entries are public domain or refused, so the page stays empty --
+  // which is correct, not incomplete.
   assert.deepEqual(attributions(), []);
 });
 
@@ -406,13 +423,18 @@ test('an explicitly non-commercial voice is refused even with the audit off', ()
   const prior = process.env.VOICE_AUDIT_REQUIRED;
   try {
     process.env.VOICE_AUDIT_REQUIRED = 'false';
-    // With the audit relaxed, unaudited voices become usable...
-    assert.equal(voicePermitted('en_US-lessac-medium').ok, true);
-    // ...but a known-bad answer is different from a missing one, and stays
-    // refused. This is asserted through the module's own data shape.
-    const nc = { ...VOICE_CATALOG[0], commercial_ok: false };
-    assert.equal(nc.commercial_ok, false,
-      'the catalogue can express a non-commercial verdict distinctly from an absent one');
+
+    // With the audit relaxed, an UNAUDITED voice becomes usable. That is what
+    // the switch is for: it says "I accept the risk on licences nobody has read".
+    assert.equal(voicePermitted('zh_CN-huayan-medium').ok, true);
+
+    // It does NOT say "I accept a licence somebody has read and rejected".
+    // en_US-lessac-medium is the real case (v12.50.0): the CSTR Blizzard 2013
+    // Lessac corpus is released for non-commercial use only. A known-bad answer
+    // is different from a missing one and stays refused either way.
+    const verdict = voicePermitted('en_US-lessac-medium');
+    assert.equal(verdict.ok, false);
+    assert.equal(verdict.reason, 'voice_non_commercial');
   } finally {
     if (prior === undefined) delete process.env.VOICE_AUDIT_REQUIRED;
     else process.env.VOICE_AUDIT_REQUIRED = prior;
@@ -479,14 +501,21 @@ test('AC: an unsupported language or voice is a clear 422, never a 500', async (
     assert.equal(voice.status, 422);
     assert.equal((await voice.json()).error, 'unknown_voice');
 
-    // The audit gate reaching the caller, honestly, as a 422.
-    const unaudited = await post({ text: 'hello', language: 'en' });
+    // The audit gate reaching the caller, honestly, as a 422. Chinese, not
+    // English: from v12.50.0 English resolves to an audited voice and would go
+    // on to the engine, so it no longer demonstrates the audit refusing anyone.
+    const unaudited = await post({ text: 'hello', language: 'zh' });
     assert.equal(unaudited.status, 422);
     assert.equal((await unaudited.json()).error, 'no_voice_available');
 
+    // A licence verdict is also a 422 with a renderable message, not a 500.
+    const nonCommercial = await post({ text: 'hello', voice: 'en_US-lessac-medium' });
+    assert.equal(nonCommercial.status, 422);
+    assert.equal((await nonCommercial.json()).error, 'voice_non_commercial');
+
     assert.equal((await post({ text: '' })).status, 422);
-    assert.equal((await post({ text: 'hi', voice: 'en_US-lessac-medium', format: 'mp3' })).status, 422);
-    assert.equal((await post({ text: 'hi', voice: 'en_US-lessac-medium', speed: 9 })).status, 422);
+    assert.equal((await post({ text: 'hi', voice: 'en_US-kristin-medium', format: 'mp3' })).status, 422);
+    assert.equal((await post({ text: 'hi', voice: 'en_US-kristin-medium', speed: 9 })).status, 422);
   } finally {
     await close();
     if (prior.e === undefined) delete process.env.VOICE_ENABLED; else process.env.VOICE_ENABLED = prior.e;
@@ -536,7 +565,9 @@ test('AC: health reports that the benchmark gate has not been passed', async () 
     // Section 14's gate is hard. An operator must be able to see that voice is
     // answering on provisional defaults rather than measured ones.
     assert.equal(body.benchmark_completed, false);
-    assert.equal(body.catalogue.usable, 0, 'and that no voice has cleared its audit');
+    assert.equal(body.catalogue.usable, 1,
+      'exactly one voice has cleared its audit: the public-domain English default');
+    assert.deepEqual(body.catalogue.usable_by_language.en, ['en_US-kristin-medium']);
     assert.deepEqual(body.tts_languages.sort(), ['en', 'ja', 'vi', 'zh']);
     assert.equal(body.stt_languages, 'auto', 'STT coverage is reported separately');
   } finally {
@@ -598,13 +629,27 @@ test('the schema stores preferences and metadata, and cannot store content', () 
     assert.equal(db.prepare('SELECT COUNT(*) c FROM voice_usage_log').get().c, 1,
       'an unknown direction is dropped, not stored');
 
-    // The catalogue table mirrors the code, and records "not yet audited" as
-    // NULL rather than 0 -- 0 would read as an audited non-commercial verdict.
-    const row = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?')
-      .get('en_US-lessac-medium');
-    assert.equal(row.audited, 0);
-    assert.equal(row.commercial_ok, null,
+    // The catalogue table mirrors the code, and the three states must stay
+    // distinguishable in SQL as well as in JS. This is the whole reason
+    // commercial_ok is nullable.
+    const unread = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?')
+      .get('zh_CN-huayan-medium');
+    assert.equal(unread.audited, 0);
+    assert.equal(unread.commercial_ok, null,
       'unverified is NULL, which is not the same claim as "audited and refused"');
+
+    const refused = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?')
+      .get('en_US-lessac-medium');
+    assert.equal(refused.audited, 1, 'read in v12.50.0');
+    assert.equal(refused.commercial_ok, 0,
+      'audited and refused: 0, distinct from the NULL above');
+    assert.match(refused.licence, /non-commercial/i);
+
+    const cleared = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?')
+      .get('en_US-kristin-medium');
+    assert.equal(cleared.audited, 1);
+    assert.equal(cleared.commercial_ok, 1);
+    assert.ok(cleared.model_card, 'an audit result records where it came from');
   } finally {
     db.close();
   }
@@ -806,8 +851,21 @@ test('AC: the allowlisted operator reaches the routes', async () => {
         body: JSON.stringify({ text: 'hello', language: 'en' }),
       });
       assert.notEqual(s.status, 404, 'the operator is not gated out');
-      assert.equal(s.status, 422, 'and is refused only by the MODEL_CARD audit');
-      assert.equal((await s.json()).error, 'no_voice_available');
+      // From v12.50.0 English clears the catalogue, so this now reaches the
+      // ENGINE and fails there (no Piper in the test image). The distinction
+      // the test protects is unchanged: whatever refuses the operator, it must
+      // not be the per-user gate.
+      assert.ok([422, 500].includes(s.status), `expected an engine or catalogue answer, got ${s.status}`);
+
+      // An unaudited language still stops at the catalogue, which proves the
+      // request got that far rather than being turned away at the gate.
+      const zh = await fetch(`${base}/voice/synthesize`, {
+        method: 'POST',
+        headers: asUser('op-1', null, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ text: 'hello', language: 'zh' }),
+      });
+      assert.equal(zh.status, 422);
+      assert.equal((await zh.json()).error, 'no_voice_available');
 
       const t = await fetch(`${base}/voice/transcribe`, {
         method: 'POST',

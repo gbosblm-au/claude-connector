@@ -274,3 +274,60 @@ downloaded and verified end to end (60 MB, config parsed, picked up by
 | `internal-config-custom-env.test.js` | 31 / 31 pass |
 | `edit-tools.test.js` | 50 / 50 pass |
 | live download of `en_US-lessac-medium` | 60 MB, verified, idempotent on re-run |
+
+---
+
+# Addendum 2 -- English default changed, and why it had to be
+
+## 8. The shipped English default was licensed for non-commercial use only
+
+`en_US-lessac-medium` was the English default. Its MODEL_CARD gives the dataset
+as the CSTR Blizzard 2013 Lessac corpus, whose project page states directly:
+
+> This data is released under a license for non-commercial use only.
+
+(Speaker: Catherine Byers. The MODEL_CARD itself records neither the restriction
+nor the speaker; both come from the linked source, which is why the audit has to
+follow the link rather than stop at the card.)
+
+TrueSource is a commercial consultancy. That voice was one `provision` command
+away from speaking in a client-facing product, and nothing about the name
+"lessac" hints at the problem. This is precisely the failure `voice-catalog.js`
+was written to catch, and it caught it only because the audit was actually done.
+
+**English now defaults to `en_US-kristin-medium`:** trained on public-domain
+LibriVox recordings, `commercial_ok: true`, `attribution_required: false`,
+`audited: true`, with the MODEL_CARD URL recorded on the entry.
+
+**`en_US-lessac-medium` is retained but refused.** It is not deleted, because
+deletion produces `unknown_voice` for anyone with the id configured, which reads
+like a typo. `voicePermitted()` returns `voice_non_commercial` with a message
+that says why, and it does so **even when `VOICE_AUDIT_REQUIRED=false`** -- that
+switch relaxes licences nobody has read, never one that has been read and
+rejected.
+
+You can now set `VOICE_AUDIT_REQUIRED=true` (your connector currently has
+`false`) and English still works. That is the correct setting: the remaining
+four voices have unread MODEL_CARDs and are refused until someone reads them.
+
+## Stale tests updated rather than deleted
+
+Six assertions in `voice.test.js` encoded the old premise that *nothing* had
+been audited, so a real audit broke them. They were rewritten to assert the
+invariant they were always protecting -- unchecked voices are refused, and being
+checked is not the same as being allowed -- rather than the frozen fact that the
+count was zero. The mirrored SQL table test now checks all three states stay
+distinguishable: `NULL` for unread, `0` for audited-and-refused, `1` for
+audited-and-cleared.
+
+## Verification
+
+| Suite | Result |
+|---|---|
+| `voice.test.js` | 47 / 47 pass |
+| `voice-auth.test.js` | 25 / 25 pass |
+| `phase0-security.test.js` | 61 / 61 pass |
+| `internal-config-custom-env.test.js` | 31 / 31 pass |
+| `edit-tools.test.js` | 50 / 50 pass |
+| `signed-urls.test.js` | 28 / 28 pass |
+| live download of `en_US-kristin-medium` | 61 MB, config parsed, verified |

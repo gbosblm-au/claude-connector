@@ -475,3 +475,55 @@ test('provisioning is opt-in and never fires unrequested', async () => {
     assert.equal(provisionFromEnv(() => {}), null, 'an empty list must do nothing');
   });
 });
+
+// ===========================================================================
+// English default and the licence audit (v12.50.0)
+// ===========================================================================
+
+test('the English default is the audited, public-domain voice', async () => {
+  const { voicesForLanguage, findVoice } = await import('../voice/voice-catalog.js');
+  await withEnv({ VOICE_AUDIT_REQUIRED: 'true' }, () => {
+    const usable = voicesForLanguage('en');
+    assert.equal(usable[0].voice_id, 'en_US-kristin-medium',
+      'a caller taking the first entry must get the audited default');
+    const kristin = findVoice('en_US-kristin-medium');
+    assert.equal(kristin.audited, true);
+    assert.equal(kristin.commercial_ok, true);
+    assert.equal(kristin.attribution_required, false);
+    assert.match(kristin.model_card, /MODEL_CARD/,
+      'an audited entry must record where the finding came from');
+  });
+});
+
+test('the non-commercial voice is refused whatever the audit setting says', async () => {
+  const { voicePermitted } = await import('../voice/voice-catalog.js');
+  // The CSTR Blizzard 2013 Lessac data is released for non-commercial use only.
+  // VOICE_AUDIT_REQUIRED=false relaxes UNKNOWN licences; it must never relax a
+  // known-bad one, or the escape hatch for "not checked yet" becomes an escape
+  // hatch for "checked, and not allowed".
+  for (const setting of ['true', 'false', undefined]) {
+    await withEnv({ VOICE_AUDIT_REQUIRED: setting }, () => {
+      const verdict = voicePermitted('en_US-lessac-medium');
+      assert.equal(verdict.ok, false, `must stay refused with VOICE_AUDIT_REQUIRED=${setting}`);
+      assert.equal(verdict.reason, 'voice_non_commercial');
+    });
+  }
+});
+
+test('a disqualified voice is refused, not deleted', async () => {
+  const { findVoice, voicePermitted } = await import('../voice/voice-catalog.js');
+  // Removing the entry would make voicePermitted answer "unknown_voice", which
+  // reads like a typo to whoever has the id configured. It must say why instead.
+  assert.notEqual(findVoice('en_US-lessac-medium'), null);
+  assert.match(voicePermitted('en_US-lessac-medium').message, /non-commercial/i);
+});
+
+test('every audited entry records a licence and a model card', async () => {
+  const { VOICE_CATALOG } = await import('../voice/voice-catalog.js');
+  for (const v of VOICE_CATALOG.filter(v => v.audited)) {
+    assert.ok(v.licence, `${v.voice_id} claims to be audited but records no licence`);
+    assert.ok(v.model_card, `${v.voice_id} claims to be audited but records no model card`);
+    assert.notEqual(v.commercial_ok, null,
+      `${v.voice_id} claims to be audited but leaves commercial_ok unanswered`);
+  }
+});

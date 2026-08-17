@@ -68,6 +68,10 @@ export function voicesDir() {
  * below, where they disagree in a way that cannot be derived.
  */
 export const VOICE_SOURCES = Object.freeze({
+  // The English default from v12.50.0: public-domain LibriVox source.
+  'en_US-kristin-medium':      'en/en_US/kristin/medium',
+  // Retained so an existing deployment can still fetch it, though
+  // voice-catalog.js refuses to synthesise with it: non-commercial licence.
   'en_US-lessac-medium':       'en/en_US/lessac/medium',
   'zh_CN-huayan-medium':       'zh/zh_CN/huayan/medium',
   'vi_VN-vais1000-medium':     'vi/vi_VN/vais1000/medium',

@@ -31,11 +31,22 @@
 //   audited: false  -- the licence below is TRANSCRIBED FROM THE SPECIFICATION,
 //                      which is a planning document, not the MODEL_CARD itself.
 //
-// Everything here is currently `audited: false`. That is not an oversight, it
-// is the honest state: this code was written without network access to
-// HuggingFace, so no MODEL_CARD has actually been read. The specification names
-// four default voices; it does not record their individual licences, and I will
-// not invent them.
+// v12.50.0 UPDATE. Two entries are now `audited: true`, and the audit was a real
+// one: the MODEL_CARD was fetched from rhasspy/piper-voices and, where it linked
+// out, the linked licence page was read as well. The remaining three are still
+// `audited: false` -- unread is unread, and marking them otherwise would put a
+// fabricated compliance record in the one place a lawyer would later look.
+//
+// The audit changed a default. `en_US-lessac-medium` shipped as the English
+// default; its MODEL_CARD points at the CSTR Blizzard 2013 Lessac dataset page,
+// which states the data is "released under a license for non-commercial use
+// only". It is therefore marked commercial_ok:false and REFUSED, which is what
+// this table exists to do. English now defaults to `en_US-kristin-medium`,
+// trained on public-domain LibriVox recordings.
+//
+// This is exactly the failure mode described above: nothing about the name
+// "lessac" reveals its licence, and it was one download away from speaking in a
+// commercial product.
 //
 // `AUDIT_REQUIRED` below is therefore ON by default, and while it is on, an
 // unaudited voice is refused even if this table claims it is commercial-OK.
@@ -54,15 +65,47 @@
  */
 export const VOICE_CATALOG = Object.freeze([
   {
-    voice_id: 'en_US-lessac-medium',
+    // AUDITED v12.50.0. MODEL_CARD read directly:
+    //   Dataset: https://librivox.org
+    //   License: public domain
+    //   "US English female voice. Single Speaker. ... about 11.5 hours of
+    //    recordings. All recordings came from LibriVox.org."
+    //
+    // Public domain source material, so there is no commercial restriction and
+    // no attribution obligation. That is what makes it a safe default for a
+    // commercial deployment, which the voice it replaces was not.
+    voice_id: 'en_US-kristin-medium',
     language: 'en',
     quality_tier: 'mature',       // Section 13: English and Japanese are mature
     role: 'default',
-    licence: null,
-    commercial_ok: null,
-    attribution_required: null,
-    audited: false,
-    model_card: null,
+    licence: 'Public domain (LibriVox source recordings)',
+    commercial_ok: true,
+    attribution_required: false,
+    audited: true,
+    model_card: 'https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/kristin/medium/MODEL_CARD',
+    active: true,
+  },
+  {
+    // AUDITED v12.50.0, and the audit disqualified it.
+    //
+    // MODEL_CARD gives the dataset as the CSTR Blizzard 2013 Lessac corpus. That
+    // project page states plainly: "This data is released under a license for
+    // non-commercial use only." Speaker: Catherine Byers.
+    //
+    // Left in the table rather than deleted, and left `active: true`. Removal
+    // would produce "unknown_voice" for anyone who has the id configured, which
+    // reads like a typo. voicePermitted() instead returns voice_non_commercial
+    // with a message that says why, and says it whatever VOICE_AUDIT_REQUIRED is
+    // set to -- a known-bad licence is not a missing one.
+    voice_id: 'en_US-lessac-medium',
+    language: 'en',
+    quality_tier: 'mature',
+    role: 'alternate',
+    licence: 'Non-commercial use only (CSTR Blizzard 2013 Lessac corpus)',
+    commercial_ok: false,
+    attribution_required: false,
+    audited: true,
+    model_card: 'https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/lessac/medium/MODEL_CARD',
     active: true,
   },
   {
