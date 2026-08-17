@@ -34,7 +34,8 @@ import { initVoiceSchema, setVoiceSettings, getVoiceSettings, logVoiceUsage }
                       from '../voice/voice-schema.js';
 import { voiceAvailableForAsync } from '../voice/voice-gate.js';
 import { allowlistSource, parseAllowlist, currentAllowlist,
-         ensureAllowlistFresh, allowlistState, resetAllowlistCache }
+         ensureAllowlistFresh, allowlistState, resetAllowlistCache,
+         allowlistConfigProblems }
                       from '../voice/voice-allowlist.js';
 import { registerVoiceRoutes } from '../routes/voice.js';
 
@@ -1139,4 +1140,130 @@ test('the allowlist entries never reach the logs or /voice/health', () => {
     'the cached entries are never logged');
   assert.ok(!/entries:\s*cache\.entries/.test(code.slice(code.indexOf('allowlistState'))),
     'and are not returned by the diagnostics');
+});
+
+// ===========================================================================
+// v12.49.0 -- configuration faults must not be silent
+// ===========================================================================
+
+test('gateway mode without a URL denies everyone, and says so', () => {
+  // THE REPORTED FAILURE. VOICE_ENABLED=true, VOICE_ALLOWLIST_SOURCE=gateway,
+  // VOICE_TEST_USERS=ava:38, no VOICE_ALLOWLIST_URL. Every user denied, no mic
+  // button, no error -- indistinguishable from voice being switched off, with
+  // VOICE_TEST_USERS sitting in the variable list looking operative.
+  withEnv({
+    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
+    VOICE_TEST_USERS: 'ava:38',
+    VOICE_ALLOWLIST_URL: undefined, VOICE_ALLOWLIST_KEY: undefined,
+    GATEWAY_ADMIN_KEY: undefined,
+  }, () => {
+    resetAllowlistCache();
+    assert.deepEqual(currentAllowlist(), [], 'nobody is allowed');
+
+    const problems = allowlistConfigProblems();
+    assert.ok(problems.length >= 2, 'the faults are detected');
+    assert.ok(problems.some(p => /VOICE_ALLOWLIST_URL is not set/.test(p)),
+      'the missing URL is named');
+    assert.ok(problems.some(p => /GATEWAY_ADMIN_KEY/.test(p)),
+      'as is the missing key');
+
+    // The most confusing part of the report: a variable that is set and ignored.
+    assert.ok(problems.some(p => /VOICE_TEST_USERS is set but IGNORED/.test(p)),
+      'and the fact that VOICE_TEST_USERS is ignored in this mode is stated');
+
+    // Each message must name what to change, not merely what is wrong.
+    for (const p of problems) {
+      assert.ok(/VOICE_[A-Z_]+|GATEWAY_ADMIN_KEY/.test(p),
+        'every message names a variable: ' + p.slice(0, 50));
+    }
+  });
+  resetAllowlistCache();
+});
+
+test('an empty env allowlist is reported too', () => {
+  withEnv({
+    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'env', VOICE_TEST_USERS: undefined,
+  }, () => {
+    const problems = allowlistConfigProblems();
+    assert.ok(problems.some(p => /VOICE_TEST_USERS is empty/.test(p)));
+    // Points at the tool that generates the correct value, rather than leaving
+    // the operator to work out the entry format.
+    assert.ok(problems.some(p => /Voice Access admin screen/.test(p)),
+      'and names where the correct value comes from');
+  });
+});
+
+test('a coherent configuration reports no faults', () => {
+  withEnv({
+    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'env', VOICE_TEST_USERS: 'ts_aaa:38',
+  }, () => {
+    assert.deepEqual(allowlistConfigProblems(), [], 'env mode with entries is clean');
+  });
+  withEnv({
+    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
+    VOICE_ALLOWLIST_URL: 'https://gw.test', VOICE_ALLOWLIST_KEY: 'k',
+    VOICE_TEST_USERS: undefined,
+  }, () => {
+    assert.deepEqual(allowlistConfigProblems(), [], 'gateway mode with url and key is clean');
+  });
+});
+
+test('health reports the faults to a denied caller, but only when enabled', async () => {
+  // The operator who needs this message is the person being denied. Withholding
+  // it means the only way to see a misconfiguration is to already be past it.
+  await withEnv({
+    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
+    VOICE_TEST_USERS: 'ava:38', VOICE_ALLOWLIST_URL: undefined,
+  }, async () => {
+    resetAllowlistCache();
+    const { base, close } = await listen(makeApp());
+    try {
+      const body = await (await fetch(`${base}/voice/health`, { headers: asUser('ava:38') })).json();
+      assert.equal(body.enabled, false, 'this caller cannot use voice');
+      assert.ok(Array.isArray(body.configuration_problems),
+        'and health tells them why the deployment is broken');
+      assert.ok(body.configuration_problems.some(p => /VOICE_ALLOWLIST_URL/.test(p)));
+    } finally { await close(); }
+  });
+  resetAllowlistCache();
+
+  // Master switch off: say nothing. The routes must stay indistinguishable from
+  // routes that do not exist.
+  await withEnv({
+    VOICE_ENABLED: undefined, VOICE_ALLOWLIST_SOURCE: 'gateway',
+    VOICE_ALLOWLIST_URL: undefined,
+  }, async () => {
+    const { base, close } = await listen(makeApp());
+    try {
+      const body = await (await fetch(`${base}/voice/health`)).json();
+      assert.equal(body.configuration_problems, undefined,
+        'a disabled deployment leaks no configuration detail');
+    } finally { await close(); }
+  });
+});
+
+test('the engines are installed in the image, in separate environments', () => {
+  // v12.46.0 shipped requirements files and documented the pip commands but
+  // never touched the Dockerfile, so neither engine was present and nothing
+  // could transcribe however the gates were set.
+  const df = readFileSync(join(HERE, '..', '..', 'Dockerfile'), 'utf8');
+
+  assert.ok(/faster-whisper==/.test(df), 'faster-whisper is installed');
+  assert.ok(/piper-tts==/.test(df), 'piper-tts is installed');
+
+  // The licence boundary, in the build. Piper into its own venv; faster-whisper
+  // into system packages. Installing them together would put GPL code in the
+  // interpreter our MIT helper imports from.
+  assert.ok(/python3 -m venv \/opt\/piper/.test(df), 'Piper gets its own venv');
+  const piperLine = df.slice(df.indexOf('/opt/piper/bin/pip install'), df.indexOf('/opt/piper/bin/pip install') + 200);
+  assert.ok(!/faster-whisper/.test(piperLine),
+    'and faster-whisper is NOT installed into it');
+
+  const whisperLine = df.slice(df.indexOf('faster-whisper=='), df.indexOf('faster-whisper==') + 120);
+  assert.ok(!/piper/.test(whisperLine), 'nor Piper into system packages');
+
+  assert.ok(/VOICE_PIPER_BIN=\/opt\/piper\/bin\/piper/.test(df),
+    'and the binary path is defaulted to match the venv');
+  // A browser sends WebM or MP4; the decoder needs the system codecs.
+  assert.ok(/ffmpeg/.test(df), 'ffmpeg is present for browser audio containers');
 });

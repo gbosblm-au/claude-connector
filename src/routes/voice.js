@@ -44,6 +44,7 @@ import { voiceEnabled, gateState, benchmarkState,
          voiceAvailableFor, voiceAvailableForAsync,
          allowlistDiagnostics, currentAllowlistSource,
          testUsers } from '../voice/voice-gate.js';
+import { allowlistConfigProblems } from '../voice/voice-allowlist.js';
 import { parseMultipart }         from '../voice/multipart.js';
 import { validateAudio, maxBytes,
          ACCEPTED_FORMATS }       from '../voice/audio-validate.js';
@@ -171,11 +172,30 @@ export function registerVoiceRoutes(app) {
     // No engine is probed on this path either, so a non-allowlisted caller
     // cannot use health to trigger a model load.
     if (!(await voiceAvailableForAsync(req).catch(() => false))) {
-      res.json({
+      const body = {
         enabled: false,
         voice_enabled_for_this_user: false,
         stt_ready: false, tts_ready: false, models_loaded: [],
-      });
+      };
+
+      // Configuration faults are reported even to a denied caller, but ONLY when
+      // the master switch is on. Rationale for each half:
+      //
+      //   Master off  -> say nothing. Voice is deliberately absent and the
+      //                  routes must be indistinguishable from routes that do
+      //                  not exist.
+      //   Master on   -> the operator who needs this message is, by definition,
+      //                  the person being denied. Withholding it means the only
+      //                  way to see a misconfiguration is to already be past it,
+      //                  which is the state they cannot reach.
+      //
+      // The messages name variables and modes, never identities.
+      if (voiceEnabled()) {
+        const problems = allowlistConfigProblems();
+        if (problems.length) body.configuration_problems = problems;
+      }
+
+      res.json(body);
       return;
     }
 
@@ -448,9 +468,16 @@ export function registerVoiceRoutes(app) {
   const allowlisted = testUsers().length;
   console.log(`[voice] routes registered (master=${voiceEnabled()}, `
     + `source=${currentAllowlistSource()}, allowlisted_users=${allowlisted})`);
-  if (voiceEnabled() && allowlisted === 0) {
-    console.log('[voice] VOICE_ENABLED is true but VOICE_TEST_USERS is empty, so voice is '
-      + 'unreachable for everyone. Add an identity to VOICE_TEST_USERS to open the keyhole.');
+  // Said at boot, once, at error level. A correct-but-silent refusal is
+  // indistinguishable from a working "off", and the deployment that hit this had
+  // no way to tell the two apart from the outside.
+  if (voiceEnabled()) {
+    const problems = allowlistConfigProblems();
+    problems.forEach((p) => console.error('[voice] CONFIGURATION: ' + p));
+    if (problems.length) {
+      console.error('[voice] Voice is enabled but NO USER CAN REACH IT until the above is fixed. '
+        + 'GET /voice/health reports the same under configuration_problems.');
+    }
   }
 }
 

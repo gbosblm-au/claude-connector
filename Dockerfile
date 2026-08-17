@@ -115,6 +115,56 @@ RUN pip3 install --break-system-packages --retries 5 --timeout 120 \
       python-docx openpyxl Pillow jinja2 cairosvg fpdf2 python-pptx weasyprint reportlab PyMuPDF \
     && rm -rf /root/.cache/pip
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/fitz
+
+# ---------------------------------------------------------------------------
+# TENAX VOICE (v12.49.0)
+#
+# Installed as TWO SEPARATE PYTHON ENVIRONMENTS, and the separation is the
+# licence boundary, not tidiness.
+#
+#   faster-whisper  MIT.            System site-packages, imported by
+#                                   src/voice/voice_stt.py.
+#   piper-tts       GPL-3.0.        Its OWN venv at /opt/piper, never on the
+#                                   import path of anything of ours.
+#
+# SPEC Section 6.2 locks this: Piper runs "as a separate OS process invoked by
+# the connector, never imported as a Python library into the connector's import
+# graph". Installing it alongside faster-whisper would put GPL code in the
+# interpreter our MIT helper imports from, which is where the entanglement the
+# boundary exists to prevent begins.
+#
+# --no-install-recommends on ffmpeg: faster-whisper decodes through PyAV, but
+# several container formats a browser can produce (WebM from Chrome, MP4 from
+# Safari) need the system codecs present.
+#
+# Build cost is real: faster-whisper pulls in CTranslate2 and onnxruntime, which
+# together are a few hundred MB. That is the price of running speech locally and
+# is why the whole feature is behind VOICE_ENABLED.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg espeak-ng \
+    && rm -rf /var/lib/apt/lists/*
+
+# MIT half. System packages, same convention as the document pipeline above.
+RUN pip3 install --break-system-packages --retries 5 --timeout 180 \
+      faster-whisper==1.1.1 \
+    && rm -rf /root/.cache/pip
+
+# GPL half. Own venv, own prefix, own directory. Nothing of ours imports from it.
+RUN python3 -m venv /opt/piper \
+    && /opt/piper/bin/pip install --retries 5 --timeout 180 piper-tts==1.2.0 \
+    && rm -rf /root/.cache/pip
+
+# Model and voice caches live on the mounted volume so they survive a restart,
+# per SPEC Section 11 ("pre-downloaded at deploy"). Created here so the paths
+# exist even before the first download.
+RUN mkdir -p /data/voice/models /data/voice/piper/voices
+
+# Defaults that match the layout above, so a deployment only has to set
+# VOICE_ENABLED and the allowlist.
+ENV VOICE_PIPER_BIN=/opt/piper/bin/piper \
+    VOICE_PIPER_DIR=/data/voice/piper \
+    VOICE_VOICES_DIR=/data/voice/piper/voices \
+    VOICE_MODEL_DIR=/data/voice/models
 # TNX-M-017: stop Python writing .pyc files into the image and the volume. A
 # committed brain_scan.cpython-312.pyc was found in the archive while this image
 # installs Python 3.11, so the bytecode could never have been loaded anyway.
