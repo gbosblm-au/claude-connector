@@ -46,6 +46,9 @@ import { registerVoiceRoutes }                   from '../routes/voice.js';
 import { classifyVoiceCredential, constantTimeEquals,
          extractBearer, extractRestoreToken }    from '../voice/voice-auth.js';
 import { installedVoices }                       from '../voice/voice-engines.js';
+import { VOICE_SOURCES, MISSING_UPSTREAM,
+         installVoice, voicesDir }              from '../voice/voice-provision.js';
+import { VOICE_CATALOG }                        from '../voice/voice-catalog.js';
 
 const MCP_KEY      = 'k'.repeat(48);
 const RESTORE_TOKEN = 'r'.repeat(40);
@@ -413,5 +416,62 @@ test('installed voices are read from the volume, not from the licence catalogue'
     // .onnx has been downloaded. Conflating the two is what let TTS report
     // itself ready and then fail on the first press of the speak button.
     assert.deepEqual(installedVoices(), []);
+  });
+});
+
+// ===========================================================================
+// Voice model provisioning (v12.50.0)
+// ===========================================================================
+
+test('every catalogue voice either has a download source or is named as missing', () => {
+  // The failure this catches: a voice offered by the API that nothing can ever
+  // download, discovered by a user pressing a speak button. Each catalogue
+  // entry must resolve to a repository path, or be explicitly recorded as
+  // unavailable with a reason.
+  for (const entry of VOICE_CATALOG) {
+    const known = Object.prototype.hasOwnProperty.call(VOICE_SOURCES, entry.voice_id)
+      || Object.prototype.hasOwnProperty.call(MISSING_UPSTREAM, entry.voice_id);
+    assert.equal(known, true,
+      `${entry.voice_id} is offered by the catalogue but has no recorded source`);
+  }
+});
+
+test('a catalogue voice that does not exist upstream is reported, not substituted', async () => {
+  // ja_JP-ryoko-medium is the Japanese default in VOICE_CATALOG and is not
+  // published by rhasspy/piper-voices. VOICE_CATALOG is a LICENCE record, so
+  // silently pointing that id at a different voice would put an unreviewed
+  // model behind a reviewed name. The provisioner must refuse and explain.
+  const result = await installVoice('ja_JP-ryoko-medium');
+  assert.equal(result.status, 'unavailable');
+  assert.match(result.error, /ja_JA-hi_fi_captain-medium/);
+  assert.equal(Object.prototype.hasOwnProperty.call(VOICE_SOURCES, 'ja_JP-ryoko-medium'), false,
+    'the missing id must not be aliased to another voice');
+});
+
+test('an unknown voice id is refused without touching the network', async () => {
+  const result = await installVoice('../../etc/passwd');
+  assert.equal(result.status, 'unknown');
+  // The id is looked up in a fixed table, so a path-shaped id resolves to
+  // nothing rather than to a path.
+  assert.match(result.error, /No source is recorded/);
+});
+
+test('the voices directory follows the same variables as the engine', async () => {
+  await withEnv({ VOICE_VOICES_DIR: '/tmp/tenax-voice-test-dir' }, () => {
+    assert.equal(voicesDir(), '/tmp/tenax-voice-test-dir');
+  });
+  await withEnv({ VOICE_VOICES_DIR: undefined, VOICE_PIPER_DIR: '/data/voice/piper' }, () => {
+    // Must match voice-engines.js, or the provisioner writes where nothing reads.
+    assert.equal(voicesDir(), '/data/voice/piper/voices');
+  });
+});
+
+test('provisioning is opt-in and never fires unrequested', async () => {
+  const { provisionFromEnv } = await import('../voice/voice-provision.js');
+  await withEnv({ VOICE_PROVISION_VOICES: undefined }, () => {
+    assert.equal(provisionFromEnv(() => {}), null, 'unset must do nothing at all');
+  });
+  await withEnv({ VOICE_PROVISION_VOICES: '  ,  ,' }, () => {
+    assert.equal(provisionFromEnv(() => {}), null, 'an empty list must do nothing');
   });
 });

@@ -176,3 +176,101 @@ reported `"probe failed"` will now report the actual cause, e.g.
    `errors.stt` and `errors.tts` will now name real causes, and
    `voices_installed` will show whether any voice model is actually on the
    volume.
+
+---
+
+# Addendum -- what the fixed probes then revealed
+
+Deploying the above turned two useless messages into two real ones. Both were
+genuine faults, and neither was configuration.
+
+## 5. `faster-whisper` could never import  ->  STT was dead in the image
+
+The probe now reports the real cause:
+
+```
+faster-whisper is not available: No module named 'requests'
+```
+
+`faster_whisper/utils.py` does `import requests` at module scope, but
+faster-whisper 1.1.1 **does not declare `requests` as a dependency**. It
+inherited it transitively from `huggingface_hub`. huggingface_hub 1.x replaced
+`requests` with `httpx`, so any build that resolves the newer hub installs no
+`requests` at all and `import faster_whisper` dies on line 8.
+
+The image built successfully and STT could never have worked in it.
+
+**Fixed in the Dockerfile:** `huggingface_hub<1.0` pinned, `requests` installed
+explicitly, and a build-time `RUN python3 -c "import faster_whisper"` so a
+broken import fails the **build** rather than the first voice request. Nothing
+verified the package could be loaded, which is why this shipped.
+
+Rebuild the image for this one -- it is not a variable.
+
+## 6. No voice models on the volume  ->  TTS had nothing to speak with
+
+`voices_installed: []`. The Dockerfile creates `/data/voice/piper/voices`, and
+it cannot fill it: the Railway volume is mounted **over** `/data` at container
+start, masking anything the build wrote underneath. A `RUN wget` there would
+download hundreds of megabytes into a directory nothing will ever read.
+
+Letting Piper fetch its own voices does not work either. `piper-tts` looks a
+missing voice up **by name** in its `voices.json` index, and `voice-engines.js`
+passes an absolute **path**, which is not a name in that index.
+
+**Added:** `src/voice/voice-provision.js` and `scripts/voice-provision.mjs`,
+downloading from `rhasspy/piper-voices` (HuggingFace, as Section 15 pins).
+Config file first so a wrong path costs kilobytes rather than 60 MB; each file
+lands as `.partial` and is renamed into place, so an interrupted download leaves
+nothing that looks installed.
+
+```
+node scripts/voice-provision.mjs --list
+node scripts/voice-provision.mjs en_US-lessac-medium
+```
+
+or set `VOICE_PROVISION_VOICES=en_US-lessac-medium` and it runs in the
+background at boot -- opt-in, gated on `VOICE_ENABLED`, and never blocking the
+boot, because Railway's health check has a deadline and a model download must
+not fail a deploy.
+
+## 7. A catalogue voice that does not exist  (reported, not fixed)
+
+`VOICE_CATALOG` lists **`ja_JP-ryoko-medium`** as the Japanese default. There is
+no such voice in `rhasspy/piper-voices`. The repository publishes exactly one
+Japanese voice, `ja_JA-hi_fi_captain-medium`, under the locale directory
+`ja_JA` -- upstream's spelling, not a typo. Japanese TTS cannot succeed today no
+matter what is downloaded.
+
+I have **not** silently repointed the id. `VOICE_CATALOG` is a licence record:
+every entry carries `audited`, `licence` and `model_card` fields that a
+compliance review reads, and swapping an id inside it would put an unreviewed
+model behind a reviewed name. That is your call, not a bug fix. The provisioner
+refuses the id with the reason, and a test asserts every catalogue voice either
+has a download source or is explicitly recorded as unavailable.
+
+The other four voices resolve and download correctly; `en_US-lessac-medium` was
+downloaded and verified end to end (60 MB, config parsed, picked up by
+`installedVoices()` and reported in `voices_installed`).
+
+## Files added in this addendum
+
+| File | Change |
+|---|---|
+| `src/voice/voice-provision.js` | **New.** Pinned voice downloader, atomic writes, opt-in boot hook. |
+| `scripts/voice-provision.mjs` | **New.** CLI: `--list`, `--force`, per-voice or all. |
+| `Dockerfile` | `requests` + `huggingface_hub<1.0`, and a build-time import check. |
+| `src/routes/voice.js` | Background provisioning hook at boot. |
+| `package.json` | `npm run voice:provision`. |
+| `src/tests/voice-auth.test.js` | 21 tests now (5 added for provisioning). |
+
+## Verification (final)
+
+| Suite | Result |
+|---|---|
+| `voice-auth.test.js` | 21 / 21 pass |
+| `voice.test.js` | 47 / 47 pass |
+| `phase0-security.test.js` | 61 / 61 pass |
+| `internal-config-custom-env.test.js` | 31 / 31 pass |
+| `edit-tools.test.js` | 50 / 50 pass |
+| live download of `en_US-lessac-medium` | 60 MB, verified, idempotent on re-run |

@@ -145,9 +145,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # MIT half. System packages, same convention as the document pipeline above.
+# v12.50.0: `requests` and the huggingface_hub pin are NOT optional extras.
+#
+# faster_whisper/utils.py does `import requests` at module scope, but
+# faster-whisper 1.1.1 does not DECLARE requests as a dependency -- it inherited
+# it transitively from huggingface_hub. huggingface_hub 1.x replaced requests
+# with httpx, so a build resolving the newer hub installs no requests at all and
+# `import faster_whisper` dies with:
+#
+#   No module named 'requests'
+#
+# which the connector reported as stt_ready:false with no working STT, on an
+# image whose build had succeeded. Pinning the hub below 1.0 keeps the declared
+# contract faster-whisper was written against; installing requests explicitly
+# means a future hub change cannot break the import again.
 RUN pip3 install --break-system-packages --retries 5 --timeout 180 \
       faster-whisper==1.1.1 \
+      "huggingface_hub<1.0" \
+      requests \
     && rm -rf /root/.cache/pip
+
+# Fail the BUILD, not the first voice request, if the import is broken. The
+# defect above shipped because nothing verified the package could be loaded.
+RUN python3 -c "import faster_whisper; print('faster-whisper', faster_whisper.__version__, 'imports cleanly')"
+
 
 # GPL half. Own venv, own prefix, own directory. Nothing of ours imports from it.
 RUN python3 -m venv /opt/piper \

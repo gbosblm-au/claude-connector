@@ -22,7 +22,8 @@
     "test:validation-tools": "node --test src/tests/validation-tools.test.js",
     "test:gateway-tools": "node --test src/tests/render-tools.test.js src/tests/edit-tools.test.js src/tests/validation-tools.test.js",
     "test:voice": "node --test src/tests/voice.test.js",
-    "voice:benchmark": "node scripts/voice-benchmark.mjs"
+    "voice:benchmark": "node scripts/voice-benchmark.mjs",
+    "voice:provision": "node scripts/voice-provision.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

@@ -49,6 +49,10 @@ import { allowlistConfigProblems } from '../voice/voice-allowlist.js';
 // RAILWAY_RESTORE_TOKEN (gateway). See src/voice/voice-auth.js for why the
 // gateway could not previously reach these routes at all.
 import { voiceCredential }        from '../voice/voice-auth.js';
+// v12.50.0: optional background download of Piper voice models onto the volume.
+// The image cannot ship them -- the Railway volume is mounted over /data at
+// runtime, masking anything the build wrote there.
+import { provisionFromEnv }       from '../voice/voice-provision.js';
 import { parseMultipart }         from '../voice/multipart.js';
 import { validateAudio, maxBytes,
          ACCEPTED_FORMATS }       from '../voice/audio-validate.js';
@@ -537,6 +541,20 @@ export function registerVoiceRoutes(app) {
   // Said at boot, once, at error level. A correct-but-silent refusal is
   // indistinguishable from a working "off", and the deployment that hit this had
   // no way to tell the two apart from the outside.
+  // v12.50.0. Fires only when VOICE_PROVISION_VOICES names something, only
+  // when the master switch is on, and never blocks the boot: Railway's health
+  // check has a deadline and a model download must not fail a deploy. Voice
+  // reports itself degraded until the files land, which is what degraded is for.
+  if (voiceEnabled()) {
+    const provisioning = provisionFromEnv();
+    // Errors are handled inside provisionFromEnv; this guard exists so an
+    // unexpected rejection can never become an unhandled promise and take the
+    // process down with it.
+    if (provisioning && typeof provisioning.catch === 'function') {
+      provisioning.catch(() => {});
+    }
+  }
+
   if (voiceEnabled()) {
     const problems = allowlistConfigProblems();
     problems.forEach((p) => console.error('[voice] CONFIGURATION: ' + p));
