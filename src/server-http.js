@@ -1658,6 +1658,18 @@ app.use(compression({
     const contentType = String(res.getHeader("Content-Type") || "");
     if (contentType.includes("text/event-stream")) return false;
 
+    // v12.53.0. POST /voice/synthesize/stream delivers one NDJSON line per
+    // synthesised phrase, and the entire point of it is that the browser gets
+    // phrase 1 while phrase 2 is still being synthesised. Buffering it in the
+    // compressor would hold every line until the reply ended -- the feature
+    // would appear to work, would be no faster than the single-call route, and
+    // nothing in any log would say why.
+    //
+    // Matched on the header the route already sets for upstream proxies, which
+    // is the same declaration made once: this response is streamed, whatever
+    // its declared content type. (The gateway's filter does exactly this.)
+    if (String(res.getHeader("X-Accel-Buffering") || "") === "no") return false;
+
     return compression.filter(req, res);
   },
   threshold: 1024,

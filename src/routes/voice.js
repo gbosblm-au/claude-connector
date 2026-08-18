@@ -64,7 +64,16 @@ import { voicePermitted, voicesForLanguage,
          speakableLanguages, bestVoiceForLanguage,
          attributions }           from '../voice/voice-catalog.js';
 import { probeEngines, engineState, installedVoices,
-         transcribe, synthesize } from '../voice/voice-engines.js';
+         transcribe, synthesize,
+         // v12.53.0 -- the prosody layer (TS-VOICE-PROSODY-v1.0).
+         synthesizeProsody, synthesizeProsodyStream,
+         voiceLengthScale, prosodyState,
+         // v12.53.0 -- PIPER-PRELOAD-v1.1 Sections 4.3, 5.
+         prewarmTts, ttsWorkerState,
+         // v12.54.0 -- PIPER-PRELOAD-v1.1 Section 6 (Change 3).
+         prewarmStt, sttWorkerHealth } from '../voice/voice-engines.js';
+import { analyse, prosodyConfig, replyHash,
+         summarise }                 from '../voice/prosody.js';
 
 /* Section 15: "Rate limiting per user on both voice routes." Voice is far more
  * expensive per request than a normal API call -- one transcription can occupy
@@ -173,12 +182,105 @@ function requireAuth(req, res, next) {
   });
 }
 
+/**
+ * Validate the Section 7.2 prosody mode.
+ *
+ * Returns null for anything unrecognised rather than quietly defaulting. A
+ * typo ("prosdy": "on") that silently produced flat audio would look exactly
+ * like the layer being broken, and the person debugging it would have no way
+ * to tell the two apart.
+ *
+ * @param {*} raw
+ * @returns {string|null} 'on' | 'off' | 'both', or null when invalid.
+ */
+function parseProsodyMode(raw) {
+  if (raw === undefined || raw === null || '' === raw) return 'off';
+  const mode = String(raw).trim().toLowerCase();
+  return ['on', 'off', 'both'].includes(mode) ? mode : null;
+}
+
 /** Never log audio, filenames or transcripts (Section 10). Metadata only. */
 function logMeta(direction, meta) {
   const parts = Object.entries(meta)
     .filter(([, v]) => v !== undefined && v !== null)
     .map(([k, v]) => `${k}=${v}`);
   console.log(`[voice] ${direction} ${parts.join(' ')}`);
+}
+
+/**
+ * Resolve and licence-check the voice for a synthesis request.
+ *
+ * v12.53.0: extracted so /voice/synthesize and /voice/synthesize/stream cannot
+ * drift apart on which voices they accept. Two copies of a LICENCE CHECK is
+ * exactly the duplication worth removing -- compliance obligation 2 is not
+ * something to enforce differently on two routes that reach the same engine.
+ *
+ * Answers the response itself on every refusal and returns null, so the caller
+ * needs only `if (!resolved) return;`.
+ *
+ * @param {object} body Parsed JSON request body.
+ * @param {object} res  Express response.
+ * @returns {Promise<{voice: string, permit: object}|null>}
+ */
+async function resolveVoice(body, res) {
+  const language = String(body.language || '').trim().toLowerCase();
+  let voice = String(body.voice || '').trim();
+
+  // No voice named: take the language's default from the catalogue. This is
+  // the path most callers use, and it must fail as clearly as an explicitly
+  // bad voice does.
+  if (!voice) {
+    if (!language) {
+      res.status(422).json({
+        error: 'no_voice_or_language',
+        message: 'Specify a voice, or a language to pick the default voice for.',
+      });
+      return null;
+    }
+    if (!TTS_LANGUAGES.includes(language)) {
+      res.status(422).json({
+        error: 'unsupported_language',
+        message: `Text-to-speech supports ${TTS_LANGUAGES.join(', ')}. `
+          + 'Speech-to-text supports many more; the two are not the same set.',
+      });
+      return null;
+    }
+    const available = voicesForLanguage(language);
+    if (!available.length) {
+      // The audit gate, surfaced honestly. Section 6.3 obligation 2 means a
+      // voice nobody has checked cannot ship, and saying so beats a 500.
+      res.status(422).json({
+        error: 'no_voice_available',
+        message: `No licence-cleared voice is available for "${language}". `
+          + 'Each Piper voice is governed by its own MODEL_CARD and some are '
+          + 'non-commercial, so voices are refused until audited.',
+      });
+      return null;
+    }
+    // v12.51.0: prefer a voice whose model is actually on the volume. Taking
+    // catalogue order blindly can select a licence-cleared voice that was never
+    // downloaded, which reaches Piper and comes back as a 500 -- an engine
+    // failure reported for what is really a missing file.
+    const best = bestVoiceForLanguage(language, installedVoices());
+    if (!best.installed) {
+      res.status(422).json({
+        error: 'voice_not_installed',
+        message: `No voice model for "${language}" is installed on this connector. `
+          + `${best.candidates} voice(s) are licence-cleared for it, but none has been `
+          + 'downloaded onto the volume.',
+      });
+      return null;
+    }
+    voice = best.voice_id;
+  }
+
+  const permit = voicePermitted(voice);
+  if (!permit.ok) {
+    res.status(422).json({ error: permit.reason, message: permit.message });
+    return null;
+  }
+
+  return { voice, permit };
 }
 
 export function registerVoiceRoutes(app) {
@@ -321,7 +423,29 @@ export function registerVoiceRoutes(app) {
       stt_languages: 'auto',
       attributions: attributions(),
       errors: { stt: engines.stt_error || null, tts: engines.tts_error || null },
-      queue: { in_flight: engineState().in_flight, queued: engineState().queued },
+      queue: {
+        in_flight: engineState().in_flight, queued: engineState().queued,
+        tts_in_flight: engineState().tts_in_flight,
+        tts_queued: engineState().tts_queued,
+      },
+
+      // v12.53.0 -- TS-VOICE-PROSODY-v1.0. THE field a client gates its A/B
+      // control on. A UI that renders On|Off|Compare against a connector
+      // deployed with the layer off would offer three buttons that all produce
+      // the same audio, which reads as a broken feature rather than a
+      // disabled one.
+      prosody: prosodyState(),
+
+      // v12.53.0 -- PIPER-PRELOAD-v1.1 A2. `warm` and `pid` are what make
+      // "two consecutive requests reused the same process" an observable fact
+      // rather than an inference from a stopwatch.
+      tts_worker: ttsWorkerState(),
+
+      // v12.54.0 -- Change 3. Reported alongside tts_worker rather than merged
+      // into it: the two are separately configurable, separately failable, and
+      // an operator diagnosing memory needs to see which of them is actually
+      // holding a model. `resident` is the field that answers that.
+      stt_worker: sttWorkerHealth(),
     });
   });
 
@@ -452,62 +576,9 @@ export function registerVoiceRoutes(app) {
         return;
       }
 
-      const language = String(body.language || '').trim().toLowerCase();
-      let voice = String(body.voice || '').trim();
-
-      // No voice named: take the language's default from the catalogue. This is
-      // the path most callers use, and it must fail as clearly as an explicitly
-      // bad voice does.
-      if (!voice) {
-        if (!language) {
-          res.status(422).json({
-            error: 'no_voice_or_language',
-            message: 'Specify a voice, or a language to pick the default voice for.',
-          });
-          return;
-        }
-        if (!TTS_LANGUAGES.includes(language)) {
-          res.status(422).json({
-            error: 'unsupported_language',
-            message: `Text-to-speech supports ${TTS_LANGUAGES.join(', ')}. `
-              + `Speech-to-text supports many more; the two are not the same set.`,
-          });
-          return;
-        }
-        const available = voicesForLanguage(language);
-        if (!available.length) {
-          // The audit gate, surfaced honestly. Section 6.3 obligation 2 means a
-          // voice nobody has checked cannot ship, and saying so beats a 500.
-          res.status(422).json({
-            error: 'no_voice_available',
-            message: `No licence-cleared voice is available for "${language}". `
-              + 'Each Piper voice is governed by its own MODEL_CARD and some are '
-              + 'non-commercial, so voices are refused until audited.',
-          });
-          return;
-        }
-        // v12.51.0: prefer a voice whose model is actually on the volume.
-        // Taking catalogue order blindly can select a licence-cleared voice
-        // that was never downloaded, which reaches Piper and comes back as a
-        // 500 -- an engine failure reported for what is really a missing file.
-        const best = bestVoiceForLanguage(language, installedVoices());
-        if (!best.installed) {
-          res.status(422).json({
-            error: 'voice_not_installed',
-            message: `No voice model for "${language}" is installed on this connector. `
-              + `${best.candidates} voice(s) are licence-cleared for it, but none has been `
-              + 'downloaded onto the volume.',
-          });
-          return;
-        }
-        voice = best.voice_id;
-      }
-
-      const permit = voicePermitted(voice);
-      if (!permit.ok) {
-        res.status(422).json({ error: permit.reason, message: permit.message });
-        return;
-      }
+      const resolved = await resolveVoice(body, res);
+      if (!resolved) return;   // resolveVoice has already answered.
+      const { voice, permit } = resolved;
 
       // Section 8.3 allows a format parameter. Only WAV is produced here: Piper
       // emits WAV natively and Table 2 puts Opus/MP3 transcoding at the gateway,
@@ -531,19 +602,145 @@ export function registerVoiceRoutes(app) {
         return;
       }
 
-      try {
-        const wav = await synthesize({
-          text, voice, speed: Number.isFinite(speed) ? speed : undefined,
+      // v12.53.0 -- Section 7.2. The A/B mode. Defaults to "off", which is the
+      // pre-prosody behaviour, so an OLDER CLIENT THAT SENDS NOTHING GETS
+      // EXACTLY WHAT IT GOT BEFORE. Defaulting to "on" here would silently
+      // change the output of every existing caller, including the benchmark
+      // harness Section 14 depends on.
+      const mode = parseProsodyMode(body.prosody);
+      if (!mode) {
+        res.status(422).json({
+          error: 'invalid_prosody',
+          message: 'prosody must be "on", "off" or "both".',
         });
+        return;
+      }
+
+      const prosodyCfg = prosodyConfig();
+      // The master switch wins over the request. A connector deployed with the
+      // layer off must behave as though it does not have one (Section 10's
+      // rollout depends on exactly that), and refusing loudly would break a
+      // client that legitimately asked for a feature the operator has not
+      // enabled yet. So it degrades to flat and SAYS SO in the response header,
+      // which is how the UI can explain a Compare button that produced two
+      // identical recordings.
+      const effective = prosodyCfg.enabled ? mode : 'off';
+      if (effective !== mode) res.setHeader('X-Tenax-Prosody-Degraded', 'layer_disabled');
+
+      const flatSpeed = Number.isFinite(speed) ? speed : undefined;
+
+      try {
+        // ---- Compare mode (Section 7.2, AC5) -------------------------------
+        //
+        // Returns BOTH renderings of the same text in one JSON body, paired by
+        // a shared reply hash.
+        //
+        // DEVIATION FROM THE SPECIFICATION, STATED PLAINLY. Section 7.2 says
+        // "both" returns two audio URLs. URLs would require the connector to
+        // STORE the two recordings somewhere a later request could fetch them,
+        // and Section 10 of the voice specification forbids exactly that:
+        // "audio is processed in memory or in temporary files deleted
+        // immediately after the request completes. No recording is written to
+        // persistent storage." Inventing an audio store to satisfy a wording
+        // choice would trade a real privacy control for a cosmetic one.
+        //
+        // Two base64 payloads in one response satisfy what AC5 actually
+        // requires -- "compare mode returns two audio outputs for one reply,
+        // and the flat output matches the Off-mode output for that text" --
+        // and the pairing the UI needs is the shared hash, not the transport.
+        if ('both' === effective) {
+          const flat = await synthesize({ text, voice, speed: flatSpeed });
+          const layered = await synthesizeProsody({
+            text, voice, speed: flatSpeed, config: prosodyCfg,
+          });
+
+          logMeta('tts', {
+            voice, language: permit.voice.language, chars: text.length,
+            prosody: 'both',
+            bytes: flat.length + layered.wav.length,
+            phrases: layered.analysis.phrases.length,
+            elapsed_ms: Date.now() - started,
+          });
+
+          res.setHeader('Cache-Control', 'no-store');
+          res.json({
+            // Section 7.2: "tagged with a shared reply hash so the UI can pair
+            // them". Both halves carry the same one because both are the same
+            // text.
+            reply_hash: replyHash(text),
+            format: 'wav',
+            sample_rate: layered.sampleRate,
+            flat: {
+              // Byte-identical to what prosody:"off" returns for this text,
+              // because it IS the same call (AC5, N4).
+              audio_base64: flat.toString('base64'),
+              bytes: flat.length,
+            },
+            prosody: {
+              audio_base64: layered.wav.toString('base64'),
+              bytes: layered.wav.length,
+              // Counts and profile names only, never the phrase text
+              // (Section 10). Enough for the panel to show what the layer did.
+              summary: summarise(layered.analysis),
+            },
+          });
+          return;
+        }
+
+        // ---- Layered, or the true flat baseline ----------------------------
+        let wav;
+        let path = 'flat';
+        let phrases = 0;
+
+        if ('on' === effective) {
+          try {
+            const layered = await synthesizeProsody({
+              text, voice, speed: flatSpeed, config: prosodyCfg,
+            });
+            wav = layered.wav;
+            path = layered.path;
+            phrases = layered.analysis.phrases.length;
+          } catch (layerErr) {
+            // NON-NEGOTIABLE 5 (SPEC-VOICE-001): "failure in the layer falls
+            // back cleanly to the current working single-call synthesis."
+            //
+            // Only for failures that are ABOUT THE LAYER. A refusal the flat
+            // path would also produce -- an unlicensed voice, empty text -- is
+            // rethrown, because retrying it would spend another Piper run to
+            // arrive at the same 422 with a worse message.
+            const notWorthRetrying = ['unknown_voice', 'voice_inactive',
+              'voice_non_commercial', 'voice_unaudited', 'empty_text'];
+            if (notWorthRetrying.includes(layerErr.code)) throw layerErr;
+
+            console.error('[voice] prosody layer failed, falling back to flat:',
+                          layerErr.message);
+            logMeta('tts_prosody_fallback', {
+              code: layerErr.code || 'tts_failed', chars: text.length,
+            });
+            wav = await synthesize({ text, voice, speed: flatSpeed });
+            path = 'flat_fallback';
+            res.setHeader('X-Tenax-Prosody-Degraded', 'layer_failed');
+          }
+        } else {
+          // N4, the TRUE flat baseline: the untouched v12.52.0 call. Not a
+          // prosody run with the features turned off -- the same function, the
+          // same argv, the same bytes -- so the comparison always has a genuine
+          // reference (AC3).
+          wav = await synthesize({ text, voice, speed: flatSpeed });
+        }
 
         // Character count and voice only. Never the text (Section 10).
         logMeta('tts', {
           voice, language: permit.voice.language, chars: text.length,
+          prosody: effective, path, phrases: phrases || undefined,
           bytes: wav.length, elapsed_ms: Date.now() - started,
         });
 
         res.setHeader('Content-Type', 'audio/wav');
         res.setHeader('Content-Length', String(wav.length));
+        // So a client can tell a layered rendering from a fallback without
+        // parsing the audio. Metadata about the PATH, never about the content.
+        res.setHeader('X-Tenax-Prosody-Path', path);
         // Synthesised speech is derived from user text; a shared cache must not
         // hold it.
         res.setHeader('Cache-Control', 'no-store');
@@ -599,6 +796,270 @@ export function registerVoiceRoutes(app) {
       }
     });
 
+  // -------------------------------------------------------------------------
+  // POST /voice/synthesize/stream   (SPEC-VOICE-001 Component D)
+  // -------------------------------------------------------------------------
+  //
+  // Streamed playback. The same per-phrase segmentation that drives prosody
+  // drives this: "early playback is not a bolt-on; it falls out of the
+  // per-phrase architecture."
+  //
+  // ── Why NDJSON and not a media container ─────────────────────────────────
+  //
+  // The client needs three things per phrase: the audio, the pause that
+  // follows it, and the knowledge that a phrase boundary has arrived. A raw
+  // PCM stream carries the first and neither of the others -- the pauses would
+  // have to be baked in, which forfeits the client's ability to schedule them
+  // on an audio clock, and there would be no framing to tell one phrase from
+  // the next.
+  //
+  // So: one JSON object per line, flushed as each phrase finishes. Base64
+  // costs a third more bytes over the wire and buys framing, metadata, and an
+  // error channel that still works after the response has started -- which
+  // matters, because by then the status code has been sent and cannot be
+  // changed.
+  //
+  // ── Time to first audio ──────────────────────────────────────────────────
+  //
+  // The first line goes out after ONE phrase has been synthesised rather than
+  // after the whole reply, which is the entire point (AC15). Nothing is
+  // buffered: the response is chunked and each line is written the moment it
+  // exists.
+  app.post('/voice/synthesize/stream',
+    voiceCredential,
+    gate,
+    requireAuth,
+    voiceLimiter,
+    express.json({ limit: '256kb' }),
+    async (req, res) => {
+      const started = Date.now();
+      const body = (req.body && typeof req.body === 'object') ? req.body : {};
+
+      const text = String(body.text || '');
+      if (!text.trim()) {
+        res.status(422).json({ error: 'empty_text', message: 'Provide text to synthesise.' });
+        return;
+      }
+
+      const MAX_CHARS = intEnv('VOICE_MAX_TTS_CHARS', 5000);
+      if (text.length > MAX_CHARS) {
+        res.status(413).json({
+          error: 'text_too_long',
+          message: `Text is ${text.length} characters; the limit is ${MAX_CHARS}.`,
+        });
+        return;
+      }
+
+      const resolved = await resolveVoice(body, res);
+      if (!resolved) return;   // resolveVoice has already answered.
+
+      const speed = Number(body.speed);
+      if (body.speed !== undefined && (!Number.isFinite(speed) || speed < 0.5 || speed > 2)) {
+        res.status(422).json({ error: 'invalid_speed', message: 'Speed must be between 0.5 and 2.' });
+        return;
+      }
+
+      const prosodyCfg = prosodyConfig();
+      if (!prosodyCfg.enabled) {
+        // Streaming exists to deliver per-phrase audio, and per-phrase audio is
+        // the prosody layer. With the layer off there is nothing to stream, and
+        // pretending otherwise (one "phrase" containing the whole reply) would
+        // give the client a stream that never overlaps anything while looking
+        // like it does. 409 so the client falls back to /voice/synthesize,
+        // which is the correct behaviour and the one it already has.
+        res.status(409).json({
+          error: 'prosody_disabled',
+          message: 'Streamed playback needs the prosody layer, which is switched off '
+            + 'on this connector. Use POST /voice/synthesize instead.',
+        });
+        return;
+      }
+
+      // Committed to 200 from here on. Everything after this point reports
+      // failure INSIDE the stream, because the status line has been sent.
+      res.status(200);
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      // Nginx and several Railway-style proxies buffer a response by default,
+      // which would hold every line until the last one and silently undo the
+      // whole feature. The header is advisory and harmless where it is not
+      // understood.
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+
+      /**
+       * Write one NDJSON line, respecting backpressure.
+       *
+       * A phrase of audio is tens of kilobytes and a slow client can fill the
+       * socket buffer. Ignoring a false return from write() would let the
+       * connector queue the whole reply in memory for a client that is not
+       * reading it, which is how one bad connection becomes a heap problem.
+       *
+       * @param {object} obj
+       * @returns {Promise<void>}
+       */
+      function writeLine(obj) {
+        return new Promise((resolve) => {
+          const ok = res.write(`${JSON.stringify(obj)}\n`);
+          if (ok) { resolve(); return; }
+          res.once('drain', resolve);
+        });
+      }
+
+      let aborted = false;
+      req.on('aborted', () => { aborted = true; });
+      res.on('close', () => { aborted = true; });
+
+      try {
+        const result = await synthesizeProsodyStream(
+          { text, voice: resolved.voice, speed: Number.isFinite(speed) ? speed : undefined,
+            config: prosodyCfg },
+          async (segment) => {
+            // The user navigated away or stopped playback. Throwing here
+            // unwinds the phrase pool, so no further Piper process is spawned
+            // for audio nobody will hear.
+            if (aborted) {
+              const stop = new Error('client went away');
+              stop.code = 'client_aborted';
+              throw stop;
+            }
+            await writeLine({
+              type: 'phrase',
+              index: segment.index,
+              total: segment.total,
+              sample_rate: segment.sampleRate,
+              pause_after_ms: segment.pauseAfterMs,
+              profile: segment.profile,
+              length_scale: segment.lengthScale,
+              // Headerless PCM, signed 16-bit little-endian mono. The client
+              // builds AudioBuffers from it directly -- no per-phrase WAV
+              // header, because the client is not writing files.
+              audio_base64: segment.pcm.toString('base64'),
+            });
+          }
+        );
+
+        if (!aborted) {
+          await writeLine({ type: 'end', phrases: result.phrases, bytes: result.bytes });
+        }
+
+        logMeta('tts_stream', {
+          voice: resolved.voice, language: resolved.permit.voice.language,
+          chars: text.length, phrases: result.phrases, bytes: result.bytes,
+          aborted: aborted || undefined,
+          elapsed_ms: Date.now() - started,
+        });
+      } catch (err) {
+        if ('client_aborted' === err.code) {
+          logMeta('tts_stream', { voice: resolved.voice, chars: text.length,
+                                  aborted: true, elapsed_ms: Date.now() - started });
+          res.end();
+          return;
+        }
+
+        // The status line is long gone, so the only way to report this is in
+        // band. The client's contract is that it falls back to the single-call
+        // route when it sees this (non-negotiable 5, AC18).
+        console.error('[voice] tts stream failed:', err.message);
+        logMeta('tts_stream_error', { code: err.code || 'tts_failed',
+                                      elapsed_ms: Date.now() - started });
+        try {
+          await writeLine({
+            type: 'error',
+            error: err.code || 'tts_failed',
+            // The same discretion the non-streaming route applies: Piper's
+            // stderr names paths and model internals and does not go to a
+            // browser. The connector log above has the real reason.
+            message: 'Speech synthesis failed. The connector log has the reason.',
+          });
+        } catch (writeErr) { /* the socket is gone; nothing left to say */ }
+      } finally {
+        res.end();
+      }
+    });
+
+  // -------------------------------------------------------------------------
+  // POST /voice/prosody/analyse   (Section 4.1, "tuning is data, not code")
+  // -------------------------------------------------------------------------
+  //
+  // The annotation with no audio. Section 4.1 requires the pause tiers and
+  // rates to be "expressed as config data, not code" and tunable by ear, and
+  // Section 9 ends with "all overridable so tuning is data, not code" -- which
+  // only helps if an operator can see what the current values actually do to a
+  // sentence without spawning Piper and listening to the result.
+  //
+  // Costs nothing: prosody.js is a pure transform, so this route reads no file,
+  // spawns no process and loads no model. It is gated exactly like the others
+  // regardless, because the register table is a description of how the
+  // assistant is written and is not owed to an anonymous caller.
+  app.post('/voice/prosody/analyse',
+    voiceCredential,
+    gate,
+    requireAuth,
+    voiceLimiter,
+    express.json({ limit: '256kb' }),
+    (req, res) => {
+      const body = (req.body && typeof req.body === 'object') ? req.body : {};
+      const text = String(body.text || '');
+      if (!text.trim()) {
+        res.status(422).json({ error: 'empty_text', message: 'Provide text to analyse.' });
+        return;
+      }
+
+      const MAX_CHARS = intEnv('VOICE_MAX_TTS_CHARS', 5000);
+      if (text.length > MAX_CHARS) {
+        res.status(413).json({
+          error: 'text_too_long',
+          message: `Text is ${text.length} characters; the limit is ${MAX_CHARS}.`,
+        });
+        return;
+      }
+
+      const speed = Number(body.speed);
+      if (body.speed !== undefined && (!Number.isFinite(speed) || speed < 0.5 || speed > 2)) {
+        res.status(422).json({ error: 'invalid_speed', message: 'Speed must be between 0.5 and 2.' });
+        return;
+      }
+
+      // A voice is OPTIONAL here. Without one the base length_scale is 1, which
+      // makes every returned lengthScale a pure multiplier -- the right answer
+      // for inspecting the register table itself. With one, the numbers are
+      // what that voice would actually be given (Section 4.2).
+      const voice = String(body.voice || '').trim();
+      let base = 1;
+      if (voice) {
+        const permit = voicePermitted(voice);
+        if (!permit.ok) {
+          res.status(422).json({ error: permit.reason, message: permit.message });
+          return;
+        }
+        base = voiceLengthScale(voice);
+      }
+
+      const analysis = analyse(text, {
+        baseLengthScale: base,
+        speed: Number.isFinite(speed) ? speed : undefined,
+      });
+
+      // Logged as counts. The phrase text is in the RESPONSE, because the
+      // caller sent it and is asking what was done to it, but it never reaches
+      // the log (Section 10).
+      logMeta('prosody_analyse', {
+        chars: text.length, phrases: analysis.phrases.length,
+        voice: voice || undefined,
+      });
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        reply_hash: replyHash(text),
+        base_length_scale: base,
+        phrases: analysis.phrases,
+        sentences: analysis.sentences,
+        summary: summarise(analysis),
+        config: analysis.config,
+      });
+    });
+
   // Reports the master switch and the SIZE of the allowlist, never its
   // contents: the identities are operator account ids and do not belong in
   // logs.
@@ -619,6 +1080,40 @@ export function registerVoiceRoutes(app) {
     // process down with it.
     if (provisioning && typeof provisioning.catch === 'function') {
       provisioning.catch(() => {});
+    }
+
+    // v12.53.0 -- PIPER-PRELOAD-v1.1 Section 5, boot pre-warm.
+    //
+    // Inside the voiceEnabled() guard, so Section 7's guarantee is untouched:
+    // with the master switch off, no Piper process is created and A7 stays
+    // verifiable from the process list.
+    //
+    // Deliberately NOT awaited. Railway's health check has a deadline and
+    // loading a 61 MB ONNX model can take seconds; blocking the boot on it
+    // would turn a latency optimisation into a failed deploy. Voice reports
+    // itself warm or cold under tts_worker in /voice/health, which is what
+    // that field is for.
+    //
+    // Ordered after provisionFromEnv because on a first boot the model may not
+    // be on the volume yet. The pre-warm will find nothing installed and
+    // decline, and the first real request warms the worker instead -- one cold
+    // utterance, once, rather than a failure.
+    // v12.54.0. The STT worker is warmed alongside the TTS one, and separately,
+    // so a missing voice model cannot suppress the Whisper warm or the reverse.
+    // Also not awaited, and for a stronger reason: a cold Whisper cache
+    // DOWNLOADS several hundred megabytes, which is far past any health-check
+    // deadline. It declines quietly when residency is off.
+    const warmingStt = prewarmStt();
+    if (warmingStt && typeof warmingStt.catch === 'function') {
+      warmingStt.catch(() => {});
+    }
+
+    const warming = prewarmTts();
+    if (warming && typeof warming.catch === 'function') {
+      // prewarmTts already swallows its own errors; this guard exists so an
+      // unexpected rejection can never become an unhandled promise and take
+      // the process down with it.
+      warming.catch(() => {});
     }
   }
 

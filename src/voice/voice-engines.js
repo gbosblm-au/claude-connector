@@ -58,6 +58,20 @@ import { join }                        from 'node:path';
 
 import { voiceEnabled }                from './voice-gate.js';
 import { voicePermitted }              from './voice-catalog.js';
+// v12.53.0 -- the prosody layer (TS-VOICE-PROSODY-v1.0). A PURE TRANSFORM: it
+// spawns nothing and reads nothing, so importing it here cannot change the
+// behaviour of the flat path even by accident. See src/voice/prosody.js.
+import { analyse, prosodyConfig }     from './prosody.js';
+// v12.53.0 -- the resident Piper worker (PIPER-PRELOAD-v1.1 Section 4).
+// SPAWNED, never imported: this is a path to a Python file, and the GPL
+// boundary is unchanged by it. See piper-worker-supervisor.js.
+import { synthesizeViaWorker, workerState,
+         prewarm as prewarmWorker }   from './piper-worker-supervisor.js';
+// v12.54.0 -- the resident STT worker (PIPER-PRELOAD-v1.1 Section 6, Change 3).
+// Spawned on VOICE_PYTHON_BIN, the MIT interpreter, never the Piper one.
+import { transcribeViaWorker, sttWorkerState, sttWorkerEnabled,
+         sttWorkerResident,
+         prewarm as prewarmSttWorker } from './stt-worker-supervisor.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -96,10 +110,39 @@ const TTS_THREADS  = intEnv('VOICE_TTS_THREADS', 1);
  * redeploy or a re-provision. */
 const _sampleRates = new Map();
 
+/* v12.53.0. The same treatment for the voice's own default length_scale, which
+ * Section 4.2 of TS-VOICE-PROSODY-v1.0 makes the base every prosody profile
+ * multiplies against. Cached for the same reason and with the same lifetime:
+ * the value cannot change without the model changing. */
+const _lengthScales = new Map();
+
+/* v12.53.0. Prosody synthesises one Piper process per phrase, so a reply that
+ * used to cost one process now costs N. Two of them at a time overlaps the
+ * model load of the next phrase with the inference of the current one, which is
+ * where the time-to-first-audio saving actually comes from -- while keeping the
+ * peak memory to two onnxruntime arenas rather than N. On the small Railway
+ * instance this connector runs on, that ceiling is the difference between a
+ * faster reply and the OOM killer described in describeFailure(). */
+const TTS_PHRASE_CONCURRENCY = intEnv('VOICE_TTS_PHRASE_CONCURRENCY', 2);
+
 /* Section 12 budgets assume one utterance at a time on a shared CPU. Two
  * concurrent Whisper runs on the box that also serves the connector will miss
  * every budget in the table, so requests queue rather than compete. */
 const STT_CONCURRENCY = intEnv('VOICE_STT_CONCURRENCY', 1);
+
+/* v12.53.0 -- PIPER-PRELOAD-v1.1 Section 5. The TTS path had NO concurrency
+ * control at all: two synthesis requests arriving together spawned two Piper
+ * processes, each loading its own copy of the model, on an instance sized for
+ * one. That is the CPU contention of item 3 and the OOM of item 4 in the
+ * corrected diagnosis, and it was reachable from two browser tabs.
+ *
+ * This queue guards the CLI SPAWN specifically. The resident worker does not
+ * need it -- it is serial by construction and holds one model however many
+ * requests are pipelined at it -- and putting the queue in front of the worker
+ * as well would serialise the phrase pipeline for no benefit. Section 5 says
+ * exactly this: "the worker is serial anyway, but the queue also serialises
+ * the fallback CLI path and prevents concurrent cold spawns during startup." */
+const TTS_CONCURRENCY = intEnv('VOICE_TTS_CONCURRENCY', 1);
 
 function intEnv(name, fallback) {
   const n = parseInt(process.env[name] || '', 10);
@@ -121,6 +164,12 @@ const state = {
   voicesInstalled: [],
   inFlight: 0,
   queue: [],
+  // v12.53.0. A second, independent queue for the CLI synthesis path. Separate
+  // counters rather than shared ones: STT and TTS have different costs and
+  // different ceilings, and one blocking the other would mean a transcription
+  // in progress silently delayed every reply's audio.
+  ttsInFlight: 0,
+  ttsQueue: [],
 };
 
 /**
@@ -338,6 +387,11 @@ export function engineState() {
     tts_error: state.ttsError,
     in_flight: state.inFlight,
     queued: state.queue.length,
+    // v12.53.0. Reported separately from the STT queue above: the two have
+    // different widths and different costs, and conflating them would make a
+    // busy transcription look like a busy synthesiser.
+    tts_in_flight: state.ttsInFlight,
+    tts_queued: state.ttsQueue.length,
   };
 }
 
@@ -347,6 +401,7 @@ export function resetEngineState() {
   state.sttError = null; state.ttsError = null;
   state.modelsLoaded = []; state.voicesInstalled = [];
   state.inFlight = 0; state.queue = [];
+  state.ttsInFlight = 0; state.ttsQueue = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +421,25 @@ function release() {
   const next = state.queue.shift();
   if (next) { next(); return; }   // hands the slot straight on; count unchanged
   state.inFlight = Math.max(0, state.inFlight - 1);
+}
+
+/**
+ * The same discipline for the CLI synthesis path (Section 5).
+ *
+ * @returns {Promise<void>}
+ */
+function acquireTts() {
+  if (state.ttsInFlight < TTS_CONCURRENCY) {
+    state.ttsInFlight++;
+    return Promise.resolve();
+  }
+  return new Promise(resolve => state.ttsQueue.push(resolve));
+}
+
+function releaseTts() {
+  const next = state.ttsQueue.shift();
+  if (next) { next(); return; }
+  state.ttsInFlight = Math.max(0, state.ttsInFlight - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +469,35 @@ export async function transcribe(audio, opts) {
     const path = join(dir, `audio.${o.format || 'wav'}`);
     await writeFile(path, audio);
 
-    const args = [STT_HELPER, '--transcribe', path, '--model', o.model || STT_TIER,
+    const model = o.model || STT_TIER;
+
+    // v12.54.0 -- PIPER-PRELOAD-v1.1 Section 6. THE RESIDENT PATH FIRST.
+    //
+    // The per-request spawn constructs WhisperModel from scratch every time:
+    // roughly 2 to 4 seconds on the base tier before a single sample of audio
+    // is looked at, paid again on every utterance for an identical result. That
+    // is the LARGER of the two cold starts, and it lands exactly where a user
+    // feels it most -- they have finished speaking and are waiting to see their
+    // words.
+    //
+    // THE AUDIO IS PASSED AS A PATH, NOT AS BYTES. A minute of speech is
+    // megabytes; base64 through a pipe would inflate it by a third and copy it
+    // twice for nothing, when the file is already on a filesystem the worker
+    // can read. The temporary directory is still owned and removed by the
+    // finally below, so this adds no second place audio can linger.
+    //
+    // A null answer means the worker cannot serve this -- not running, backing
+    // off, crashed, or wedged -- and execution falls through to the spawn
+    // below. Section 6: transcribe() "falls back to the current per-request
+    // spawn on failure", so the worst case of enabling this is the behaviour
+    // that already shipped. A transcription REFUSAL still throws, because the
+    // spawn would refuse identically and more slowly.
+    const viaWorker = await transcribeViaWorker({
+      path, model, modelDir: MODEL_DIR, language: o.language,
+    });
+    if (viaWorker) return viaWorker;
+
+    const args = [STT_HELPER, '--transcribe', path, '--model', model,
                   '--model-dir', MODEL_DIR];
     if (o.language) args.push('--language', o.language);
 
@@ -538,6 +640,47 @@ export function describeFailure(code, signal, stderrText) {
 
 export async function synthesize(opts) {
   const o = opts || {};
+  // v12.53.0. The body of this function moved to synthesizePcm() unchanged, so
+  // that the prosody layer can obtain HEADERLESS PCM per phrase and concatenate
+  // it. The flat path is preserved exactly:
+  //
+  //   - the same argv is built (--model, --output_raw, and --length_scale ONLY
+  //     when a speed was supplied, computed the same way);
+  //   - the same environment, cwd, stdio and timeout;
+  //   - the same PCM comes back, and it is wrapped by the same wrapPcmAsWav
+  //     with the same sample rate.
+  //
+  // AC3 requires flat output to be byte-identical to the pre-prosody build for
+  // the same reply text, and byte-identity is only defensible if the argv is
+  // identical -- Piper's output depends on nothing else. That equality is
+  // asserted in src/tests/voice-prosody.test.js rather than left to review.
+  const pcm = await synthesizePcm({
+    text: o.text,
+    voice: o.voice,
+    lengthScale: (Number.isFinite(o.speed) && o.speed > 0) ? (1 / o.speed) : undefined,
+  });
+  return wrapPcmAsWav(pcm, voiceSampleRate(o.voice));
+}
+
+/**
+ * Synthesise one unit of text and return HEADERLESS PCM.
+ *
+ * The building block for both paths. Flat synthesis calls it once; the prosody
+ * layer calls it once per phrase and joins the results.
+ *
+ * Returning PCM rather than WAV is what makes the joining possible at all: two
+ * WAV files cannot be concatenated (the second file's 44-byte header lands in
+ * the middle of the audio as a burst of noise), while two PCM buffers at the
+ * same rate and width simply are the longer recording.
+ *
+ * @param {{text: string, voice: string, lengthScale?: number}} opts
+ *        lengthScale is the ABSOLUTE value handed to Piper. Omit it entirely to
+ *        let the voice's own config default apply, which is what the flat path
+ *        does when no speed was requested.
+ * @returns {Promise<Buffer>} Signed 16-bit little-endian mono samples.
+ */
+export async function synthesizePcm(opts) {
+  const o = opts || {};
   const text = String(o.text || '');
   if (!text.trim()) {
     const err = new Error('No text to synthesise.');
@@ -556,6 +699,66 @@ export async function synthesize(opts) {
   }
 
   const modelPath = join(VOICES_DIR, `${o.voice}.onnx`);
+
+  // v12.53.0 -- PIPER-PRELOAD-v1.1 Section 4. THE RESIDENT PATH FIRST.
+  //
+  // The worker holds the model loaded, so this returns without paying the 1 to
+  // 2.5 second spawn-and-load the CLI path pays on every single utterance.
+  // That cost is the whole of Section 3's item 1, and on a per-phrase prosody
+  // reply it was being paid N times rather than once.
+  //
+  // A null answer means the worker cannot serve this -- not running, still
+  // backing off, crashed mid-request, or returned something malformed -- and
+  // execution falls through to the CLI spawn below. That fallthrough is the
+  // zero-regression guarantee in Section 4.3: the previous behaviour IS the
+  // degraded mode, so the worst case of shipping this is the status quo.
+  //
+  // A synthesis REFUSAL, by contrast, throws from here and is not retried:
+  // running the CLI path to reach the same refusal more slowly helps nobody.
+  const viaWorker = await synthesizeViaWorker({
+    text, modelPath, lengthScale: o.lengthScale,
+  });
+  if (viaWorker) {
+    // The worker reports the rate from the voice object it loaded. Cached here
+    // so wrapPcmAsWav and the prosody concatenator agree with it without
+    // re-reading the config file -- and so the two paths cannot disagree about
+    // the rate of the same voice.
+    if (viaWorker.sampleRate >= 8000 && viaWorker.sampleRate <= 48000) {
+      _sampleRates.set(o.voice, viaWorker.sampleRate);
+    }
+    return viaWorker.pcm;
+  }
+
+  // ---- CLI fallback (the v12.52.0 path, unchanged) ----------------------
+  //
+  // Queued, so concurrent replies cannot spawn concurrent cold Piper processes
+  // (Section 5). The queue is here and not around the worker call above
+  // because only this branch creates a process per request.
+  await acquireTts();
+  try {
+    return await synthesizePcmViaCli({ text, modelPath, lengthScale: o.lengthScale });
+  } finally {
+    releaseTts();
+  }
+}
+
+/**
+ * The per-request Piper CLI spawn.
+ *
+ * v12.53.0: extracted from synthesizePcm() so the resident worker can sit in
+ * front of it without either path acquiring a comment about the other. The
+ * body below is byte-for-byte the v12.52.0 implementation -- same argv, same
+ * environment, same cwd, same timeout, same error handling -- because A5
+ * requires that "with the worker disabled by flag, behaviour is byte-identical
+ * to the current CLI path".
+ *
+ * @param {{text: string, modelPath: string, lengthScale?: number}} opts
+ * @returns {Promise<Buffer>} Signed 16-bit little-endian mono PCM.
+ */
+function synthesizePcmViaCli(opts) {
+  const o = opts || {};
+  const text = o.text;
+  const modelPath = o.modelPath;
 
   // v12.52.0 -- THE PRODUCTION 500.
   //
@@ -588,14 +791,22 @@ export async function synthesize(opts) {
   // there is nothing to patch afterwards.
   const args = ['--model', modelPath, '--output_raw'];
 
+  // v12.53.0. The caller now supplies the ABSOLUTE length_scale rather than a
+  // speed, because the prosody layer needs to vary it per phrase and cannot
+  // express "the voice's own base times 1.08" as a speed multiplier.
+  //
+  // The flat path preserves the previous behaviour exactly: synthesize() passes
+  // `1 / speed` when a speed was given and `undefined` otherwise, so the argv
+  // built here is byte-for-byte what v12.52.0 built. Piper's output depends on
+  // nothing but the model and the argv, which is what makes AC3's byte-identity
+  // claim checkable rather than hopeful.
+  //
   // Piper expresses speed as length_scale, which is INVERSE: larger is slower.
-  // Passing a speed multiplier straight through would make "1.5x speed" play
-  // half as fast.
-  if (Number.isFinite(o.speed) && o.speed > 0) {
-    args.push('--length_scale', String(1 / o.speed));
+  if (Number.isFinite(o.lengthScale) && o.lengthScale > 0) {
+    args.push('--length_scale', String(o.lengthScale));
   }
 
-  return await new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     let child;
     try {
       child = spawn(PIPER_BIN, args, {
@@ -649,17 +860,10 @@ export async function synthesize(opts) {
       settled = true;
       clearTimeout(timer);
       const pcm = Buffer.concat(out);
-      let wav = pcm;
-      if (code === 0 && pcm.length > 0) {
-        try {
-          wav = wrapPcmAsWav(pcm, voiceSampleRate(o.voice));
-        } catch (err) {
-          const wrapErr = new Error(`Could not build the WAV header: ${err.message}`);
-          wrapErr.code = 'tts_failed';
-          reject(wrapErr);
-          return;
-        }
-      }
+      // v12.53.0. The WAV header is no longer built here. This function returns
+      // headerless PCM and the CALLER wraps it -- once, around the whole reply
+      // -- because a prosody reply is many of these buffers joined end to end
+      // and a header in the middle of one is a burst of noise, not a header.
       if (code !== 0 || pcm.length === 0) {
         // v12.52.0. The old message was `errText || "Piper exited <code>"`, and
         // on the failure that matters most -- the process being KILLED -- both
@@ -684,7 +888,7 @@ export async function synthesize(opts) {
         reject(err);
         return;
       }
-      resolve(wav);
+      resolve(pcm);
     });
 
     // stdin can EPIPE if Piper dies early. The close handler already reports
@@ -700,7 +904,469 @@ export const config = Object.freeze({
   STT_TIER, STT_TIMEOUT, TTS_TIMEOUT, STT_CONCURRENCY,
 });
 
+// ---------------------------------------------------------------------------
+// Prosody layer  (TS-VOICE-PROSODY-v1.0 Sections 3, 4; SPEC-VOICE-001 D)
+// ---------------------------------------------------------------------------
+//
+// THE MECHANISM THE WHOLE LAYER STANDS ON (Section 3).
+//
+// Piper applies --length_scale to a single text input GLOBALLY: one invocation
+// carries one rate for everything it is given. That is not a limitation to work
+// around, it is the reason today's output sounds metronomic -- a single call
+// per reply is structurally incapable of varying pace within that reply.
+//
+// So the synthesis path changes shape: N short calls instead of one long one,
+// each with its own length_scale, joined with explicit silence. Everything
+// below is that join, and the care it needs.
+
+/**
+ * The default length_scale the ACTIVE VOICE was configured with.
+ *
+ * Section 4.2: "the active voice's default length_scale is the multiplier base;
+ * every profile expresses rate as a relative multiplier against that base,
+ * which keeps the layer voice-agnostic (N2)".
+ *
+ * Read from the voice's own .onnx.json, exactly as voiceSampleRate() reads the
+ * rate from the same file. Hardcoding 1.0 would work for most voices and would
+ * be wrong for any voice tuned slow or fast at training time -- and it would
+ * quietly re-introduce a voice constant into a layer whose whole claim is that
+ * it holds none.
+ *
+ * @param {string} voiceId
+ * @returns {number} The base length_scale; 1 when the config does not say.
+ */
+export function voiceLengthScale(voiceId) {
+  const cached = _lengthScales.get(voiceId);
+  if (cached) return cached;
+
+  let scale = 1;
+  try {
+    const cfg = JSON.parse(readFileSync(join(VOICES_DIR, `${voiceId}.onnx.json`), 'utf8'));
+    const parsed = Number(cfg && cfg.inference && cfg.inference.length_scale);
+    // Bounded for the same reason the sample rate is: a config value outside
+    // this range is a corrupt file, and passing it to Piper produces either
+    // silence or a minutes-long drawl from a one-line reply.
+    if (Number.isFinite(parsed) && parsed >= 0.1 && parsed <= 10) scale = parsed;
+  } catch (err) {
+    // Not a warning. Piper falls back to 1.0 itself when the field is absent,
+    // and most voice configs simply do not carry an inference block, so a
+    // console line here would fire on every healthy synthesis.
+    scale = 1;
+  }
+
+  _lengthScales.set(voiceId, scale);
+  return scale;
+}
+
+/**
+ * A buffer of digital silence.
+ *
+ * Section 4.1's pause tiers are expressed in MILLISECONDS, and this is where
+ * they become samples. Doing the conversion here, against the voice's own rate,
+ * is what makes the pause table sample-rate independent (Section 6): the same
+ * 250 ms is 5512 samples at 22.05 kHz and 4000 at 16 kHz, and neither number
+ * appears anywhere in the configuration.
+ *
+ * @param {number} ms         Duration in milliseconds.
+ * @param {number} sampleRate Samples per second.
+ * @returns {Buffer} Zeroed signed 16-bit mono samples.
+ */
+export function silencePcm(ms, sampleRate) {
+  const duration = Number.isFinite(ms) && ms > 0 ? ms : 0;
+  const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 22050;
+  // Rounded to a whole SAMPLE, then doubled for 16-bit width. Allocating an odd
+  // number of bytes would shift every subsequent sample by one byte and turn
+  // the rest of the reply into noise.
+  const samples = Math.round((duration / 1000) * rate);
+  return Buffer.alloc(samples * 2);
+}
+
+/**
+ * Apply a short linear fade to the start and end of a PCM buffer, in place.
+ *
+ * NON-NEGOTIABLE 7 (SPEC-VOICE-001): "concatenation must not introduce audible
+ * clicks, gaps, or joins in the output."
+ *
+ * A click at a join is not a mixing subtlety, it is arithmetic. Two segments
+ * synthesised independently end and begin at arbitrary sample values, so
+ * butting them together puts a vertical step in the waveform. A step is,
+ * spectrally, a broadband impulse -- the ear hears it as a tick on every single
+ * phrase boundary, which on a forty-phrase reply is forty ticks.
+ *
+ * A few milliseconds of ramp to and from zero removes the step, because both
+ * sides of every join are then exactly zero. Five milliseconds is short enough
+ * to be inaudible as a fade and long enough to cover the impulse.
+ *
+ * @param {Buffer} pcm    Signed 16-bit little-endian mono. Modified in place.
+ * @param {number} fadeMs
+ * @param {number} sampleRate
+ * @returns {Buffer} The same buffer, for chaining.
+ */
+export function applyEdgeFades(pcm, fadeMs, sampleRate) {
+  if (!Buffer.isBuffer(pcm) || pcm.length < 4) return pcm;
+  const ms = Number.isFinite(fadeMs) && fadeMs > 0 ? fadeMs : 0;
+  if (!ms) return pcm;
+
+  const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 22050;
+  const totalSamples = Math.floor(pcm.length / 2);
+  // Never fade more than a third of the segment from each end. A one-word
+  // emphasis unit can be shorter than two fade windows, and fading it twice
+  // over would mute the very word the fades exist to make prominent.
+  const fadeSamples = Math.min(
+    Math.round((ms / 1000) * rate),
+    Math.floor(totalSamples / 3)
+  );
+  if (fadeSamples < 1) return pcm;
+
+  for (let i = 0; i < fadeSamples; i++) {
+    const gain = i / fadeSamples;
+
+    const headOffset = i * 2;
+    pcm.writeInt16LE(Math.round(pcm.readInt16LE(headOffset) * gain), headOffset);
+
+    const tailOffset = (totalSamples - 1 - i) * 2;
+    pcm.writeInt16LE(Math.round(pcm.readInt16LE(tailOffset) * gain), tailOffset);
+  }
+  return pcm;
+}
+
+/**
+ * Join phrase segments with their pauses into one continuous recording.
+ *
+ * @param {Array<{pcm: Buffer, pauseAfterMs: number}>} segments
+ * @param {number} sampleRate
+ * @param {number} fadeMs
+ * @returns {Buffer} One PCM buffer.
+ */
+export function concatPhrasePcm(segments, sampleRate, fadeMs) {
+  const parts = [];
+  for (const segment of segments) {
+    if (!segment || !Buffer.isBuffer(segment.pcm) || !segment.pcm.length) continue;
+    parts.push(applyEdgeFades(segment.pcm, fadeMs, sampleRate));
+    const pause = silencePcm(segment.pauseAfterMs, sampleRate);
+    if (pause.length) parts.push(pause);
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * Run an async worker over a list with a bounded number in flight, preserving
+ * input order in the result.
+ *
+ * Order preservation is not a nicety here: the results ARE the reply, in
+ * sequence. A pool that resolved out of order would deliver a fluent,
+ * confident, scrambled sentence -- the kind of defect that sounds like a
+ * feature until someone listens closely.
+ *
+ * The first rejection aborts: there is no useful partial reply, and letting the
+ * remaining phrases run would spend CPU on audio nobody will hear.
+ *
+ * @param {Array} items
+ * @param {number} limit
+ * @param {(item: any, index: number) => Promise<any>} worker
+ * @returns {Promise<Array>}
+ */
+async function mapWithLimit(items, limit, worker) {
+  const width = Math.max(1, Math.min(limit || 1, items.length || 1));
+  const results = new Array(items.length);
+  let next = 0;
+  let failed = null;
+
+  async function runner() {
+    for (;;) {
+      if (failed) return;
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        results[index] = await worker(items[index], index);
+      } catch (err) {
+        if (!failed) failed = err;
+        return;
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: width }, runner));
+  if (failed) throw failed;
+  return results;
+}
+
+/**
+ * Synthesise a reply through the prosody layer.
+ *
+ * The Section 3 pipeline, in order: register detection and segmentation (both
+ * inside analyse()), one Piper invocation per phrase each with its own
+ * length_scale, concatenation with tiered silence, then the same WAV wrap the
+ * flat path uses.
+ *
+ * FAILURE FALLS BACK RATHER THAN FAILING THE TURN. Non-negotiable 5
+ * (SPEC-VOICE-001): "the default path must remain functional even if the
+ * prosody layer or streaming fails. Failure in the layer falls back cleanly to
+ * the current working single-call synthesis." The caller gets that behaviour by
+ * construction -- this function reports which path produced the audio, so a
+ * fallback is visible in the logs rather than silent.
+ *
+ * @param {{text: string, voice: string, speed?: number, config?: object}} opts
+ * @returns {Promise<{wav: Buffer, path: string, analysis: object, sampleRate: number}>}
+ */
+export async function synthesizeProsody(opts) {
+  const o = opts || {};
+  const text = String(o.text || '');
+  if (!text.trim()) {
+    const err = new Error('No text to synthesise.');
+    err.code = 'empty_text';
+    throw err;
+  }
+
+  const permit = voicePermitted(o.voice);
+  if (!permit.ok) {
+    const err = new Error(permit.message);
+    err.code = permit.reason;
+    throw err;
+  }
+
+  const cfg = o.config || prosodyConfig();
+  const sampleRate = voiceSampleRate(o.voice);
+  const analysis = analyse(text, {
+    baseLengthScale: voiceLengthScale(o.voice),
+    speed: o.speed,
+    config: cfg,
+  });
+
+  // A reply the segmenter reduced to nothing -- punctuation only, or an empty
+  // markdown artefact. The flat path handles it identically, so hand it there
+  // rather than returning a zero-length WAV.
+  if (!analysis.phrases.length) {
+    const pcm = await synthesizePcm({
+      text, voice: o.voice,
+      lengthScale: (Number.isFinite(o.speed) && o.speed > 0) ? (1 / o.speed) : undefined,
+    });
+    return { wav: wrapPcmAsWav(pcm, sampleRate), path: 'flat_no_phrases',
+             analysis, sampleRate };
+  }
+
+  const rendered = await mapWithLimit(
+    analysis.phrases, TTS_PHRASE_CONCURRENCY,
+    async (phrase) => ({
+      pcm: await synthesizePcm({
+        text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
+      }),
+      pauseAfterMs: phrase.pauseAfterMs,
+    })
+  );
+
+  const pcm = concatPhrasePcm(rendered, sampleRate, cfg.joinFadeMs);
+  if (!pcm.length) {
+    const err = new Error('The prosody layer produced no audio.');
+    err.code = 'tts_failed';
+    throw err;
+  }
+
+  return { wav: wrapPcmAsWav(pcm, sampleRate), path: 'prosody', analysis, sampleRate };
+}
+
+/**
+ * Synthesise a reply phrase by phrase, handing each one to a callback the
+ * moment it is ready.
+ *
+ * SPEC-VOICE-001 Component D, overlap 1: "once the full text exists, synthesise
+ * phrase 1, start playing it, synthesise phrase 2 while phrase 1 plays. Audio
+ * starts after one phrase's worth of synthesis instead of the whole reply's."
+ *
+ * The callback receives phrases IN ORDER even though several are synthesised
+ * concurrently, because playback is a sequence and delivering phrase 3 before
+ * phrase 2 would reorder the sentence. Concurrency buys the overlap; the
+ * ordered emit keeps the reply intelligible.
+ *
+ * @param {{text: string, voice: string, speed?: number, config?: object}} opts
+ * @param {(segment: {index: number, total: number, pcm: Buffer, pauseAfterMs: number, profile: string, lengthScale: number, sampleRate: number}) => Promise<void>|void} onSegment
+ * @returns {Promise<{phrases: number, bytes: number, sampleRate: number}>}
+ */
+export async function synthesizeProsodyStream(opts, onSegment) {
+  const o = opts || {};
+  const text = String(o.text || '');
+  if (!text.trim()) {
+    const err = new Error('No text to synthesise.');
+    err.code = 'empty_text';
+    throw err;
+  }
+
+  const permit = voicePermitted(o.voice);
+  if (!permit.ok) {
+    const err = new Error(permit.message);
+    err.code = permit.reason;
+    throw err;
+  }
+
+  const cfg = o.config || prosodyConfig();
+  const sampleRate = voiceSampleRate(o.voice);
+  const analysis = analyse(text, {
+    baseLengthScale: voiceLengthScale(o.voice),
+    speed: o.speed,
+    config: cfg,
+  });
+
+  const phrases = analysis.phrases.length
+    ? analysis.phrases
+    // Same degenerate case as synthesizeProsody: speak it flat rather than
+    // return silence.
+    : [{ text, lengthScale: (Number.isFinite(o.speed) && o.speed > 0) ? (1 / o.speed) : 1,
+         pauseAfterMs: 0, profile: 'neutral' }];
+
+  const total = phrases.length;
+  let emitted = 0;
+  let bytes = 0;
+
+  /* Results arrive out of order from the pool and must LEAVE in order, so
+   * completed-but-not-yet-emitted phrases are parked here until their turn.
+   * Bounded by the pool width, so this cannot grow with reply length. */
+  const pending = new Map();
+
+  async function drain() {
+    while (pending.has(emitted)) {
+      const segment = pending.get(emitted);
+      pending.delete(emitted);
+      emitted++;
+      bytes += segment.pcm.length;
+      await onSegment(segment);
+    }
+  }
+
+  await mapWithLimit(phrases, TTS_PHRASE_CONCURRENCY, async (phrase, index) => {
+    const pcm = await synthesizePcm({
+      text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
+    });
+    pending.set(index, {
+      index, total,
+      pcm: applyEdgeFades(pcm, cfg.joinFadeMs, sampleRate),
+      pauseAfterMs: phrase.pauseAfterMs,
+      profile: phrase.profile,
+      lengthScale: phrase.lengthScale,
+      sampleRate,
+    });
+    await drain();
+  });
+
+  // Anything the pool finished after the last drain. Reached when the final
+  // phrase completes before an earlier one it was waiting on.
+  await drain();
+
+  return { phrases: total, bytes, sampleRate };
+}
+
+/**
+ * Is the prosody layer available on this connector?
+ *
+ * Reported by /voice/health so a UI can decide whether to render the A/B
+ * control at all, rather than rendering it and discovering on first press that
+ * the connector was deployed with the layer switched off.
+ *
+ * @returns {{enabled: boolean, phrase_concurrency: number, config: object}}
+ */
+export function prosodyState() {
+  const cfg = prosodyConfig();
+  return {
+    enabled: cfg.enabled,
+    phrase_concurrency: TTS_PHRASE_CONCURRENCY,
+    // Tuning values, deliberately exposed: Section 4.1 makes them "config data,
+    // not code", and an operator tuning by ear needs to see what is live rather
+    // than infer it from which variables they remember setting.
+    config: cfg,
+  };
+}
+
+/**
+ * Warm the resident Piper worker at boot (PIPER-PRELOAD-v1.1 Section 5).
+ *
+ * "When voiceEnabled() and at least one voice is installed, spawn the worker
+ * and load the default voice at boot, so the first utterance is already warm.
+ * This is gated on the same master switch, so Section 7 holds: with voice off,
+ * no process exists."
+ *
+ * Both halves of that gate are enforced here:
+ *
+ *   - voiceEnabled() is checked, so a connector with voice off spawns nothing
+ *     and A7 remains verifiable from the process list.
+ *   - a voice must actually be installed, because warming a worker with no
+ *     model to load holds a process for no benefit.
+ *
+ * probeEngines() is deliberately NOT called. It stays lazy exactly as Section 5
+ * requires, so a health probe from a caller who cannot use voice still never
+ * triggers a model load. This is a separate, gate-gated step.
+ *
+ * Never throws. A boot must not fail because a model did not load.
+ *
+ * @param {string} [voiceId] Defaults to the first installed voice.
+ * @returns {Promise<boolean>} Whether the worker came up warm.
+ */
+export async function prewarmTts(voiceId) {
+  if (!voiceEnabled()) return false;
+
+  const installed = installedVoices();
+  if (!installed.length) return false;
+
+  // An explicitly named voice must be one that is actually present; falling
+  // back to "the first installed" on a typo would warm a voice nobody asked
+  // for and hide the mistake.
+  const voice = voiceId && installed.includes(voiceId) ? voiceId : installed[0];
+
+  try {
+    return await prewarmWorker(join(VOICES_DIR, `${voice}.onnx`));
+  } catch (err) {
+    console.error(`[voice] pre-warm failed for ${voice}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Warm the resident STT worker at boot (Section 6).
+ *
+ * Separate from prewarmTts() because the two are separately configurable and
+ * separately failable: an instance may hold Whisper resident and not Piper, or
+ * the reverse, and a single combined pre-warm would make one engine's missing
+ * model look like the other's failure.
+ *
+ * Gated on voiceEnabled() for the same reason prewarmTts() is: with the master
+ * switch off, no process exists (A7). Never throws.
+ *
+ * @returns {Promise<boolean>}
+ */
+export async function prewarmStt() {
+  if (!voiceEnabled()) return false;
+  try {
+    return await prewarmSttWorker({ model: STT_TIER, modelDir: MODEL_DIR });
+  } catch (err) {
+    console.error(`[voice] stt pre-warm failed: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * The resident STT worker's state, for /voice/health.
+ *
+ * @returns {object}
+ */
+export function sttWorkerHealth() {
+  return sttWorkerState();
+}
+
+/**
+ * The resident worker's state, for /voice/health.
+ *
+ * A2 is asserted against this: two consecutive requests reusing one process
+ * show the same `pid` and `warm: true`.
+ *
+ * @returns {object}
+ */
+export function ttsWorkerState() {
+  return workerState();
+}
+
 export default {
   probeEngines, engineState, resetEngineState, transcribe, synthesize,
-  installedVoices, wrapPcmAsWav, voiceSampleRate, describeFailure, config,
+  synthesizePcm, synthesizeProsody, synthesizeProsodyStream,
+  installedVoices, wrapPcmAsWav, voiceSampleRate, voiceLengthScale,
+  silencePcm, applyEdgeFades, concatPhrasePcm,
+  describeFailure, prosodyState, prewarmTts, ttsWorkerState,
+  prewarmStt, sttWorkerHealth, config,
 };
