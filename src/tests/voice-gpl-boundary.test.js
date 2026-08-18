@@ -200,19 +200,29 @@ test('the two default interpreters cannot collapse to one path', () => {
   const piper = code(join(VOICE_DIR, 'piper-worker-supervisor.js'));
   const stt = code(join(VOICE_DIR, 'stt-worker-supervisor.js'));
 
-  // Both fall back to the bare string 'python3' when unset, which resolves via
-  // PATH -- and if that were the whole story the two workers WOULD share an
-  // interpreter on a default deployment.
+  // THIS TEST PREVIOUSLY PASSED WHILE DESCRIBING A DEFECT.
   //
-  // It is not the whole story: the Piper supervisor prefers the venv inside
-  // VOICE_PIPER_DIR and only falls back to PATH when that venv is absent, and
-  // when it is absent the worker cannot import piper anyway, so it never
-  // starts and the CLI path serves synthesis. The bare-python3 case is
-  // therefore a state in which the GPL worker does not run at all.
+  // Its earlier comment argued that the Piper supervisor falling back to a bare
+  // 'python3' was harmless, because "when the venv is absent the worker cannot
+  // import piper anyway, so it never starts and the CLI path serves
+  // synthesis". Both halves of that were false in production: the worker DID
+  // start on the system interpreter, reported ready, and then failed every
+  // synthesis with ModuleNotFoundError -- and the failure did not fall back.
+  //
+  // The reasoning was doing the work an assertion should have done. It is kept
+  // here as a marker, because a test that explains away the behaviour it is
+  // meant to constrain is worse than no test: it makes the next reader confident.
+  //
+  // The fix is that there is no guess at all now. An unresolved interpreter is
+  // an empty string, the supervisor declines to spawn, and synthesis uses the
+  // CLI path -- which drives the piper BINARY and is unaffected.
   assert.ok(piper.includes("join(dir, 'venv', 'bin', 'python3')"),
-    'the Piper worker prefers its own venv, not the system interpreter');
-  assert.ok(/existsSync\(venv\) \? venv : 'python3'/.test(piper),
-    'and only falls back when that venv does not exist');
+    'the Piper worker looks for its own venv');
+  assert.ok(/existsSync\(venv\) \? venv : ''/.test(piper),
+    'and resolves to NOTHING rather than the system interpreter when it is absent');
+  assert.ok(!/:\s*'python3'/.test(piper),
+    'the Piper supervisor must never default to the system interpreter: it is '
+    + 'the one interpreter we can be sure does not have piper installed');
   assert.ok(!stt.includes("'venv'"),
     'the STT worker uses the interpreter that already runs voice_stt.py');
 });

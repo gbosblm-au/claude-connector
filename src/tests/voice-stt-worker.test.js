@@ -91,11 +91,24 @@ test('transcribe tries the worker first and falls through to the spawn', () => {
 test('an unavailable worker falls back; a refusal does not', () => {
   // Retrying a refusal on the spawn reaches the same refusal more slowly, which
   // helps nobody and doubles the model load on a cold cache.
-  assert.ok(shared.includes("const infrastructure = ['worker_unavailable', 'worker_gone', 'worker_timeout'];"),
-    'infrastructure failures resolve to null');
   const call = shared.slice(shared.indexOf('async function call('));
-  assert.ok(call.includes('return null;'), 'null means "use the per-request path"');
-  assert.ok(call.includes('throw err;'), 'a refusal propagates');
+  assert.ok(/if \(refusals\.includes\(err\.code\)\) throw err;/.test(call),
+    'only the codes the caller named as refusals propagate');
+  assert.ok(call.includes('return null;'), 'everything else means "use the per-request path"');
+
+  // A missing or broken faster-whisper must NOT be a refusal: it can be true of
+  // the worker while the per-request spawn -- a different interpreter
+  // invocation entirely -- succeeds.
+  const supervisor = readFileSync(join(SRC, 'voice', 'stt-worker-supervisor.js'), 'utf8');
+  const refusals = /refusals:\s*\(\)\s*=>\s*\[([^\]]*)\]/.exec(supervisor);
+  assert.ok(refusals, 'the STT supervisor declares its refusals');
+  for (const code of ['stt_failed', 'model_load_failed', 'stt_unavailable']) {
+    assert.ok(!refusals[1].includes(code), `${code} must fall back, not fail the turn`);
+  }
+  // And the ones that genuinely would be refused identically by the spawn.
+  for (const code of ['unsupported_model', 'audio_missing']) {
+    assert.ok(refusals[1].includes(code), `${code} should not be retried on the spawn`);
+  }
 });
 
 test('the worker flag reverts transcription to the previous behaviour', () => {

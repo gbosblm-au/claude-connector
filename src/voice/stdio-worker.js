@@ -121,6 +121,21 @@ function installReaper() {
   if ('function' === typeof process.setMaxListeners) process.setMaxListeners(0);
 }
 
+/**
+ * @typedef {object} StdioWorkerSpec
+ * @property {string}   name        For logs.
+ * @property {Function} interpreter Resolves the interpreter path.
+ * @property {Function} script      Resolves the worker script path.
+ * @property {Function} enabled     Whether this worker is switched on.
+ * @property {Function} [env]       Extra environment for the child.
+ * @property {Function} [args]      Extra argv for the child.
+ * @property {Function} [refusals]  Error codes that must NOT fall back --
+ *        the ones the per-request path would reject identically, so retrying
+ *        there only reaches the same answer more slowly. Everything else falls
+ *        back. See call() for why this is a refusal list and not an
+ *        infrastructure list.
+ */
+
 export function createStdioWorker(spec) {
   const state = {
     child: null,
@@ -137,6 +152,10 @@ export function createStdioWorker(spec) {
     idleTimer: null,
     restarts: 0,
     lastError: null,
+    // Set when the worker diagnosed itself as structurally unable to serve --
+    // a missing engine, not a transient crash. Retrying that on a schedule
+    // achieves nothing but log noise.
+    fatal: false,
     disabledUntil: 0,
     startedAt: null,
     requestsServed: 0,
@@ -176,6 +195,62 @@ export function createStdioWorker(spec) {
    *
    * @param {string} reason
    */
+  /**
+   * Keep the event loop alive while this worker has work outstanding.
+   *
+   * THE OTHER HALF OF THE unref FIX, AND IT IS NOT OPTIONAL.
+   *
+   * Unreferencing the child stopped an idle worker holding the process open,
+   * which was the bug it was written for. But it went too far: with the child
+   * and all three pipes unreferenced, NOTHING held the loop while a request was
+   * in flight, so node could decide it had run out of work and exit while a
+   * synthesis was still being awaited. The caller's promise then simply never
+   * settled -- no error, no timeout, no log line.
+   *
+   * In the server that never happens, because the HTTP listener holds the loop
+   * open regardless. It is invisible there and fatal anywhere else, which is
+   * the same trap as the original defect wearing the opposite face.
+   *
+   * So the reference tracks BUSYNESS rather than existence, which is what was
+   * meant all along: an idle worker is not a reason to keep running, and a
+   * worker mid-request is.
+   *
+   * @returns {void}
+   */
+  function holdLoop() {
+    const child = state.child;
+    if (!child) return;
+    try {
+      child.ref();
+      // Only stdout matters for liveness -- it is the channel a response
+      // arrives on -- but stderr carries the diagnosis when a worker dies
+      // mid-request, and losing that is how a failure becomes a mystery.
+      if (child.stdout) child.stdout.ref();
+      if (child.stderr) child.stderr.ref();
+    } catch (err) { /* already gone */ }
+  }
+
+  /**
+   * Let the process exit if this worker is the only thing left.
+   *
+   * Called when the last outstanding operation settles, and only then: a
+   * release while another request is still pending would reintroduce the hang
+   * holdLoop() exists to prevent.
+   *
+   * @returns {void}
+   */
+  function releaseLoop() {
+    const child = state.child;
+    if (!child) return;
+    if (state.starting || state.pending.size) return;
+    try {
+      child.unref();
+      if (child.stdout) child.stdout.unref();
+      if (child.stderr) child.stderr.unref();
+      if (child.stdin) child.stdin.unref();
+    } catch (err) { /* already gone */ }
+  }
+
   function teardown(reason) {
     if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
 
@@ -230,7 +305,18 @@ export function createStdioWorker(spec) {
       state.capabilities = Object.assign({}, state.capabilities, message.capabilities);
     }
 
-    if ('ready' === message.type) {
+      // The worker has diagnosed itself as unable to serve and is exiting. Its
+    // reason is far more useful than the exit code the close handler would
+    // otherwise report, so it is captured before the process goes.
+    if ('fatal' === message.type) {
+      state.lastError = `${spec.name} worker cannot start: `
+        + `${message.error || message.code || 'no reason given'}`;
+      console.error(`[voice] ${state.lastError}`);
+      state.fatal = true;
+      return;
+    }
+
+  if ('ready' === message.type) {
       state.ready = true;
       state.protocol = message.protocol;
       state.pid = message.pid;
@@ -259,9 +345,20 @@ export function createStdioWorker(spec) {
    */
   function backOff() {
     state.restarts++;
-    const wait = Math.min(120_000, 2000 * Math.pow(2, Math.min(state.restarts - 1, 10)));
+
+    // A FATAL diagnosis goes straight to the ceiling. Exponential backoff is
+    // for a worker that might come back -- a crash under load, a transient
+    // resource shortage. A worker whose interpreter cannot import its engine
+    // will fail identically on every attempt until someone changes the
+    // deployment, so climbing 2s, 4s, 8s through that is pure log noise around
+    // a fallback that is already working.
+    const wait = state.fatal
+      ? 120_000
+      : Math.min(120_000, 2000 * Math.pow(2, Math.min(state.restarts - 1, 10)));
     state.disabledUntil = Date.now() + wait;
-    console.error(`[voice] ${spec.name} worker start failed ${state.restarts} time(s); `
+
+    console.error(`[voice] ${spec.name} worker start failed ${state.restarts} time(s)`
+      + `${state.fatal ? ' (fatal: the engine is not installed for this interpreter)' : ''}; `
       + `next attempt in ${Math.round(wait / 1000)}s (the per-request path is serving)`);
   }
 
@@ -307,6 +404,21 @@ export function createStdioWorker(spec) {
         .concat('function' === typeof spec.args ? spec.args() : [])
         .concat(extraArgs || []);
 
+      // An unresolved interpreter is a decline, not a spawn. spawn('') fails
+      // asynchronously with a confusing ENOENT, and spawning the WRONG
+      // interpreter is worse still: it starts, looks healthy, and fails every
+      // request. See piperPython() for how that actually happened.
+      if (!interpreter) {
+        state.lastError = `no interpreter is configured for the ${spec.name} worker; `
+          + 'using the per-request path';
+        console.error(`[voice] ${state.lastError}`);
+        backOff();
+        state.starting = null;
+        releaseLoop();
+        resolve(false);
+        return;
+      }
+
       let child;
       try {
         child = spawn(interpreter, args, {
@@ -331,6 +443,7 @@ export function createStdioWorker(spec) {
         console.error(`[voice] ${state.lastError}`);
         backOff();
         state.starting = null;
+        releaseLoop();
         resolve(false);
         return;
       }
@@ -361,10 +474,9 @@ export function createStdioWorker(spec) {
       installReaper();
       LIVE_WORKERS.add(child);
 
-      child.unref();
-      if (child.stdout) child.stdout.unref();
-      if (child.stderr) child.stderr.unref();
-      if (child.stdin) child.stdin.unref();
+      // Unreferenced to begin with, then referenced again whenever there is
+      // work outstanding. See holdLoop().
+      releaseLoop();
 
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk) => {
@@ -400,6 +512,7 @@ export function createStdioWorker(spec) {
         teardown(err.message);
         backOff();
         state.starting = null;
+        releaseLoop();
         resolve(false);
       });
 
@@ -415,6 +528,7 @@ export function createStdioWorker(spec) {
         teardown(`exit ${code}`);
         if (!wasReady) backOff();
         state.starting = null;
+        releaseLoop();
         resolve(false);
       });
 
@@ -426,21 +540,29 @@ export function createStdioWorker(spec) {
       // working one. A missing import takes a moment to fail and would
       // otherwise be discovered by the first user request.
       const deadline = Date.now() + startMs();
+      holdLoop();
+
       const poll = setInterval(() => {
         if (state.ready) {
           clearInterval(poll);
           state.restarts = 0;
           state.disabledUntil = 0;
           state.lastError = null;
+          // Cleared on a SUCCESSFUL start, so a deployment that installs the
+          // missing engine recovers on the next attempt instead of staying
+          // marked fatal for the life of the process.
+          state.fatal = false;
           console.log(`[voice] ${spec.name} worker ready (pid=${state.pid})`);
           armIdleTimer();
           state.starting = null;
+          releaseLoop();
           resolve(true);
           return;
         }
         if (!state.child) {          // died while we waited
           clearInterval(poll);
           state.starting = null;
+          releaseLoop();
           resolve(false);
           return;
         }
@@ -452,6 +574,7 @@ export function createStdioWorker(spec) {
           teardown('ready timeout');
           backOff();
           state.starting = null;
+          releaseLoop();
           resolve(false);
         }
       }, 100);
@@ -480,11 +603,33 @@ export function createStdioWorker(spec) {
       const id = state.nextId++;
       const limit = limitMs || timeoutMs();
 
-      // Unreferenced for the same reason as the child itself: a request in
-      // flight is work the CALLER is awaiting, and the caller's own lifetime is
-      // what should hold the loop open, not our watchdog.
-      const timer = setTimeout(() => {
+      // ONE EXIT FOR EVERY OUTCOME.
+      //
+      // A request can end four ways: a response arrives, the worker dies, the
+      // deadline passes, or the write itself fails. Each must delete the
+      // pending entry, clear the timer and release the loop reference, and an
+      // earlier revision had three of those four doing it by hand -- so two
+      // paths deleted the entry but never released the reference, and a single
+      // timeout would pin the process open for good.
+      //
+      // Routing all four through one wrapper means a fifth outcome added later
+      // cannot forget a step. `settled` guards against a double settle, which
+      // is reachable: a worker can answer a request in the same tick its
+      // deadline expires.
+      let settled = false;
+      let timer = null;
+      const settle = (fn) => (value) => {
+        if (settled) return;
+        settled = true;
         state.pending.delete(id);
+        if (timer) clearTimeout(timer);
+        releaseLoop();
+        fn(value);
+      };
+      const finish = settle(resolve);
+      const fail = settle(reject);
+
+      timer = setTimeout(() => {
         // A worker that missed a deadline is presumed WEDGED, not slow. Leaving
         // it in place would make every subsequent request wait the full timeout
         // too; restarting costs one model load and restores the feature.
@@ -492,21 +637,23 @@ export function createStdioWorker(spec) {
         teardown('request timeout');
         const err = new Error(`the ${spec.name} worker did not answer within ${limit}ms`);
         err.code = 'worker_timeout';
-        reject(err);
+        fail(err);
       }, limit);
 
+      // Unreferenced for the same reason the idle child is: the watchdog for a
+      // request is not itself a reason to keep the process alive. holdLoop()
+      // below is what holds it, and it is released by settle().
       if ('function' === typeof timer.unref) timer.unref();
 
-      state.pending.set(id, { resolve, reject, timer });
+      state.pending.set(id, { resolve: finish, reject: fail, timer });
+      holdLoop();
 
       try {
         state.child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`);
       } catch (err) {
-        state.pending.delete(id);
-        clearTimeout(timer);
         const writeErr = new Error(`could not write to the ${spec.name} worker: ${err.message}`);
         writeErr.code = 'worker_unavailable';
-        reject(writeErr);
+        fail(writeErr);
       }
     });
   }
@@ -539,13 +686,36 @@ export function createStdioWorker(spec) {
     try {
       response = await request(payload, o.timeoutMs);
     } catch (err) {
-      const infrastructure = ['worker_unavailable', 'worker_gone', 'worker_timeout'];
-      if (infrastructure.includes(err.code)) {
-        console.error(`[voice] ${spec.name} worker unavailable (${err.code}); `
-          + 'using the per-request path');
-        return null;
-      }
-      throw err;
+      // FALL BACK BY DEFAULT. REJECT ONLY WHAT THE PER-REQUEST PATH WOULD ALSO
+      // REJECT.
+      //
+      // This was originally the other way round -- an allowlist of three
+      // "infrastructure" codes fell back and everything else threw -- and it
+      // was wrong in production within a day. A worker whose interpreter could
+      // not `import piper` returned the generic `synthesis_failed`, which was
+      // not on that list, so it propagated as a 500 and the CLI path was never
+      // tried. Voice was down while a working fallback sat one branch away.
+      //
+      // The asymmetry of the two mistakes is the whole argument:
+      //
+      //   Fall back when we should have thrown  -> one wasted retry, then the
+      //                                            same clear error. Costs a
+      //                                            second.
+      //   Throw when we should have fallen back -> the feature is down, and
+      //                                            the log names a Python
+      //                                            module rather than the
+      //                                            fallback that did not run.
+      //
+      // So the default must be to fall back, and every code that skips the
+      // fallback has to be named deliberately by the caller. A code nobody
+      // anticipated -- which is exactly what a novel failure is -- now degrades
+      // instead of failing the turn.
+      const refusals = ('function' === typeof spec.refusals ? spec.refusals() : []) || [];
+      if (refusals.includes(err.code)) throw err;
+
+      console.error(`[voice] ${spec.name} worker could not serve this (${err.code
+        || 'unknown'}); using the per-request path`);
+      return null;
     }
 
     state.lastUsedAt = Date.now();
@@ -589,6 +759,10 @@ export function createStdioWorker(spec) {
       in_flight: state.pending.size,
       uptime_ms: state.startedAt ? Date.now() - state.startedAt : 0,
       last_error: state.lastError,
+      // True when the engine is structurally unavailable to this worker's
+      // interpreter. Distinguished from last_error because it is the one state
+      // an operator must ACT on -- everything else self-heals.
+      fatal: state.fatal,
       interpreter: spec.interpreter(),
       worker_script: spec.script,
     }, 'function' === typeof spec.meta ? spec.meta() : (spec.meta || {}));
@@ -600,6 +774,7 @@ export function createStdioWorker(spec) {
     state.restarts = 0;
     state.disabledUntil = 0;
     state.lastError = null;
+    state.fatal = false;
     state.requestsServed = 0;
     state.nextId = 1;
     state.capabilities = null;

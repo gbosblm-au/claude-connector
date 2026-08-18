@@ -477,6 +477,26 @@ def serve(state):
     A closed stdin is the supervisor going away, and the correct response is to
     exit rather than to linger holding a model.
     """
+    # PROVE THE ENGINE IS IMPORTABLE BEFORE CLAIMING READY.
+    #
+    # This used to report ready the moment the process started, deferring the
+    # import to the first request. The result in production was a log reading
+    # "piper worker ready (pid=123)" followed immediately by ModuleNotFoundError
+    # on every synthesis -- a worker advertising a capability it did not have,
+    # and a supervisor with no reason to doubt it.
+    #
+    # Failing here instead makes the supervisor treat it as a failed START,
+    # which is a state it already handles correctly: back off, stop retrying,
+    # and let synthesis use the CLI path. One clear failure at startup beats an
+    # unbounded series of 500s that each look like a synthesis bug.
+    try:
+        state.ensure_imported()
+    except Exception as err:  # noqa: BLE001
+        _log("cannot import piper: %s: %s" % (type(err).__name__, err))
+        _stdout_line({"type": "fatal", "code": "piper_import_failed",
+                      "error": "%s: %s" % (type(err).__name__, err)})
+        return 1
+
     _stdout_line({"type": "ready", "protocol": PROTOCOL_VERSION, "pid": os.getpid(),
                   # The adapter is not known until a voice is loaded, so at this
                   # point capabilities carries only what is knowable. It is

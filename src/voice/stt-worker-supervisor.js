@@ -122,6 +122,13 @@ const worker = createStdioWorker({
   }),
   args: () => ['--resident', sttWorkerResident() ? 'true' : 'false'],
   enabled: sttWorkerEnabled,
+
+  // Only what the per-request spawn would refuse identically. `stt_failed`,
+  // `model_load_failed` and a missing faster_whisper are deliberately absent:
+  // those can be true of the worker while the spawn succeeds, and the spawn is
+  // the thing we fall back TO.
+  refusals: () => ['unsupported_model', 'audio_missing', 'unknown_op',
+                   'bad_request'],
   timeoutMs: requestTimeoutMs,
   // Whisper is the larger model of the two, so it is released sooner by
   // default. On an instance holding both, this is the one whose idle footprint

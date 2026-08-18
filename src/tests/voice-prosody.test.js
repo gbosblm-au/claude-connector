@@ -659,10 +659,29 @@ test('A5: disabling the worker by flag reverts to the CLI path', () => {
 
 test('A4: an unavailable worker routes to the CLI path, a refusal does not', () => {
   const src = source('voice/stdio-worker.js');
-  assert.ok(src.includes("const infrastructure = ['worker_unavailable', 'worker_gone', 'worker_timeout'];"),
-    'infrastructure failures fall back');
-  assert.ok(src.includes('throw err;'),
-    'request-level refusals propagate rather than being retried slowly');
+
+  // FALL BACK BY DEFAULT, REJECT ONLY WHAT IS NAMED.
+  //
+  // This originally asserted an allowlist of three "infrastructure" codes that
+  // fell back, with everything else throwing. That shipped and took voice down:
+  // a worker that could not `import piper` returned the generic
+  // `synthesis_failed`, which was not on the list, so it became a 500 and the
+  // CLI path was never tried.
+  assert.ok(/const refusals = \('function' === typeof spec\.refusals/.test(src),
+    'the caller names the codes that must NOT fall back');
+  assert.ok(/if \(refusals\.includes\(err\.code\)\) throw err;/.test(src),
+    'and only those throw');
+  assert.ok(/return null;/.test(src.slice(src.indexOf('const refusals'))),
+    'everything else degrades to the per-request path');
+
+  // The specific regression: a generic engine failure must NOT be a refusal.
+  const piper = source('voice/piper-worker-supervisor.js');
+  const refusals = /refusals:\s*\(\)\s*=>\s*\[([^\]]*)\]/.exec(piper);
+  assert.ok(refusals, 'the Piper supervisor declares its refusals');
+  for (const code of ['synthesis_failed', 'piper_import_failed', 'model_load_failed']) {
+    assert.ok(!refusals[1].includes(code),
+      `${code} must fall back: it can be true of the worker while the CLI binary works`);
+  }
   // And the Piper side still reads a null answer as "use the CLI path".
   const engines = source('voice/voice-engines.js');
   assert.ok(engines.includes('if (viaWorker) {'),
@@ -759,4 +778,71 @@ test('the worker returns raw PCM, never a WAV per phrase', () => {
   const supervisor = source('voice/piper-worker-supervisor.js');
   assert.ok(supervisor.includes('pcm.length % 2 !== 0'),
     'an odd byte count is treated as a fault and falls back');
+});
+
+// ===========================================================================
+// REGRESSION: the production failure of 2026-08-18
+//
+//   [voice] piper worker ready (pid=123)
+//   [voice] tts_failed: ModuleNotFoundError: No module named 'piper'
+//   [voice] tts_error code=synthesis_failed status=500
+//
+// A worker whose interpreter could not import piper started, ANNOUNCED ITSELF
+// READY, and then failed every synthesis as a 500 -- while a working CLI
+// fallback sat one branch away and was never tried.
+//
+// Run against the real supervisor with a real interpreter that has no piper,
+// because every structural assertion in this file passed while this was broken.
+// ===========================================================================
+
+test('REGRESSION: an interpreter without piper falls back instead of 500ing', async () => {
+  const { spawnSync } = await import('node:child_process');
+
+  // A system python3 is exactly the interpreter that will not have piper --
+  // which is the whole point, and is what the deployment accidentally used.
+  const probe = spawnSync('python3', ['-c', 'import piper'], { encoding: 'utf8' });
+  if (0 === probe.status) return;   // piper IS installed here; nothing to prove
+
+  const script = `
+    process.env.VOICE_PIPER_PYTHON = 'python3';
+    process.env.VOICE_TTS_WORKER_ENABLED = 'true';
+    const m = await import(${JSON.stringify(join(SRC, 'voice', 'piper-worker-supervisor.js'))});
+    let verdict;
+    try {
+      const r = await m.synthesizeViaWorker({ text: 'hi', modelPath: '/tmp/none.onnx' });
+      verdict = (null === r) ? 'FELL_BACK' : 'RETURNED_VALUE';
+    } catch (err) {
+      verdict = 'THREW:' + err.code;
+    }
+    console.log(verdict + '|fatal=' + m.workerState().fatal);
+  `;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script],
+                      { encoding: 'utf8', timeout: 90_000 });
+
+  // The process must also EXIT. An unsettled promise here would mean the
+  // busy-tracking reference leaked, which was the second-order bug the unref
+  // fix introduced and which presents as a test that simply never finishes.
+  assert.equal(r.status, 0, `the supervisor did not exit cleanly: ${r.stderr}`);
+  assert.ok(!/unsettled top-level await/.test(r.stderr || ''),
+    'the request settled rather than leaving the loop with nothing to do');
+
+  assert.match(r.stdout, /FELL_BACK/,
+    'a missing engine must resolve to null so synthesis uses the CLI path, '
+    + `not throw a 500. Got: ${r.stdout.trim()}`);
+  assert.match(r.stdout, /fatal=true/,
+    'and the state is reported as fatal, so an operator can see it needs action');
+});
+
+test('REGRESSION: a worker is not "ready" until the engine imports', () => {
+  const worker = readFileSync(join(SRC, 'voice', 'piper_worker.py'), 'utf8');
+  const serve = worker.slice(worker.indexOf('def serve('));
+  const readyAt = serve.indexOf('"type": "ready"');
+  const importAt = serve.indexOf('state.ensure_imported()');
+
+  assert.ok(importAt !== -1, 'serve() verifies the import');
+  assert.ok(importAt < readyAt,
+    'the import is verified BEFORE ready is announced -- otherwise the log reads '
+    + '"worker ready" immediately above ModuleNotFoundError, which is what it did');
+  assert.ok(serve.includes('"type": "fatal"'),
+    'and it reports a fatal line the supervisor can act on');
 });

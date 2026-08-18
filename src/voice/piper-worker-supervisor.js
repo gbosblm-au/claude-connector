@@ -84,7 +84,19 @@ function piperPython() {
   if (explicit) return explicit;
   const dir = env('VOICE_PIPER_DIR', '/data/voice/piper');
   const venv = join(dir, 'venv', 'bin', 'python3');
-  return existsSync(venv) ? venv : 'python3';
+  // EMPTY, NOT 'python3', WHEN THE VENV IS ABSENT.
+  //
+  // This previously fell back to the bare system interpreter, which is very
+  // nearly the worst possible guess: the system python is the one interpreter
+  // we can be confident does NOT have piper installed, because piper lives in
+  // its own directory precisely to keep the GPL dependency out of everything
+  // else. So the fallback reliably spawned a worker that started cleanly,
+  // reported ready, and then failed every request with ModuleNotFoundError.
+  //
+  // A guess that is wrong by construction is worse than no guess. Returning
+  // empty makes startWorker decline, and synthesis uses the CLI path -- which
+  // drives the piper BINARY and is unaffected by any of this.
+  return existsSync(venv) ? venv : '';
 }
 
 /** Section 10: default true. */
@@ -114,6 +126,17 @@ const worker = createStdioWorker({
   },
   args: () => ['--resident-voices', String(residentVoices())],
   enabled: workerEnabled,
+
+  // Codes that must NOT fall back to the CLI spawn, because the CLI spawn
+  // would reject them identically. Everything else degrades (see call()).
+  //
+  // Note what is deliberately ABSENT: synthesis_failed, piper_import_failed,
+  // model_load_failed, no_audio. Every one of those can be true of the resident
+  // worker while the CLI binary works perfectly -- they are different programs
+  // reaching Piper by different routes, and the Python module being missing
+  // says nothing about the binary.
+  refusals: () => ['empty_text', 'invalid_length_scale', 'no_model_path',
+                   'unknown_op', 'bad_request'],
   timeoutMs: () => intEnv('VOICE_TTS_WORKER_TIMEOUT_MS', 60_000, 1000, 600_000),
   idleMs: () => intEnv('VOICE_TTS_WORKER_IDLE_MS', 300_000, 0, 24 * 3600_000),
   startMs: () => intEnv('VOICE_TTS_WORKER_START_MS', 45_000, 1000, 300_000),
