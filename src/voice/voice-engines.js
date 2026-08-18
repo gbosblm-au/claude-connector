@@ -52,7 +52,7 @@
 
 import { spawn }                       from 'node:child_process';
 import { mkdtemp, rm, writeFile }      from 'node:fs/promises';
-import { existsSync, readdirSync }     from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir }                      from 'node:os';
 import { join }                        from 'node:path';
 
@@ -86,6 +86,15 @@ const STT_TIER     = process.env.VOICE_STT_TIER     || 'base';
 
 const STT_TIMEOUT  = intEnv('VOICE_STT_TIMEOUT_MS', 120_000);
 const TTS_TIMEOUT  = intEnv('VOICE_TTS_TIMEOUT_MS',  60_000);
+
+/* v12.52.0: thread cap for the Piper child. 1 is the safe default on a small
+ * shared instance; see the env block in synthesize() for why. */
+const TTS_THREADS  = intEnv('VOICE_TTS_THREADS', 1);
+
+/* Sample rates read from voice configs, cached for the process lifetime. The
+ * config cannot change without the model changing, and a model change needs a
+ * redeploy or a re-provision. */
+const _sampleRates = new Map();
 
 /* Section 12 budgets assume one utterance at a time on a shared CPU. Two
  * concurrent Whisper runs on the box that also serves the connector will miss
@@ -429,6 +438,104 @@ export async function transcribe(audio, opts) {
  * @param {{text: string, voice: string, speed?: number}} opts
  * @returns {Promise<Buffer>} WAV bytes.
  */
+/**
+ * A failure message an operator can act on.
+ *
+ * @param {number|null} code   Exit code, null when the process was signalled.
+ * @param {string|null} signal Signal name, null on a normal exit.
+ * @param {string} stderrText  Whatever Piper managed to write.
+ * @returns {string}
+ */
+/**
+ * The sample rate a voice was trained at, from its own config file.
+ *
+ * Piper writes `--output_raw` at the model's native rate. Assuming 22050 for
+ * everything would play a 16 kHz low-quality voice fast and high, so the rate
+ * is read from the config that ships beside the model rather than guessed. The
+ * fallback is only reached if the config is missing, which is the same state
+ * that makes Piper itself fail.
+ *
+ * @param {string} voiceId
+ * @returns {number} Samples per second.
+ */
+export function voiceSampleRate(voiceId) {
+  const cached = _sampleRates.get(voiceId);
+  if (cached) return cached;
+
+  let rate = 22050;
+  try {
+    const cfg = JSON.parse(readFileSync(join(VOICES_DIR, `${voiceId}.onnx.json`), 'utf8'));
+    const parsed = Number(cfg && cfg.audio && cfg.audio.sample_rate);
+    if (Number.isFinite(parsed) && parsed >= 8000 && parsed <= 48000) rate = parsed;
+  } catch (err) {
+    console.warn(`[voice] could not read the sample rate for ${voiceId}, `
+      + `assuming ${rate}: ${err.message}`);
+  }
+
+  _sampleRates.set(voiceId, rate);
+  return rate;
+}
+
+/**
+ * Wrap headerless PCM in a canonical 44-byte WAV header.
+ *
+ * Piper emits signed 16-bit little-endian mono at the model's sample rate. All
+ * three are known here, so every length field can be written correctly the
+ * first time -- which is the whole point: nothing has to be patched later, so
+ * nothing has to seek.
+ *
+ * @param {Buffer} pcm Raw samples.
+ * @param {number} sampleRate
+ * @returns {Buffer} A complete WAV file.
+ */
+export function wrapPcmAsWav(pcm, sampleRate) {
+  const channels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * channels * (bitsPerSample / 8);
+  const blockAlign = channels * (bitsPerSample / 8);
+
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0, 'ascii');
+  // Everything after this field: 36 + data length.
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8, 'ascii');
+  header.write('fmt ', 12, 'ascii');
+  header.writeUInt32LE(16, 16);            // PCM chunk size
+  header.writeUInt16LE(1, 20);             // format 1 = uncompressed PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36, 'ascii');
+  header.writeUInt32LE(pcm.length, 40);
+
+  return Buffer.concat([header, pcm], 44 + pcm.length);
+}
+
+export function describeFailure(code, signal, stderrText) {
+  const detail = String(stderrText || '').trim().slice(0, 500);
+
+  if (signal) {
+    const base = `Piper was killed by ${signal}`;
+    if ('SIGKILL' === signal) {
+      // Nothing in userspace sends SIGKILL to this child except our own
+      // timeout, and the timeout rejects on its own path before reaching here.
+      // So on a container this is the OOM killer almost every time.
+      return base + '. On a memory-limited container this is almost always the '
+        + 'kernel OOM killer: onnxruntime holds the voice model plus its arenas, '
+        + 'so raise the service memory limit or use a smaller (low-quality) voice.'
+        + (detail ? ` Piper said: ${detail}` : '');
+    }
+    return base + (detail ? `. Piper said: ${detail}` : '.');
+  }
+
+  if (detail) return detail;
+
+  if (0 === code) return 'Piper exited cleanly but produced no audio.';
+  return `Piper exited ${code} without writing anything to stderr.`;
+}
+
 export async function synthesize(opts) {
   const o = opts || {};
   const text = String(o.text || '');
@@ -449,7 +556,37 @@ export async function synthesize(opts) {
   }
 
   const modelPath = join(VOICES_DIR, `${o.voice}.onnx`);
-  const args = ['--model', modelPath, '--output_file', '-'];
+
+  // v12.52.0 -- THE PRODUCTION 500.
+  //
+  // This used to be ['--output_file', '-'], asking Piper to write a WAV to
+  // stdout. Piper does that with Python's `wave` module, and `wave` patches the
+  // RIFF header on close by SEEKING back to byte 4 to write the final length.
+  //
+  // A pipe cannot seek. The connector spawns Piper with stdio: 'pipe', so once
+  // enough audio has been written for the buffer to flush to the real file
+  // descriptor, the next header patch calls tell()/seek() on the pipe and the
+  // process dies:
+  //
+  //   File ".../piper/voice.py", line 103, in synthesize
+  //     wav_file.writeframes(audio_bytes)
+  //   File ".../wave.py", line 560, in writeframes
+  //     self._patchheader()
+  //   OSError: [Errno 29] Illegal seek
+  //
+  // Exit 1, after several seconds of successful synthesis and hundreds of
+  // kilobytes of correct audio -- which is exactly what production showed: a
+  // 500 at 2.7 s for a 283-character request. It is SIZE DEPENDENT, which is
+  // why a short probe or a quick manual test passes: a small utterance never
+  // fills the buffer, so no flush happens and no seek is ever attempted. The
+  // same command redirected to a file works perfectly, because files seek.
+  //
+  // So we no longer ask Piper for a container it cannot write to a pipe.
+  // --output_raw streams headerless PCM, which needs no seeking at all, and
+  // the 44-byte WAV header is assembled here from the voice's own config. We
+  // know the sample rate, the channel count and the sample width exactly, so
+  // there is nothing to patch afterwards.
+  const args = ['--model', modelPath, '--output_raw'];
 
   // Piper expresses speed as length_scale, which is INVERSE: larger is slower.
   // Passing a speed multiplier straight through would make "1.5x speed" play
@@ -466,7 +603,20 @@ export async function synthesize(opts) {
         // Section 11: no connector secrets, no database access. An explicit
         // minimal environment is how that is enforced -- the default would hand
         // this GPL process every API key the connector holds.
-        env: { PATH: process.env.PATH, HOME: PIPER_DIR, PYTHONDONTWRITEBYTECODE: '1' },
+        env: {
+          PATH: process.env.PATH, HOME: PIPER_DIR, PYTHONDONTWRITEBYTECODE: '1',
+          // v12.52.0. onnxruntime and OpenMP size their thread pools from the
+          // CPU count they can SEE, which on a container is the host's count,
+          // not the share this service is entitled to. On a small Railway
+          // instance that means a dozen threads fighting over a fraction of a
+          // core, each with its own arena, which is both slower and heavier
+          // than running single-threaded.
+          //
+          // Overridable, because the right number depends on the plan, and
+          // Section 14's benchmark is what should eventually set it.
+          OMP_NUM_THREADS: String(TTS_THREADS),
+          ORT_NUM_THREADS: String(TTS_THREADS),
+        },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) { reject(err); return; }
@@ -479,7 +629,11 @@ export async function synthesize(opts) {
       if (settled) return;
       settled = true;
       try { child.kill('SIGKILL'); } catch (e) { /* already gone */ }
-      reject(new Error(`Piper timed out after ${TTS_TIMEOUT}ms`));
+      const err = new Error(`Piper timed out after ${TTS_TIMEOUT}ms`);
+      // Given a code so the route can report a timeout as a timeout rather
+      // than as a generic failure.
+      err.code = 'tts_timeout';
+      reject(err);
     }, TTS_TIMEOUT);
 
     child.stdout.on('data', c => out.push(c));
@@ -490,14 +644,43 @@ export async function synthesize(opts) {
       settled = true; clearTimeout(timer); reject(err);
     });
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      const wav = Buffer.concat(out);
-      if (code !== 0 || wav.length === 0) {
-        const err = new Error(errText.slice(0, 500) || `Piper exited ${code} with no audio`);
+      const pcm = Buffer.concat(out);
+      let wav = pcm;
+      if (code === 0 && pcm.length > 0) {
+        try {
+          wav = wrapPcmAsWav(pcm, voiceSampleRate(o.voice));
+        } catch (err) {
+          const wrapErr = new Error(`Could not build the WAV header: ${err.message}`);
+          wrapErr.code = 'tts_failed';
+          reject(wrapErr);
+          return;
+        }
+      }
+      if (code !== 0 || pcm.length === 0) {
+        // v12.52.0. The old message was `errText || "Piper exited <code>"`, and
+        // on the failure that matters most -- the process being KILLED -- both
+        // halves are useless: stderr is empty because nothing got to write it,
+        // and `code` is null because the process did not exit, it was
+        // terminated. The operator was left with "Piper exited null with no
+        // audio", which names neither the cause nor where to look.
+        //
+        // A signal is now reported by name, and SIGKILL is called what it
+        // almost always is on a small container: the kernel's OOM killer.
+        // onnxruntime holds the 61 MB model plus its arenas, so a synthesis
+        // that runs for seconds and then dies without a word is the signature.
+        const err = new Error(describeFailure(code, signal, errText));
         err.code = 'tts_failed';
+        // Structured fields for the route to log. Deliberately separate from
+        // the message so the log can carry them without the client ever seeing
+        // any of it.
+        err.exitCode = code;
+        err.signal = signal;
+        err.stderr = errText.slice(0, 2000);
+        err.bytes = pcm.length;
         reject(err);
         return;
       }
@@ -519,5 +702,5 @@ export const config = Object.freeze({
 
 export default {
   probeEngines, engineState, resetEngineState, transcribe, synthesize,
-  installedVoices, config,
+  installedVoices, wrapPcmAsWav, voiceSampleRate, describeFailure, config,
 };

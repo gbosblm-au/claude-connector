@@ -552,13 +552,49 @@ export function registerVoiceRoutes(app) {
         const known = {
           unknown_voice: 422, voice_inactive: 422,
           voice_non_commercial: 422, voice_unaudited: 422, empty_text: 422,
+          // v12.52.0: a timeout is the engine being too slow, not the caller
+          // being wrong. 504 says which, and says it to the gateway in the
+          // vocabulary it already uses for its own timeout.
+          tts_timeout: 504,
         };
         const status = known[err.code] || 500;
+
+        // v12.52.0. THE FIX FOR "500 and nothing else".
+        //
+        // The client is still told only "Speech synthesis failed" -- Piper's
+        // stderr can carry file paths and model internals, and none of that
+        // belongs in a browser. But the SERVER kept nothing either, so a 500
+        // here produced a log line reading `code=tts_failed status=500` and
+        // that was the entire record of the failure. There was no way to tell
+        // an OOM kill from a corrupt model from a bad argument.
+        //
+        // Now the real reason is written to the connector's own log, where an
+        // operator reading Railway logs will find it. Still never the text
+        // being spoken (Section 10) -- only the engine's own diagnostics.
+        if (status >= 500) {
+          console.error('[voice] tts_failed:', err.message);
+          if (err.exitCode !== undefined || err.signal) {
+            console.error(`[voice] tts_failed detail: exit=${err.exitCode} `
+              + `signal=${err.signal || 'none'} audio_bytes=${err.bytes || 0}`);
+          }
+          if (err.stderr) console.error('[voice] piper stderr:', err.stderr);
+        }
+
         logMeta('tts_error', { code: err.code || 'tts_failed', status,
+                               signal: err.signal || undefined,
+                               exit: err.exitCode === undefined ? undefined : err.exitCode,
                                elapsed_ms: Date.now() - started });
         res.status(status).json({
           error: err.code || 'tts_failed',
-          message: status === 500 ? 'Speech synthesis failed.' : err.message,
+          // 5xx keeps a generic message: Piper's stderr can name paths and
+          // model internals. The operator gets the real reason from the
+          // connector log above. 504 is the one exception worth naming,
+          // because "it was too slow" is actionable by the user (shorter text)
+          // and reveals nothing.
+          message: status === 504
+            ? 'Speech synthesis took too long. Try a shorter passage.'
+            : (status >= 500 ? 'Speech synthesis failed. The connector log has the reason.'
+                             : err.message),
         });
       }
     });
