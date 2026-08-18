@@ -225,6 +225,13 @@ RUN groupadd -r mcp && useradd -r -g mcp -m -d /home/mcp mcp
 # Copy production dependencies and application source.
 COPY --from=deps /app/node_modules ./node_modules
 COPY src/ ./src/
+# v12.54.2. scripts/ was allowed by .dockerignore but never copied, so every
+# `npm run` entry pointing into it failed in the container with MODULE_NOT_FOUND
+# -- including voice:smoke, the deployment gate that would have caught the
+# interpreter misconfiguration, and voice:benchmark, which had been unrunnable
+# in the image since it was written. Tests are still excluded: .dockerignore
+# drops **/*.test.js inside the allowed paths.
+COPY scripts/ ./scripts/
 COPY package.json ./
 
 # Data directory and persistent-volume mount point with correct ownership.

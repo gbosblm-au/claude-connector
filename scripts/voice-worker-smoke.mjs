@@ -35,6 +35,8 @@
 import { spawn }                    from 'node:child_process';
 import { existsSync, readdirSync }  from 'node:fs';
 import { join }                     from 'node:path';
+// The single source of truth for which interpreter runs the worker.
+import { workerState }              from '../src/voice/piper-worker-supervisor.js';
 
 const WORKER = new URL('../src/voice/piper_worker.py', import.meta.url).pathname;
 
@@ -42,11 +44,19 @@ const PIPER_DIR  = process.env.VOICE_PIPER_DIR  || '/data/voice/piper';
 const VOICES_DIR = process.env.VOICE_VOICES_DIR || join(PIPER_DIR, 'voices');
 const THREADS    = process.env.VOICE_TTS_THREADS || '1';
 
-/** The interpreter the supervisor would use. Resolved identically on purpose. */
+/**
+ * The interpreter the supervisor will use.
+ *
+ * IMPORTED, NOT REIMPLEMENTED. This was a second copy of the resolution logic,
+ * and the two drifted the moment the supervisor's was corrected -- which is the
+ * worst possible place for a gate to disagree with the thing it gates. A smoke
+ * test that resolves a different interpreter from production can pass while
+ * production fails, or fail while production works.
+ *
+ * @returns {string} The interpreter path, or '' when none resolves.
+ */
 function piperPython() {
-  if (process.env.VOICE_PIPER_PYTHON) return process.env.VOICE_PIPER_PYTHON;
-  const venv = join(PIPER_DIR, 'venv', 'bin', 'python3');
-  return existsSync(venv) ? venv : 'python3';
+  return workerState().interpreter || '';
 }
 
 function arg(name, fallback) {
@@ -130,6 +140,15 @@ async function main() {
   console.log(`  worker      : ${WORKER}\n`);
 
   if (!existsSync(WORKER)) fail(`the worker script is missing at ${WORKER}`);
+
+  if (!piperPython()) {
+    fail('no Piper interpreter could be resolved',
+      'Set VOICE_PIPER_PYTHON to the python3 inside the Piper virtual environment.\n'
+      + 'In the image built by this repository\'s Dockerfile that is:\n'
+      + '  VOICE_PIPER_PYTHON=/opt/piper/bin/python3\n'
+      + 'Note that VOICE_PIPER_DIR is the VOICES directory on the volume, not the venv.\n'
+      + 'Synthesis will use the CLI fallback until this resolves.');
+  }
 
   const installed = installedVoices();
   console.log(`Installed voices: ${installed.length ? installed.join(', ') : '(none)'}`);

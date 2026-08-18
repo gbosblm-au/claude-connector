@@ -53,7 +53,7 @@
 
 import test           from 'node:test';
 import assert         from 'node:assert/strict';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, extname } from 'node:path';
 
@@ -399,4 +399,57 @@ test('the worker script is never executed with the gate off', () => {
   assert.ok(supervisor.includes('export async function prewarm(modelPath)'));
   assert.ok(/if \(!workerEnabled\(\) \|\| !prewarmEnabled\(\)\) return false;/.test(supervisor),
     'and it also respects its own two flags');
+});
+
+// ===========================================================================
+// REGRESSION: the interpreter must be DERIVED, not guessed
+// ===========================================================================
+
+test('the Piper interpreter is derived from VOICE_PIPER_BIN, not from the data dir', () => {
+  const piper = code(join(VOICE_DIR, 'piper-worker-supervisor.js'));
+
+  // The original guessed `VOICE_PIPER_DIR/venv/bin/python3`. Those are two
+  // different things, and this repository's own Dockerfile says so:
+  //
+  //     VOICE_PIPER_BIN=/opt/piper/bin/piper     <- the venv
+  //     VOICE_PIPER_DIR=/data/voice/piper        <- voices, on the volume
+  //
+  // So the guess pointed at a path that exists on no correctly built image.
+  assert.ok(piper.includes("env('VOICE_PIPER_BIN', '')"),
+    'the interpreter is derived from the binary the image already configures');
+  assert.ok(/join\(dirname\(bin\), 'python3'\)/.test(piper),
+    "and from its directory, because `python3 -m venv` puts both in the venv's bin");
+
+  // Order matters: derivation is evidence, the directory guess is an assumption.
+  assert.ok(piper.indexOf("VOICE_PIPER_BIN") < piper.indexOf("'venv', 'bin', 'python3'"),
+    'the derivation is tried before the guess');
+});
+
+test('the Dockerfile ships the scripts the npm entries point at', () => {
+  // scripts/ was allowed by .dockerignore but never COPYed, so `npm run
+  // voice:smoke` -- the deployment gate for exactly the interpreter problem
+  // above -- failed in the container with MODULE_NOT_FOUND. The gate could not
+  // catch the fault because the gate was not in the image.
+  const dockerfile = readFileSync(join(SRC, '..', 'Dockerfile'), 'utf8');
+  assert.ok(/^COPY scripts\/ \.\/scripts\/$/m.test(dockerfile),
+    'the runtime image must contain scripts/');
+
+  const pkg = JSON.parse(readFileSync(join(SRC, '..', 'package.json'), 'utf8'));
+  for (const [name, cmd] of Object.entries(pkg.scripts || {})) {
+    const m = /(?:^|\s)(scripts\/[\w./-]+)/.exec(cmd);
+    if (!m) continue;
+    assert.ok(existsSync(join(SRC, '..', m[1])),
+      `npm run ${name} points at ${m[1]}, which does not exist`);
+  }
+});
+
+test('the smoke test resolves the same interpreter as the supervisor', () => {
+  // A gate that resolves a different interpreter from production can pass while
+  // production fails. It imports the supervisor's resolution rather than
+  // carrying a second copy that drifts.
+  const smoke = readFileSync(join(SRC, '..', 'scripts', 'voice-worker-smoke.mjs'), 'utf8');
+  assert.ok(smoke.includes("from '../src/voice/piper-worker-supervisor.js'"),
+    'the smoke test imports the real resolution');
+  assert.ok(!/join\(PIPER_DIR, 'venv'/.test(smoke),
+    'and holds no second copy of it');
 });

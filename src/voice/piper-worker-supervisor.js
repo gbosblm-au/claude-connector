@@ -41,7 +41,7 @@
 // in this file, and src/tests/voice-gpl-boundary.test.js asserts both halves.
 
 import { existsSync }         from 'node:fs';
-import { join }               from 'node:path';
+import { join, dirname }      from 'node:path';
 import { createStdioWorker }  from './stdio-worker.js';
 
 const WORKER_SCRIPT = new URL('./piper_worker.py', import.meta.url).pathname;
@@ -82,6 +82,36 @@ function boolEnv(name, fallback) {
 function piperPython() {
   const explicit = env('VOICE_PIPER_PYTHON', '');
   if (explicit) return explicit;
+
+  // DERIVE THE INTERPRETER FROM THE BINARY WE ALREADY KNOW.
+  //
+  // The first version guessed `VOICE_PIPER_DIR/venv/bin/python3`, on the
+  // assumption that the venv lived inside the Piper directory. It does not, and
+  // the Dockerfile in this very repository says so:
+  //
+  //     VOICE_PIPER_BIN=/opt/piper/bin/piper     <- the venv
+  //     VOICE_PIPER_DIR=/data/voice/piper        <- voices, on the volume
+  //
+  // Those are two different things. VOICE_PIPER_DIR is a DATA directory on the
+  // mounted volume; the virtual environment is baked into the image at
+  // /opt/piper. So the guess pointed at a path that never existed on any
+  // correctly built deployment, and the old fallback then quietly used the
+  // system python -- which cannot import piper, by design.
+  //
+  // VOICE_PIPER_BIN is the console script of the very venv we want, and it is
+  // already set by the image. `dirname(bin)/python3` is that venv's interpreter
+  // by construction: `python3 -m venv /opt/piper` puts both in /opt/piper/bin.
+  // Deriving beats guessing -- the two cannot drift apart, because one is
+  // computed from the other.
+  const bin = env('VOICE_PIPER_BIN', '');
+  if (bin) {
+    const sibling = join(dirname(bin), 'python3');
+    if (existsSync(sibling)) return sibling;
+  }
+
+  // Retained as a secondary guess for a layout that really does put the venv
+  // under the Piper directory. Tried second because the derivation above is
+  // evidence and this is an assumption.
   const dir = env('VOICE_PIPER_DIR', '/data/voice/piper');
   const venv = join(dir, 'venv', 'bin', 'python3');
   // EMPTY, NOT 'python3', WHEN THE VENV IS ABSENT.
