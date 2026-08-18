@@ -58,8 +58,12 @@ import { validateAudio, maxBytes,
          ACCEPTED_FORMATS }       from '../voice/audio-validate.js';
 import { voicePermitted, voicesForLanguage,
          catalogState, TTS_LANGUAGES,
+         // v12.51.0: a language is only offerable when a permitted voice is
+         // also INSTALLED. The catalogue answers the licence question; these
+         // two answer "would it actually speak".
+         speakableLanguages, bestVoiceForLanguage,
          attributions }           from '../voice/voice-catalog.js';
-import { probeEngines, engineState,
+import { probeEngines, engineState, installedVoices,
          transcribe, synthesize } from '../voice/voice-engines.js';
 
 /* Section 15: "Rate limiting per user on both voice routes." Voice is far more
@@ -266,6 +270,7 @@ export function registerVoiceRoutes(app) {
     }
 
     const bench = benchmarkState();
+    const speakable = speakableLanguages(engines.voices_installed || []);
     res.json({
       // The four fields Section 8.1 specifies, at the top level and named
       // exactly as written, so a client coded to the specification works.
@@ -283,6 +288,18 @@ export function registerVoiceRoutes(app) {
       // populated catalogue is the state where TTS looks configured and cannot
       // speak, so the two are reported side by side rather than conflated.
       voices_installed: engines.voices_installed || [],
+
+      // v12.51.0. THE field a client should gate its voice UI on.
+      //
+      // tts_languages below is the launch set, and catalogue.usable_by_language
+      // is the licence answer; neither knows whether a model file exists. Only
+      // this is the intersection of "licence-cleared" and "actually installed",
+      // and only this is safe to build a language picker from. A UI built on
+      // either of the others offers languages that fail on first use, which is
+      // exactly what Vietnamese, Chinese and Japanese would do today on a
+      // volume holding one English voice.
+      speakable_languages: speakable.languages,
+      speakable_by_language: speakable.by_language,
 
       // Everything below is additional diagnostics.
       degraded: !!engines.degraded,
@@ -469,7 +486,21 @@ export function registerVoiceRoutes(app) {
           });
           return;
         }
-        voice = available[0].voice_id;
+        // v12.51.0: prefer a voice whose model is actually on the volume.
+        // Taking catalogue order blindly can select a licence-cleared voice
+        // that was never downloaded, which reaches Piper and comes back as a
+        // 500 -- an engine failure reported for what is really a missing file.
+        const best = bestVoiceForLanguage(language, installedVoices());
+        if (!best.installed) {
+          res.status(422).json({
+            error: 'voice_not_installed',
+            message: `No voice model for "${language}" is installed on this connector. `
+              + `${best.candidates} voice(s) are licence-cleared for it, but none has been `
+              + 'downloaded onto the volume.',
+          });
+          return;
+        }
+        voice = best.voice_id;
       }
 
       const permit = voicePermitted(voice);

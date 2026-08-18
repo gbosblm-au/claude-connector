@@ -271,6 +271,67 @@ export function attributions() {
 }
 
 /**
+ * Languages that can actually be spoken RIGHT NOW.
+ *
+ * v12.51.0. `usable_by_language` answers a LICENCE question: which voices are
+ * cleared to ship. It says nothing about whether the model file exists on the
+ * volume, and the two diverge constantly -- a fresh volume has a fully populated
+ * catalogue and not one .onnx file.
+ *
+ * A UI that offers a language on the strength of the licence answer alone
+ * offers something that fails at the engine. So this intersects the two: a
+ * language is speakable when it has at least one voice that is BOTH permitted
+ * by the catalogue AND installed on disk.
+ *
+ * The installed list is passed in rather than imported, so this module keeps
+ * knowing nothing about the filesystem and stays unit-testable without one.
+ *
+ * @param {string[]} installedVoiceIds Voice ids present on the volume.
+ * @returns {{languages: string[], by_language: Object<string, string[]>}}
+ */
+export function speakableLanguages(installedVoiceIds) {
+  const installed = new Set(Array.isArray(installedVoiceIds) ? installedVoiceIds : []);
+  const byLanguage = {};
+
+  for (const lang of TTS_LANGUAGES) {
+    const ready = voicesForLanguage(lang)
+      .filter(v => installed.has(v.voice_id))
+      .map(v => v.voice_id);
+    if (ready.length) byLanguage[lang] = ready;
+  }
+
+  return { languages: Object.keys(byLanguage), by_language: byLanguage };
+}
+
+/**
+ * The best voice to use for a language, preferring one that is installed.
+ *
+ * voicesForLanguage() returns catalogue order, defaults first. Taking its first
+ * entry blindly can select a licence-cleared voice whose model was never
+ * downloaded, which reaches Piper and fails as a 500 -- an engine error for what
+ * is really a missing file. Preferring an installed voice turns that into a
+ * successful request whenever any installed voice would do, and the caller can
+ * refuse cleanly when none would.
+ *
+ * @param {string} language
+ * @param {string[]} installedVoiceIds
+ * @returns {{voice_id: string|null, installed: boolean, candidates: number}}
+ */
+export function bestVoiceForLanguage(language, installedVoiceIds) {
+  const installed = new Set(Array.isArray(installedVoiceIds) ? installedVoiceIds : []);
+  const candidates = voicesForLanguage(language);
+
+  const ready = candidates.find(v => installed.has(v.voice_id));
+  if (ready) return { voice_id: ready.voice_id, installed: true, candidates: candidates.length };
+
+  return {
+    voice_id: candidates.length ? candidates[0].voice_id : null,
+    installed: false,
+    candidates: candidates.length,
+  };
+}
+
+/**
  * Catalogue state for /voice/health and for the settings UI.
  *
  * Deliberately reports how many voices are actually usable, which is zero until
@@ -295,5 +356,6 @@ export function catalogState() {
 export default {
   VOICE_CATALOG, TTS_LANGUAGES,
   auditRequired, findVoice, voicePermitted, voicesForLanguage,
+  speakableLanguages, bestVoiceForLanguage,
   attributions, catalogState,
 };

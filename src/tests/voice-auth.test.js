@@ -527,3 +527,82 @@ test('every audited entry records a licence and a model card', async () => {
       `${v.voice_id} claims to be audited but leaves commercial_ok unanswered`);
   }
 });
+
+// ===========================================================================
+// Speakable languages: licence AND installation (v12.51.0)
+// ===========================================================================
+
+test('a language is speakable only when a PERMITTED voice is also INSTALLED', async () => {
+  const { speakableLanguages } = await import('../voice/voice-catalog.js');
+  await withEnv({ VOICE_AUDIT_REQUIRED: 'true' }, () => {
+    // The catalogue clears voices; the volume holds files. A UI told only the
+    // first offers languages that fail at the engine, which is what four
+    // advertised languages beside one installed voice actually meant.
+    assert.deepEqual(speakableLanguages([]).languages, [],
+      'a full catalogue and an empty volume can speak nothing');
+
+    const live = speakableLanguages(['en_US-kristin-medium']);
+    assert.deepEqual(live.languages, ['en']);
+    assert.deepEqual(live.by_language.en, ['en_US-kristin-medium']);
+
+    // Installed is not sufficient: this one is licence-refused.
+    assert.deepEqual(speakableLanguages(['en_US-lessac-medium']).languages, [],
+      'a non-commercial voice on disk unlocks nothing');
+
+    // Nor is it sufficient while the audit is required.
+    assert.equal(speakableLanguages(['zh_CN-huayan-medium']).languages.includes('zh'), false);
+  });
+});
+
+test('the audit switch changes what is speakable, and only for unaudited voices', async () => {
+  const { speakableLanguages } = await import('../voice/voice-catalog.js');
+  await withEnv({ VOICE_AUDIT_REQUIRED: 'false' }, () => {
+    assert.equal(speakableLanguages(['zh_CN-huayan-medium']).languages.includes('zh'), true,
+      'relaxing the audit unlocks an installed but unread voice');
+    assert.deepEqual(speakableLanguages(['en_US-lessac-medium']).languages, [],
+      'but never one that has been read and refused');
+  });
+});
+
+test('synthesis prefers an installed voice and refuses cleanly when there is none', async () => {
+  const { bestVoiceForLanguage } = await import('../voice/voice-catalog.js');
+  await withEnv({ VOICE_AUDIT_REQUIRED: 'true' }, () => {
+    const ready = bestVoiceForLanguage('en', ['en_US-kristin-medium']);
+    assert.equal(ready.voice_id, 'en_US-kristin-medium');
+    assert.equal(ready.installed, true);
+
+    // Catalogue order alone would have returned this voice and sent it to
+    // Piper, which fails on a missing file and reports a 500 -- an engine
+    // error for what is really a download that never happened.
+    const missing = bestVoiceForLanguage('en', []);
+    assert.equal(missing.installed, false);
+    assert.ok(missing.candidates >= 1, 'the licence answer is still reported');
+
+    const unsupported = bestVoiceForLanguage('ko', ['en_US-kristin-medium']);
+    assert.equal(unsupported.voice_id, null);
+    assert.equal(unsupported.candidates, 0);
+  });
+});
+
+test('health separates the launch set from what can actually be spoken', async () => {
+  await withEnv({ ...VOICE_ON, VOICE_AUDIT_REQUIRED: 'true',
+                  VOICE_VOICES_DIR: '/nonexistent/voices' }, async () => {
+    const { base, close } = await listenWithAuthGate();
+    try {
+      const body = await (await fetch(`${base}/voice/health`, {
+        headers: { ...asOperator(), ...identity('38', 'ava') },
+      })).json();
+
+      assert.equal(body.tts_languages.length, 4, 'the launch set is unchanged');
+      assert.deepEqual(body.speakable_languages, [],
+        'and nothing is speakable with no models on the volume');
+      assert.deepEqual(body.speakable_by_language, {});
+      // A client that gated on either of the other two fields would offer four
+      // languages here and deliver none.
+      assert.ok(body.catalogue.usable >= 1,
+        'while the licence answer still reports a cleared voice');
+    } finally {
+      await close();
+    }
+  });
+});
