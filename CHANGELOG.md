@@ -1,3 +1,24 @@
+# v13.2.1 — Spoken replies said "no voice is installed" while five were
+
+THE PRODUCTION FAULT. voice-catalog.speakableLanguages() returned
+{ languages, by_language } under Piper; the v13.0.0 rewrite made it a plain array.
+routes/voice.js emits `speakable_languages: speakable.languages`, which on an
+array is undefined — JSON.stringify DROPS it, the gateway turns the missing key
+into [] via `|| []`, and the client renders "Unavailable: no voice is installed"
+with tts_ready TRUE and five voices installed.
+
+Not one layer failed loudly. Every one did something defensible with a missing
+field, which is why it survived a green suite, a passing smoke test and a deploy.
+
+The tests missed it because they asserted the shape I had just written rather than
+the shape the caller reads. The four new ones are written in terms of the CALLER,
+including a JSON round trip — the step that hid it. Mutation-tested: restoring the
+bare array fails three.
+
+621/621. No variable, migration or admin setting changes.
+
+Full detail in `CHANGELOG-v13.2.1.md`.
+
 # v13.2.0 — The engine artifacts survive a redeploy
 
 The model and voice bundle are BAKED INTO THE IMAGE. A fresh deploy speaks

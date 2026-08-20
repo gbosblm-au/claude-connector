@@ -138,9 +138,33 @@ is not inert.** It only takes one future test calling the symbol already
 conveniently in scope for the suite to acquire a 28 MB fetch and a network
 dependency nobody chose.
 
+## Deployment variables, documented and self-reporting
+
+New `VOICE-DEPLOYMENT-VARIABLES.md`: every `process.env` read on the voice path,
+enumerated from the code and cross-referenced against what the image defaults.
+
+The short version is that **two** connector variables decide whether any of this
+works — `VOICE_ENABLED=true` (defaults to false, not set in the image) and
+`CONNECTOR_URL`. Nothing Kokoro-specific needs setting.
+
+`deploymentConfigProblems()` now names the faults that make voice or its output
+unusable, following the pattern `allowlistConfigProblems()` already established:
+an unset `CONNECTOR_URL`, a pinned interpreter that does not exist, a pinned
+artifact path that does not exist. Logged at boot and reported in
+`/voice/health`.
+
+**Reported on the allowlisted branch only, and that distinction is the point.**
+An allowlist fault explains why *that caller* was denied, so the person being
+denied is the person who needs it — which is why the existing code deliberately
+shows it to them. `CONNECTOR_URL` being unset explains nothing about a denial: it
+is infrastructure detail that helps a denied caller not at all and helps someone
+mapping the deployment quite a lot. Two existing information-leak tests caught
+the first draft putting it in the refusal body.
+
 ## Verification performed
 
-- **Whole connector: 617 passed, 0 failed**, and re-run with the volume artifact
+- **Whole connector: 617 passed, 0 failed**, including two information-leak
+  tests that caught deployment faults being exposed to a refused caller, and re-run with the volume artifact
   deleted to prove the suite performs no network download.
 - All three resolution layers exercised by execution: no volume file → image;
   volume file present → volume; explicit env → configured, including the case

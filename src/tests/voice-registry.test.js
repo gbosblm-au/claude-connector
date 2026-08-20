@@ -244,6 +244,7 @@ test('the registry is immutable', () => {
 // value threads through several call sites and a gap at any one of them is
 // invisible from the others.
 
+import { speakableLanguages as catalogSpeakable } from '../voice/voice-catalog.js';
 import { readFileSync as _read } from 'node:fs';
 import { fileURLToPath as _url } from 'node:url';
 import { dirname as _dir, join as _join } from 'node:path';
@@ -459,4 +460,65 @@ test('boot provisioning stays off and no longer warns about a normal deploy', ()
     'the warning is gated on the baked copy being absent too');
   assert.match(prov, /on NEITHER the volume/u,
     'and says so plainly when the image was built without them');
+});
+
+// ===========================================================================
+// v13.2.1 -- the speakable_languages contract
+// ===========================================================================
+//
+// THE PRODUCTION FAULT THIS PREVENTS, reproduced end to end.
+//
+// v13.0.0 rewrote voice-catalog.speakableLanguages() to return a plain array.
+// It read as a tidy-up. routes/voice.js emits
+// `speakable_languages: speakable.languages`, so on an array that expression is
+// `undefined`; JSON.stringify DROPS an undefined value; the gateway's
+// `( connector.speakable_languages ) || []` turns the missing key into `[]`;
+// and the browser renders "Unavailable: no voice is installed on this
+// workspace" -- with tts_ready TRUE and five voices genuinely installed.
+//
+// Not one layer failed loudly. Every one did something defensible with a
+// missing field, which is exactly why it survived a green test suite, a passing
+// smoke test, and a deploy.
+
+test('speakableLanguages returns the SHAPE the route emits, not a bare array', () => {
+  const out = catalogSpeakable([ 'af_bella', 'bf_emma' ]);
+
+  assert.ok(! Array.isArray(out),
+    'a bare array makes speakable.languages undefined at the call site');
+  assert.deepEqual(out.languages, [ 'en' ]);
+  assert.deepEqual(out.by_language, { en: [ 'af_bella', 'bf_emma' ] });
+});
+
+test('the emitted payload survives a JSON round trip with the field intact', () => {
+  // The step that hid it. An undefined value does not throw and does not warn:
+  // the key simply is not there on the other side.
+  const speakable = catalogSpeakable([ 'af_bella' ]);
+  const wire = JSON.parse(JSON.stringify({
+    tts_ready: true,
+    voices_installed: [ 'af_bella' ],
+    speakable_languages: speakable.languages,
+    speakable_by_language: speakable.by_language,
+  }));
+
+  assert.ok('speakable_languages' in wire,
+    'the key must reach the wire -- undefined would be dropped silently');
+  assert.deepEqual(wire.speakable_languages, [ 'en' ]);
+
+  // And the gateway's own defaulting, which turned the missing key into [].
+  const relayed = (wire && wire.speakable_languages) || [];
+  assert.deepEqual(relayed, [ 'en' ],
+    'the gateway relays a real language list, not an empty fallback');
+});
+
+test('no voices installed still yields an empty list, not a missing key', () => {
+  // The genuinely-empty case must stay distinguishable from the broken one.
+  const out = catalogSpeakable([]);
+  assert.deepEqual(out.languages, []);
+  assert.deepEqual(out.by_language, {});
+});
+
+test('the route reads .languages, which is why the shape cannot change', () => {
+  const routes = _code('routes/voice.js');
+  assert.match(routes, /speakable_languages: speakable\.languages/u);
+  assert.match(routes, /speakable_by_language: speakable\.by_language/u);
 });

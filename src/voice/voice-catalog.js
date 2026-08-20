@@ -135,14 +135,36 @@ export function voicesForLanguage(language) {
  * diverging is exactly the state that produced a healthy-looking catalogue
  * beside an engine that could not synthesise a word.
  *
+ * ── THE RETURN SHAPE IS A CONTRACT. DO NOT SIMPLIFY IT. ───────────────────
+ *
+ * `{ languages, by_language }`, not a bare array.
+ *
+ * v13.0.0 rewrote this to return a plain array, which read as a tidy-up and was
+ * a production outage. routes/voice.js emits `speakable_languages:
+ * speakable.languages`, so on an array that expression is `undefined`,
+ * JSON.stringify DROPS the key, the gateway's
+ * `( connector.speakable_languages ) || []` turns it into `[]`, and the browser
+ * shows "Unavailable: no voice is installed on this workspace" -- with
+ * tts_ready TRUE and five voices genuinely installed.
+ *
+ * Nothing failed loudly anywhere along that path. Every layer did something
+ * defensible with a missing field.
+ *
  * @param {Array<string>} installedVoiceIds
- * @returns {Array<string>}
+ * @returns {{languages: Array<string>, by_language: Object<string, Array<string>>}}
  */
 export function speakableLanguages(installedVoiceIds) {
   const installed = new Set((installedVoiceIds || []).map(v => String(v)));
-  const langs = new Set(
-    VOICE_CATALOG.filter(v => v.active && installed.has(v.voice_id)).map(v => v.language));
-  return TTS_LANGUAGES.filter(l => langs.has(l));
+  const byLanguage = {};
+
+  for (const lang of TTS_LANGUAGES) {
+    const ready = voicesForLanguage(lang)
+      .filter(v => installed.has(v.voice_id))
+      .map(v => v.voice_id);
+    if (ready.length) byLanguage[lang] = ready;
+  }
+
+  return { languages: Object.keys(byLanguage), by_language: byLanguage };
 }
 
 /**

@@ -44,7 +44,8 @@ import { voiceEnabled, gateState, benchmarkState,
          voiceAvailableFor, voiceAvailableForAsync,
          allowlistDiagnostics, currentAllowlistSource,
          resolveIdentity, testUsers } from '../voice/voice-gate.js';
-import { allowlistConfigProblems } from '../voice/voice-allowlist.js';
+import { allowlistConfigProblems,
+         deploymentConfigProblems } from '../voice/voice-allowlist.js';
 // v12.50.0: the transport credential. MCP_API_KEY (operator) or
 // RAILWAY_RESTORE_TOKEN (gateway). See src/voice/voice-auth.js for why the
 // gateway could not previously reach these routes at all.
@@ -400,6 +401,17 @@ export function registerVoiceRoutes(app) {
       //
       // The messages name variables and modes, never identities.
       if (voiceEnabled()) {
+        // v13.2.0. ALLOWLIST PROBLEMS ONLY, deliberately.
+        //
+        // deploymentConfigProblems() is NOT included here, and the distinction
+        // is the one the comment above turns on. An allowlist fault EXPLAINS
+        // THIS REFUSAL -- the person being denied is the person who needs it.
+        // CONNECTOR_URL being unset explains nothing about why they were
+        // denied; it is unrelated infrastructure detail that helps them not at
+        // all and helps someone mapping the deployment quite a lot.
+        //
+        // Deployment faults go to /voice/health, which is operator-gated, and
+        // to the boot log. See the health route below.
         const problems = allowlistConfigProblems();
         if (problems.length) body.configuration_problems = problems;
       }
@@ -470,6 +482,22 @@ export function registerVoiceRoutes(app) {
       // populated catalogue is the state where TTS looks configured and cannot
       // speak, so the two are reported side by side rather than conflated.
       voices_installed: engines.voices_installed || [],
+
+      // v13.2.0. Deployment faults, on the ALLOWLISTED branch only.
+      //
+      // Not on the refusal branch above, and the distinction matters: an
+      // allowlist fault explains why THAT caller was denied, so the person
+      // being denied is the person who needs it. CONNECTOR_URL being unset
+      // explains nothing about a denial -- it is infrastructure detail that
+      // helps a denied caller not at all and helps someone mapping the
+      // deployment quite a lot.
+      //
+      // Omitted entirely when the configuration is coherent, so its presence is
+      // itself the signal rather than an empty array an operator has to inspect.
+      ...( (() => {
+        const faults = deploymentConfigProblems();
+        return faults.length ? { deployment_problems: faults } : {};
+      })() ),
 
       // v13.0.1. The SAME list, with the labels and accents a picker needs.
       //
@@ -1258,7 +1286,7 @@ export function registerVoiceRoutes(app) {
   }
 
   if (voiceEnabled()) {
-    const problems = allowlistConfigProblems();
+    const problems = [ ...allowlistConfigProblems(), ...deploymentConfigProblems() ];
     problems.forEach((p) => console.error('[voice] CONFIGURATION: ' + p));
     if (problems.length) {
       console.error('[voice] Voice is enabled but NO USER CAN REACH IT until the above is fixed. '
