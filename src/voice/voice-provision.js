@@ -1,257 +1,296 @@
-// src/voice/voice-provision.js
-//
-// Tenax Voice -- getting Piper voice models onto the volume. (v12.50.0)
-//
-// ===========================================================================
-// WHY THIS IS RUNTIME WORK AND NOT A DOCKERFILE LINE
-// ===========================================================================
-//
-// Specification Section 11 asks for models "pre-downloaded at deploy", and the
-// Dockerfile does create /data/voice/piper/voices at build time. It cannot fill
-// it. The Railway volume is mounted OVER /data when the container starts, so
-// anything the image wrote underneath that path is masked the moment it runs.
-// A `RUN wget` in the Dockerfile would download several hundred megabytes into
-// a directory nothing will ever read.
-//
-// So the download has to happen at runtime, against the mounted volume, exactly
-// once, and it has to survive restarts -- which it does, because the volume is
-// persistent. This module is that step.
-//
-// ===========================================================================
-// WHY NOT LET PIPER DOWNLOAD ITS OWN VOICES
-// ===========================================================================
-//
-// piper-tts can fetch a missing voice: __main__.py calls ensure_voice_exists()
-// when the model path does not exist. It looks the voice up BY NAME in its
-// voices.json index, and voice-engines.js passes an absolute PATH
-// (<VOICES_DIR>/<voice>.onnx), which is not a name in that index. The lookup
-// raises and the request fails.
-//
-// Passing a bare name instead would hand the GPL process a network egress path
-// and a download directory chosen by its own defaults, on a request path, while
-// a user waits. Downloading deliberately, ahead of time, from a pinned
-// repository is the better trade in every direction.
-//
-// ===========================================================================
-// PINNED SOURCE
-// ===========================================================================
-//
-// Section 15 pins model downloads to HuggingFace. Voices come from
-// rhasspy/piper-voices, the repository Piper itself indexes, at a fixed layout:
-//
-//   <lang_family>/<locale>/<name>/<quality>/<voice_id>.onnx
-//   <lang_family>/<locale>/<name>/<quality>/<voice_id>.onnx.json
-//
-// Both files are required. Piper reads the .onnx.json for the sample rate,
-// phoneme map and inference defaults; the .onnx alone produces an immediate
-// failure that reads like a corrupt model rather than a missing config.
+/* voice-provision.js  --  get the Kokoro model and voice bundle onto the volume.
+ *
+ * SPEC-KOKORO-001 v1.1, Section 7.
+ *
+ * ===========================================================================
+ * WHAT PROVISIONING MEANS NOW
+ * ===========================================================================
+ *
+ * Under Piper this module downloaded ONE FILE PAIR PER VOICE (`<voice>.onnx`
+ * plus `<voice>.onnx.json`) from huggingface.co/rhasspy/piper-voices, and
+ * "install a voice" was a meaningful operation.
+ *
+ * Kokoro is two files TOTAL: the model, and a bundle holding every voice as a
+ * 256-dimensional style vector. Adding a voice to the offered set is a registry
+ * edit, not a download. So the surface shrinks to "are the two artifacts here,
+ * and fetch them if not".
+ *
+ * The exported names are unchanged -- routes/voice.js calls provisionFromEnv()
+ * and the test suite calls installVoice() and voicesDir(). Keeping the interface
+ * is what stopped the engine swap becoming a rewrite of every caller.
+ *
+ * ===========================================================================
+ * WHY DOWNLOADS ARE OPT-IN
+ * ===========================================================================
+ *
+ * The model is ~310 MB. A boot path that fetches it by default turns a redeploy
+ * into a multi-minute stall against a health check with a deadline, and turns a
+ * network blip into a failed deploy. VOICE_PROVISION_ON_BOOT therefore defaults
+ * to FALSE and the intended path is a pre-populated volume or an image layer.
+ *
+ * When it is off and the files are absent, probeEngines() reports tts_ready
+ * false with a message naming the missing path. That is a visible, actionable
+ * failure rather than a silent one.
+ */
 
-import { mkdir, writeFile, rename, stat } from 'node:fs/promises';
-import { existsSync }                     from 'node:fs';
-import { join }                           from 'node:path';
+'use strict';
 
-const HF_BASE = 'https://huggingface.co/rhasspy/piper-voices/resolve/main';
+import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { writeFile }                                              from 'node:fs/promises';
+import { dirname, join }                                          from 'node:path';
 
-/** Where the voice files live, matching voice-engines.js. */
+/* v13.2.0. Mirrors kokoro-worker-supervisor.js. Duplicated rather than imported
+ * so that provisioning -- which runs at boot, before the worker exists -- does
+ * not pull in the supervisor and its process machinery just to read a constant. */
+const BAKED_DIR = '/opt/kokoro/models';
+
+/* The upstream the pinned kokoro-onnx release is built against. Both files come
+ * from the same tagged release, and that matters: a model from one release with
+ * a bundle from another produces either a load failure or, worse, voices whose
+ * vectors no longer line up with the names. */
+const RELEASE = 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0';
+
+/** Where the engine artifacts live. Mirrors kokoro-worker-supervisor.js. */
 export function voicesDir() {
-  const dir = process.env.VOICE_VOICES_DIR;
-  if (dir) return dir;
-  const piperDir = process.env.VOICE_PIPER_DIR || '/data/voice/piper';
-  return join(piperDir, 'voices');
+  return process.env.VOICE_KOKORO_DIR || '/data/voice/kokoro';
 }
 
 /**
- * Repository path for each voice the catalogue names.
+ * The two artifacts, with the checks that make a partial download detectable.
  *
- * Verified against the live repository tree rather than inferred from the voice
- * id, because the id and the path do not always agree -- see the Japanese entry
- * below, where they disagree in a way that cannot be derived.
+ * `minBytes` is a floor, not a checksum. A truncated download -- the common
+ * failure on a flaky connection or a full volume -- leaves a file that exists
+ * and is far too small, and onnxruntime's error for that is an opaque protobuf
+ * parse failure. A size floor turns it into a message that says what happened.
+ *
+ * It is deliberately not a hash: pinning one would mean this file has to change
+ * whenever upstream re-cuts a release, and a stale hash refusing a good download
+ * is a worse failure than a size floor accepting a rare corrupt one.
  */
 export const VOICE_SOURCES = Object.freeze({
-  // The English default from v12.50.0: public-domain LibriVox source.
-  'en_US-kristin-medium':      'en/en_US/kristin/medium',
-  // Retained so an existing deployment can still fetch it, though
-  // voice-catalog.js refuses to synthesise with it: non-commercial licence.
-  'en_US-lessac-medium':       'en/en_US/lessac/medium',
-  'zh_CN-huayan-medium':       'zh/zh_CN/huayan/medium',
-  'vi_VN-vais1000-medium':     'vi/vi_VN/vais1000/medium',
-  'vi_VN-25hours_single-low':  'vi/vi_VN/25hours_single/low',
-  // The only Japanese voice the repository publishes. Note the locale
-  // directory: ja_JA, not ja_JP. That is upstream's spelling, not a typo here.
-  'ja_JA-hi_fi_captain-medium': 'ja/ja_JA/hi_fi_captain/medium',
+  model: Object.freeze({
+    file: 'kokoro-v1.0.onnx',
+    url: `${RELEASE}/kokoro-v1.0.onnx`,
+    minBytes: 100 * 1024 * 1024,
+  }),
+  voices: Object.freeze({
+    file: 'voices-v1.0.bin',
+    url: `${RELEASE}/voices-v1.0.bin`,
+    minBytes: 1024 * 1024,
+  }),
 });
 
 /**
- * Voice ids the catalogue lists that DO NOT EXIST upstream.
+ * Retained for interface compatibility.
  *
- * `ja_JP-ryoko-medium` is in VOICE_CATALOG as the Japanese default. There is no
- * such voice in rhasspy/piper-voices: the repository has exactly one Japanese
- * voice, ja_JA-hi_fi_captain-medium. A request for Japanese TTS therefore
- * cannot succeed no matter what is downloaded.
- *
- * Named here rather than silently substituted. VOICE_CATALOG is a LICENCE
- * record -- every entry carries audited/licence/model_card fields that a
- * compliance review reads -- and quietly swapping an id in it would put an
- * unreviewed voice behind a reviewed name. The substitution is a decision for
- * whoever owns that record, so this module reports the problem precisely and
- * changes nothing.
+ * Under Piper this listed voices whose upstream had disappeared. Kokoro has no
+ * per-voice upstream, so nothing can go missing individually -- either the
+ * bundle is there or it is not.
  */
-export const MISSING_UPSTREAM = Object.freeze({
-  'ja_JP-ryoko-medium':
-    'not published by rhasspy/piper-voices. The only Japanese voice available is '
-    + 'ja_JA-hi_fi_captain-medium. Japanese TTS cannot work until VOICE_CATALOG in '
-    + 'src/voice/voice-catalog.js is updated, which is a licence-record change and '
-    + 'needs the same audit as any other entry.',
-});
+export const MISSING_UPSTREAM = Object.freeze({});
 
 /**
- * Download one file to a temporary name and move it into place.
+ * Is an artifact present and plausibly complete?
  *
- * The rename is the point: a download interrupted halfway leaves
- * `<voice>.onnx.partial`, which installedVoices() ignores, rather than a
- * truncated `<voice>.onnx` that looks installed and fails at synthesis. Rename
- * within one directory is atomic on the volume's filesystem.
- *
- * @param {string} url
- * @param {string} destination
- * @param {number} timeoutMs
- * @returns {Promise<number>} Bytes written.
+ * @param {{file: string, minBytes: number}} source
+ * @returns {{path: string, present: boolean, bytes: number, truncated: boolean}}
  */
-async function download(url, destination, timeoutMs) {
-  const res = await fetch(url, {
-    redirect: 'follow',
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: { 'User-Agent': 'claude-connector/12.50.0 (tenax-voice provisioner)' },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-
-  const bytes = Buffer.from(await res.arrayBuffer());
-  if (!bytes.length) throw new Error(`empty response for ${url}`);
-
-  const partial = `${destination}.partial`;
-  await writeFile(partial, bytes);
-  await rename(partial, destination);
-  return bytes.length;
+function inspect(source) {
+  const path = join(voicesDir(), source.file);
+  try {
+    const bytes = statSync(path).size;
+    return { path, present: true, bytes, truncated: bytes < source.minBytes };
+  } catch (err) {
+    return { path, present: false, bytes: 0, truncated: false };
+  }
 }
 
 /**
- * Install one voice, unless it is already present.
+ * Fetch one artifact.
  *
- * @param {string} voiceId
- * @param {{force?: boolean, timeoutMs?: number, log?: Function}} [opts]
- * @returns {Promise<{voice: string, status: string, bytes?: number, error?: string}>}
+ * Downloaded to a `.part` file and RENAMED on success, so an interrupted
+ * download can never be mistaken for a complete one. A rename within a
+ * directory is atomic, which a write-in-place is not -- and the failure mode it
+ * prevents is the expensive one: a half-written model that exists, passes an
+ * existence check, and fails at load with an opaque parse error.
+ *
+ * @param {{file: string, url: string, minBytes: number}} source
+ * @param {(msg: string) => void} log
+ * @returns {Promise<boolean>}
  */
-export async function installVoice(voiceId, opts) {
-  const o = opts || {};
-  const log = o.log || (() => {});
-  const timeoutMs = o.timeoutMs || 300_000;
-
-  if (MISSING_UPSTREAM[voiceId]) {
-    return { voice: voiceId, status: 'unavailable', error: MISSING_UPSTREAM[voiceId] };
-  }
-
-  const path = VOICE_SOURCES[voiceId];
-  if (!path) {
-    return {
-      voice: voiceId,
-      status: 'unknown',
-      error: `No source is recorded for "${voiceId}". Known voices: `
-        + `${Object.keys(VOICE_SOURCES).join(', ')}.`,
-    };
-  }
-
+async function fetchArtifact(source, log) {
   const dir = voicesDir();
-  await mkdir(dir, { recursive: true });
-
-  const model  = join(dir, `${voiceId}.onnx`);
-  const config = join(dir, `${voiceId}.onnx.json`);
-
-  // Both files, or it is not installed. A model without its config is the
-  // failure that reads like a corrupt download.
-  if (!o.force && existsSync(model) && existsSync(config)) {
-    const s = await stat(model).catch(() => null);
-    return { voice: voiceId, status: 'present', bytes: s ? s.size : undefined };
-  }
+  const target = join(dir, source.file);
+  const partial = `${target}.part`;
 
   try {
-    // Config first: it is small, so a wrong path or a network fault costs a few
-    // kilobytes instead of sixty megabytes before it is discovered.
-    log(`[voice-provision] ${voiceId}: fetching config`);
-    await download(`${HF_BASE}/${path}/${voiceId}.onnx.json`, config, timeoutMs);
-
-    log(`[voice-provision] ${voiceId}: fetching model (this is tens of MB)`);
-    const bytes = await download(`${HF_BASE}/${path}/${voiceId}.onnx`, model, timeoutMs);
-
-    log(`[voice-provision] ${voiceId}: installed (${Math.round(bytes / 1048576)} MB)`);
-    return { voice: voiceId, status: 'installed', bytes };
+    mkdirSync(dir, { recursive: true });
   } catch (err) {
-    log(`[voice-provision] ${voiceId}: FAILED -- ${err.message}`);
-    return { voice: voiceId, status: 'failed', error: err.message };
+    log(`[voice] cannot create ${dir}: ${err.message}`);
+    return false;
+  }
+
+  log(`[voice] fetching ${source.file} (this is a large file; it runs once)`);
+
+  try {
+    const response = await fetch(source.url, { redirect: 'follow' });
+    if (!response.ok) {
+      log(`[voice] ${source.file} download failed: HTTP ${response.status}`);
+      return false;
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+
+    // Checked BEFORE the rename. A short body that arrived with a 200 -- a proxy
+    // error page, a truncated transfer -- must never be promoted to the real
+    // filename, because from then on every check would say the artifact is
+    // present.
+    if (bytes.length < source.minBytes) {
+      log(`[voice] ${source.file} download was truncated `
+        + `(${bytes.length} bytes, expected at least ${source.minBytes}); discarding`);
+      return false;
+    }
+
+    await writeFile(partial, bytes);
+    renameSync(partial, target);
+    log(`[voice] ${source.file} installed (${bytes.length} bytes)`);
+    return true;
+  } catch (err) {
+    log(`[voice] ${source.file} download failed: ${err.message}`);
+    try { if (existsSync(partial)) unlinkSync(partial); } catch (e) { /* best effort */ }
+    return false;
   }
 }
 
 /**
- * Install several voices, one at a time.
+ * Ensure one named artifact is present.
  *
- * Serial, not parallel. These are tens of megabytes each onto a small shared
- * box that is also serving the connector, and the whole point of Section 12's
- * budgets is that voice does not get to monopolise it.
+ * The name is 'model' or 'voices'. A VOICE name is accepted and answered
+ * honestly rather than rejected: under Kokoro a voice is a vector inside the
+ * bundle, so "install af_bella" means "make sure the bundle is here". Rejecting
+ * it would be technically correct and useless to a caller carrying a voice id.
  *
- * @param {string[]} voiceIds
- * @param {object} [opts]
- * @returns {Promise<Array>}
+ * @param {string} what
+ * @param {{log?: (msg: string) => void}} [opts]
+ * @returns {Promise<{ok: boolean, path: string|null, reason?: string}>}
  */
-export async function installVoices(voiceIds, opts) {
-  const results = [];
-  for (const voiceId of voiceIds) {
-    results.push(await installVoice(voiceId, opts));
+export async function installVoice(what, opts) {
+  const o = opts || {};
+  const log = o.log || (msg => console.log(msg));
+  const wanted = String(what ?? '').trim();
+
+  const source = VOICE_SOURCES[wanted]
+    // Any other name is treated as a voice id, which the bundle carries.
+    || (wanted ? VOICE_SOURCES.voices : null);
+
+  if (!source) {
+    return { ok: false, path: null, reason: 'unknown_artifact' };
   }
-  return results;
+
+  const found = inspect(source);
+  if (found.present && !found.truncated) return { ok: true, path: found.path };
+
+  if (found.truncated) {
+    log(`[voice] ${source.file} is present but only ${found.bytes} bytes; refetching`);
+    try { unlinkSync(found.path); } catch (err) { /* best effort */ }
+  }
+
+  const ok = await fetchArtifact(source, log);
+  return ok
+    ? { ok: true, path: found.path }
+    : { ok: false, path: null, reason: 'download_failed' };
 }
 
 /**
- * The boot hook. Reads VOICE_PROVISION_VOICES and installs what it names.
+ * Ensure everything the engine needs is present.
  *
- * DELIBERATELY OPT-IN, and deliberately does not block the boot:
+ * @param {Array<string>} [names]
+ * @param {{log?: (msg: string) => void}} [opts]
+ * @returns {Promise<{ok: boolean, installed: Array<string>, failed: Array<string>}>}
+ */
+export async function installVoices(names, opts) {
+  const wanted = (Array.isArray(names) && names.length) ? names : ['model', 'voices'];
+  const installed = [];
+  const failed = [];
+
+  // Sequential, not parallel. Two concurrent multi-hundred-megabyte downloads on
+  // a small instance compete for the same bandwidth and the same disk, and the
+  // failure they produce -- a full volume midway through both -- leaves two
+  // truncated files instead of one good one.
+  for (const name of wanted) {
+    const result = await installVoice(name, opts);
+    (result.ok ? installed : failed).push(name);
+  }
+
+  return { ok: 0 === failed.length, installed, failed };
+}
+
+/**
+ * Provision at boot, if asked.
  *
- *   - Opt-in, because a connector that downloads hundreds of megabytes on first
- *     start because a variable was left unset is the same class of surprise the
- *     VOICE_ENABLED default exists to avoid.
- *   - Non-blocking, because Railway's health check has a deadline and a slow
- *     model download must not fail a deploy. Voice reports itself degraded
- *     until the files land, which is exactly what degraded is for.
- *   - Gated on voiceEnabled(), because Section 7 requires that nothing voice
- *     related runs when the master switch is off.
+ * v13.2.0. LARGELY REDUNDANT NOW, and kept deliberately.
  *
- * @param {Function} [log]
- * @returns {Promise<Array>|null} Null when nothing was requested.
+ * The artifacts are baked into the image at /opt/kokoro/models, so a fresh
+ * deploy works with no network and no manual step. This path remains for the
+ * two cases the image copy cannot serve:
+ *
+ *   1. Upgrading the model without rebuilding -- fetch a newer file onto the
+ *      volume, which the runtime prefers over the baked copy.
+ *   2. A deployment that strips the image layers, or runs the source outside
+ *      the container.
+ *
+ * Still OFF by default: with the artifacts baked in, a boot-time fetch would be
+ * pure cost -- a redeploy stalling against a health check deadline to download
+ * something already present.
+ *
+ * DEFAULTS TO OFF. See the header: the model is ~310 MB, and a boot path that
+ * fetches it turns a redeploy into a stall against a health check with a
+ * deadline. Never throws and never blocks -- it returns a promise the caller is
+ * free to ignore, and a failure here surfaces as tts_ready:false with a message
+ * naming the missing path.
+ *
+ * @param {(msg: string) => void} [log]
+ * @returns {Promise<{ok: boolean, skipped?: boolean, installed?: Array<string>,
+ *                    failed?: Array<string>}>}
  */
 export function provisionFromEnv(log) {
-  const raw = String(process.env.VOICE_PROVISION_VOICES || '').trim();
-  if (!raw) return null;
+  const write = log || (msg => console.log(msg));
+  const raw = String(process.env.VOICE_PROVISION_ON_BOOT || '').trim().toLowerCase();
+  const enabled = 'true' === raw || '1' === raw || 'yes' === raw;
 
-  const wanted = raw.split(',').map(s => s.trim()).filter(Boolean);
-  if (!wanted.length) return null;
+  if (!enabled) {
+    // v13.2.0. Absent from the VOLUME is no longer a problem worth a warning:
+    // the runtime falls back to the copy baked into the image, which is the
+    // normal and expected state. Warning about it on every boot would train an
+    // operator to ignore the log line that matters.
+    //
+    // It is only worth saying something when NEITHER layer has the artifacts,
+    // which means the image was built without them -- and that is a broken
+    // image rather than a missing volume.
+    const missingFromVolume = ['model', 'voices']
+      .filter(k => !inspect(VOICE_SOURCES[k]).present)
+      .map(k => VOICE_SOURCES[k].file);
 
-  const say = log || ((m) => console.log(m));
-  say(`[voice-provision] requested: ${wanted.join(', ')}`);
+    if (missingFromVolume.length) {
+      const bakedMissing = missingFromVolume
+        .filter(f => !existsSync(join(BAKED_DIR, f)));
+      if (bakedMissing.length) {
+        write(`[voice] Kokoro artifacts are on NEITHER the volume (${voicesDir()}) `
+          + `nor in the image (${BAKED_DIR}): ${bakedMissing.join(', ')}. `
+          + 'The image was built without them. Rebuild, or set '
+          + 'VOICE_PROVISION_ON_BOOT=true to fetch them onto the volume.');
+      }
+    }
+    return Promise.resolve({ ok: true, skipped: true });
+  }
 
-  return installVoices(wanted, { log: say }).then((results) => {
-    const failed = results.filter(r => r.status === 'failed' || r.status === 'unavailable'
-                                    || r.status === 'unknown');
-    failed.forEach(r => console.error(`[voice-provision] ${r.voice}: ${r.error}`));
-    const ok = results.filter(r => r.status === 'installed' || r.status === 'present');
-    say(`[voice-provision] done: ${ok.length} available, ${failed.length} unresolved`);
-    return results;
-  }).catch((err) => {
-    // Never allowed to take the connector down. A failed voice download is a
-    // degraded feature, not a dead service.
-    console.error(`[voice-provision] aborted: ${err.message}`);
-    return [];
-  });
+  return installVoices(['model', 'voices'], { log: write })
+    .catch(err => {
+      write(`[voice] provisioning failed: ${err.message}`);
+      return { ok: false, installed: [], failed: ['model', 'voices'] };
+    });
 }
 
 export default {
-  installVoice, installVoices, provisionFromEnv, voicesDir,
-  VOICE_SOURCES, MISSING_UPSTREAM,
+  voicesDir, VOICE_SOURCES, MISSING_UPSTREAM, installVoice, installVoices,
+  provisionFromEnv,
 };

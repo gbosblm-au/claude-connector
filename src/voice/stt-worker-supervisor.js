@@ -24,7 +24,7 @@
 // VOICE_PYTHON_BIN, the same interpreter voice_stt.py has always used.
 //
 // The Piper worker imports piper, which is GPL-3.0-or-later, and runs on
-// VOICE_PIPER_PYTHON.
+// VOICE_KOKORO_PYTHON.
 //
 // THOSE TWO MUST NEVER BE THE SAME INTERPRETER. Since v12.54.0 both workers are
 // supervised by one shared module, which means the separation is now expressed
@@ -32,7 +32,7 @@
 // between two files. That is a genuine weakening of a structural guarantee, and
 // it is compensated for by asserting it directly in
 // src/tests/voice-gpl-boundary.test.js -- which checks that this file resolves
-// VOICE_PYTHON_BIN, that piper-worker-supervisor.js never mentions it, and that
+// VOICE_PYTHON_BIN, that the TTS supervisor never mentions it, and that
 // the two resolvers cannot collapse to one value by default.
 
 import { join }        from 'node:path';

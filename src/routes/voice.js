@@ -63,6 +63,11 @@ import { voicePermitted, voicesForLanguage,
          // two answer "would it actually speak".
          speakableLanguages, bestVoiceForLanguage,
          attributions }           from '../voice/voice-catalog.js';
+// v13.0.1. SAMPLE_RATES and registryState come from the registry rather than
+// being restated here: the offered rates are a property of the model, and a
+// second list would be a second answer to the same question.
+import { SAMPLE_RATES, registryState, resolveVoice as resolveFromRegistry }
+                                 from '../voice/voice-registry.js';
 import { probeEngines, engineState, installedVoices,
          transcribe, synthesize,
          // v12.53.0 -- the prosody layer (TS-VOICE-PROSODY-v1.0).
@@ -80,6 +85,41 @@ import { analyse, prosodyConfig, replyHash,
  * the CPU for seconds -- so the ceiling is low by design. */
 const WINDOW_MS = intEnv('VOICE_RATE_WINDOW_MS', 60_000);
 const MAX_REQS  = intEnv('VOICE_RATE_MAX', 20);
+
+/**
+ * The output sample rate this request asked for, if any.
+ *
+ * v13.0.1 -- SPEC-KOKORO-001 Section 12.
+ *
+ * Returns `undefined` when nothing was asked for (the deployment default then
+ * applies), a number when a valid rate was, and `false` when the request was
+ * REFUSED -- in which case this has already sent the response.
+ *
+ * The three-way return is deliberate. "Nothing asked for" and "asked for
+ * something invalid" are genuinely different outcomes, and collapsing them
+ * would mean an unsupported rate silently produced audio at some other rate --
+ * which is the one failure an admin cannot diagnose by listening.
+ *
+ * @param {object} body
+ * @param {object} res
+ * @returns {number|undefined|false}
+ */
+function parseSampleRate(body, res) {
+  const raw = body ? body.sample_rate : undefined;
+  if (undefined === raw || null === raw || '' === raw) return undefined;
+
+  const wanted = Number(raw);
+  if (!Number.isFinite(wanted) || !SAMPLE_RATES.includes(wanted)) {
+    res.status(422).json({
+      error: 'unsupported_sample_rate',
+      // Names what IS offered. The caller is usually the gateway relaying a
+      // tenant setting, and the operator reading this needs the valid set.
+      message: `Sample rate must be one of ${SAMPLE_RATES.join(', ')}.`,
+    });
+    return false;
+  }
+  return wanted;
+}
 
 function intEnv(name, fallback) {
   const n = parseInt(process.env[name] || '', 10);
@@ -224,7 +264,42 @@ function logMeta(direction, meta) {
  */
 async function resolveVoice(body, res) {
   const language = String(body.language || '').trim().toLowerCase();
+
+  // v13.1.1 -- SPEC-KOKORO-001 Section 10, precedence made real.
+  //
+  // THE DEFECT THIS FIXES. VOICE_TTS_TENANT_VOICE was reported in
+  // /voice/health as though it were a setting and was read by NOTHING. An
+  // operator could set it, see it echoed back in the health payload, and get no
+  // change in the voice -- which is the worst shape a configuration bug can
+  // take, because the system appears to confirm the setting.
+  //
+  // Precedence is: an explicit per-request voice, then the deployment-wide
+  // tenant default, then the platform default. The gateway injects a
+  // per-TENANT voice into body.voice, which is why that level wins here -- a
+  // multi-tenant install resolves above this function, and this env var is the
+  // single-tenant fallback it was always documented to be.
+  //
+  // A stale or unknown value at either level falls through to the next rather
+  // than failing, and is reported. A bad env var should cost a log line, not
+  // every reply.
+  const fromRegistry = resolveFromRegistry({
+    requested: body.voice,
+    tenant: process.env.VOICE_TTS_TENANT_VOICE,
+  });
+  for (const ignored of fromRegistry.ignored) {
+    console.warn(`[voice] ignoring unusable ${ignored.level} voice `
+      + `"${ignored.value}"; falling back`);
+  }
+
+  // Only adopted when the caller named nothing AND no language was given. With
+  // a language present the catalogue's own selection below is more specific --
+  // it checks what is actually installed -- and overriding it here would
+  // reintroduce the "licence-cleared but never downloaded" 500 that
+  // bestVoiceForLanguage exists to prevent.
   let voice = String(body.voice || '').trim();
+  if (!voice && !language && 'default' !== fromRegistry.source) {
+    voice = fromRegistry.voice;
+  }
 
   // No voice named: take the language's default from the catalogue. This is
   // the path most callers use, and it must fail as clearly as an explicitly
@@ -251,16 +326,21 @@ async function resolveVoice(body, res) {
       // voice nobody has checked cannot ship, and saying so beats a 500.
       res.status(422).json({
         error: 'no_voice_available',
-        message: `No licence-cleared voice is available for "${language}". `
-          + 'Each Piper voice is governed by its own MODEL_CARD and some are '
-          + 'non-commercial, so voices are refused until audited.',
+        // v13.1.1. Was written for Piper's per-voice licence model, where each
+        // voice carried its own MODEL_CARD and some were non-commercial. Kokoro
+        // is one Apache-2.0 model, so a language with no voice means no voice
+        // is REGISTERED for it -- not that one is awaiting an audit. The old
+        // wording would send an operator hunting a licence problem that cannot
+        // exist.
+        message: `No voice is registered for "${language}" on this connector. `
+          + `Text-to-speech supports ${TTS_LANGUAGES.join(', ')}.`,
       });
       return null;
     }
     // v12.51.0: prefer a voice whose model is actually on the volume. Taking
-    // catalogue order blindly can select a licence-cleared voice that was never
-    // downloaded, which reaches Piper and comes back as a 500 -- an engine
-    // failure reported for what is really a missing file.
+    // catalogue order blindly can select a registered voice that is not in the
+    // installed bundle, which reaches the engine and comes back as a 500 -- an
+    // engine failure reported for what is really a missing artifact.
     const best = bestVoiceForLanguage(language, installedVoices());
     if (!best.installed) {
       res.status(422).json({
@@ -390,6 +470,18 @@ export function registerVoiceRoutes(app) {
       // populated catalogue is the state where TTS looks configured and cannot
       // speak, so the two are reported side by side rather than conflated.
       voices_installed: engines.voices_installed || [],
+
+      // v13.0.1. The SAME list, with the labels and accents a picker needs.
+      //
+      // voices_installed is a bare array of ids and stays exactly as it is,
+      // because clients gate on it. This is additive: without it the gateway's
+      // settings screen can only offer raw ids like `af_bella`, and an admin
+      // choosing a voice for their whole workspace deserves to read
+      // "Bella (US, female)".
+      //
+      // Narrowed to what is ACTUALLY installed rather than to what the registry
+      // offers, so the picker cannot present a voice the engine would refuse.
+      voices: registryState(engines.voices_installed || []).voices,
 
       // v12.51.0. THE field a client should gate its voice UI on.
       //
@@ -544,6 +636,7 @@ export function registerVoiceRoutes(app) {
     });
 
   // -------------------------------------------------------------------------
+  // v13.0.1 -- SPEC-KOKORO-001 Section 12. See parseSampleRate below.
   // POST /voice/synthesize   (Section 8.3)
   // -------------------------------------------------------------------------
   app.post('/voice/synthesize',
@@ -575,6 +668,19 @@ export function registerVoiceRoutes(app) {
         });
         return;
       }
+
+      // v13.0.1 -- SPEC-KOKORO-001 Section 12, per-tenant output rate.
+      //
+      // The gateway injects the TENANT'S rate here, because the connector's env
+      // var expresses one rate for the whole process and cannot serve two
+      // tenants differently.
+      //
+      // REFUSED rather than silently ignored when it is not one of the offered
+      // rates. An admin who set a rate and heard no difference would have no
+      // way to tell whether the setting was wrong, unsupported, or simply not
+      // plumbed through -- which is exactly the failure this release fixes.
+      const requestedRate = parseSampleRate(body, res);
+      if (false === requestedRate) return;   // parseSampleRate has answered.
 
       const resolved = await resolveVoice(body, res);
       if (!resolved) return;   // resolveVoice has already answered.
@@ -629,6 +735,35 @@ export function registerVoiceRoutes(app) {
 
       const flatSpeed = Number.isFinite(speed) ? speed : undefined;
 
+      /**
+       * The flat rendering. ONE definition, three call sites.
+       *
+       * v13.0.1 -- AC3/AC5/N4 made structural instead of asserted.
+       *
+       * AC3 requires the flat output to be byte-identical to the pre-prosody
+       * build for the same text, and AC5 requires Compare's flat half to match
+       * what Off mode produces. Both are equivalence properties between call
+       * sites that used to be written out three times: once for Compare, once
+       * for the prosody fallback, once for the true flat path.
+       *
+       * Three copies of an argument list cannot be kept equal by review, and a
+       * test that compares them can only report drift AFTER someone has shipped
+       * it. Worse, the test that did compare them pinned a literal argument
+       * list -- so adding `sampleRate` to all three, which PRESERVED the
+       * equivalence exactly, still failed it. A test that fails on correct code
+       * invites weakening, which is how the control gets lost.
+       *
+       * A closure removes the class of bug rather than detecting it. There is
+       * now no way for the three paths to disagree, because there is nothing to
+       * keep in step: the equivalence is a property of the code, not a claim
+       * about it.
+       *
+       * @returns {Promise<Buffer>} WAV bytes.
+       */
+      const renderFlat = () => synthesize({
+        text, voice, speed: flatSpeed, sampleRate: requestedRate,
+      });
+
       try {
         // ---- Compare mode (Section 7.2, AC5) -------------------------------
         //
@@ -649,9 +784,10 @@ export function registerVoiceRoutes(app) {
         // and the flat output matches the Off-mode output for that text" --
         // and the pairing the UI needs is the shared hash, not the transport.
         if ('both' === effective) {
-          const flat = await synthesize({ text, voice, speed: flatSpeed });
+          const flat = await renderFlat();
           const layered = await synthesizeProsody({
             text, voice, speed: flatSpeed, config: prosodyCfg,
+            sampleRate: requestedRate,
           });
 
           logMeta('tts', {
@@ -696,6 +832,7 @@ export function registerVoiceRoutes(app) {
           try {
             const layered = await synthesizeProsody({
               text, voice, speed: flatSpeed, config: prosodyCfg,
+              sampleRate: requestedRate,
             });
             wav = layered.wav;
             path = layered.path;
@@ -717,7 +854,7 @@ export function registerVoiceRoutes(app) {
             logMeta('tts_prosody_fallback', {
               code: layerErr.code || 'tts_failed', chars: text.length,
             });
-            wav = await synthesize({ text, voice, speed: flatSpeed });
+            wav = await renderFlat();
             path = 'flat_fallback';
             res.setHeader('X-Tenax-Prosody-Degraded', 'layer_failed');
           }
@@ -726,7 +863,7 @@ export function registerVoiceRoutes(app) {
           // prosody run with the features turned off -- the same function, the
           // same argv, the same bytes -- so the comparison always has a genuine
           // reference (AC3).
-          wav = await synthesize({ text, voice, speed: flatSpeed });
+          wav = await renderFlat();
         }
 
         // Character count and voice only. Never the text (Section 10).
@@ -913,7 +1050,7 @@ export function registerVoiceRoutes(app) {
       try {
         const result = await synthesizeProsodyStream(
           { text, voice: resolved.voice, speed: Number.isFinite(speed) ? speed : undefined,
-            config: prosodyCfg },
+            config: prosodyCfg, sampleRate: streamRate },
           async (segment) => {
             // The user navigated away or stopped playback. Throwing here
             // unwinds the phrase pool, so no further Piper process is spawned
@@ -1025,6 +1162,9 @@ export function registerVoiceRoutes(app) {
       // makes every returned lengthScale a pure multiplier -- the right answer
       // for inspecting the register table itself. With one, the numbers are
       // what that voice would actually be given (Section 4.2).
+      const streamRate = parseSampleRate(body, res);
+      if (false === streamRate) return;   // parseSampleRate has answered.
+
       const voice = String(body.voice || '').trim();
       let base = 1;
       if (voice) {

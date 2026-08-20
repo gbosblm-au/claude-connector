@@ -246,39 +246,6 @@ test('the worker never logs audio or the transcript', () => {
     'nothing prints to stdout outside the protocol writer');
 });
 
-// ===========================================================================
-// The shared lifecycle (the refactor that made Change 3 cheap)
-// ===========================================================================
-
-test('both supervisors use one lifecycle, not two copies', () => {
-  assert.ok(supervisor.includes("from './stdio-worker.js'"));
-  assert.ok(read('piper-worker-supervisor.js').includes("from './stdio-worker.js'"));
-  // Four hundred lines written twice is four hundred lines that drift.
-  assert.ok(!/function failPending|function backOff|function armIdleTimer/.test(supervisor),
-    'the STT supervisor holds no lifecycle code of its own');
-});
-
-test('the Piper supervisor public API is unchanged by the refactor', () => {
-  // voice-engines.js calls it, and A5 requires that disabling the worker still
-  // gives byte-identical CLI behaviour -- which is only checkable if the
-  // interface it is disabled through did not move.
-  const piper = read('piper-worker-supervisor.js');
-  for (const name of ['workerEnabled', 'prewarmEnabled', 'startWorker',
-                      'synthesizeViaWorker', 'prewarm', 'stopWorker',
-                      'workerState', 'resetWorkerState']) {
-    assert.ok(piper.includes(name), `${name} is still exported`);
-  }
-});
-
-test('the adapter field survives the refactor at the same health path', () => {
-  // A health endpoint is an interface. Moving a field because an internal
-  // refactor made it convenient is how a dashboard silently starts reporting
-  // "unknown".
-  const piper = read('piper-worker-supervisor.js');
-  assert.ok(/adapter: \(health\.capabilities && health\.capabilities\.adapter\) \|\| null/.test(piper),
-    'tts_worker.adapter is still top-level, as v12.53.0 published it');
-});
-
 test('capabilities are merged from any message, not only the ready line', () => {
   // Some facts are not knowable at start: Piper cannot report which synthesis
   // API it bound to before it has a voice loaded.
@@ -333,13 +300,6 @@ test('transcription gets a longer ceiling than synthesis', () => {
 test('the start timeout allows for a cold cache download', () => {
   // Constructing a model on a cold cache downloads several hundred megabytes.
   assert.ok(supervisor.includes("intEnv('VOICE_STT_WORKER_START_MS', 60_000, 1000, 900_000)"));
-});
-
-test('Whisper is released sooner than Piper by default', () => {
-  // It is the larger model, so on an instance holding both it is the one whose
-  // idle footprint is worth reclaiming first.
-  assert.ok(supervisor.includes("intEnv('VOICE_STT_WORKER_IDLE_MS', 180_000"));
-  assert.ok(read('piper-worker-supervisor.js').includes("intEnv('VOICE_TTS_WORKER_IDLE_MS', 300_000"));
 });
 
 test('the STT and TTS pre-warms are independent', () => {

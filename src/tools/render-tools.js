@@ -1401,25 +1401,56 @@ async function handleSpecRender( cfg, input ) {
       const produced = dirExists && readdirSync( downloadsBase() ).some( name => name.endsWith(ext) );
 
       if ( produced ) {
+        // v13.1.1 -- REPORTED AS A FAILURE, NOT A PARTIAL SUCCESS.
+        //
+        // ── The bug this fixes, and why the old shape caused it ─────────────
+        //
+        // This branch used to return `ok: true, partial: true` with a message
+        // explaining that the file was on disk "and available through the
+        // downloads directory". Every consumer that checks `ok` and reads
+        // `download_url` therefore saw a SUCCESS with no link, and presented the
+        // user with a document they could not open. That is the empty-document
+        // symptom, and it is reproducible: unset CONNECTOR_URL and render.
+        //
+        // The reasoning behind the old shape assumed an operator standing next
+        // to the box. On a hosted connector the user is not: the downloads
+        // directory is unreachable to them, so a file they cannot fetch is not
+        // a partial deliverable, it is no deliverable. Success is a claim about
+        // what the CALLER can do next, and here they can do nothing.
+        //
+        // The diagnostic richness is kept -- which renderer ran, that the file
+        // WAS written, and which variable is missing -- because the operator
+        // fix is a one-line environment change and the message should say so.
         const urlIssue = ! isNonEmptyString( process.env.CONNECTOR_URL )
           ? 'CONNECTOR_URL_NOT_SET'
           : 'DOWNLOAD_LINK_UNBUILDABLE';
 
-        return mcp( {
-          ok: true,
-          tool,
-          format: ext.replace( '.', '' ),
-          renderer: scriptFile,
-          spec_bytes: staged.bytes,
-          ...counts( spec ),
-          partial: true,
-          partial_reason: urlIssue,
-          message: `${ scriptFile } ran successfully and wrote a ${ ext } file to ${ downloadsBase() }, but a shareable link could not be built (CONNECTOR_URL is ${ process.env.CONNECTOR_URL ? 'set' : 'not set' }). The file is on disk and available through the downloads directory.`,
-          download_warnings: warnings.length ? warnings : undefined,
-          renderer_contract: envelope || undefined,
-          ...( ignored.length ? { ignored_parameters: ignored } : {} ),
-          execution_time_ms: run.elapsed_ms,
-        } );
+        // Guaranteed to name the variable even when buildDownloadLinks failed
+        // for a reason of its own, because the operator's next action depends on
+        // reading it.
+        const urlWarning = 'CONNECTOR_URL_NOT_SET' === urlIssue
+          ? 'CONNECTOR_URL is not set on the connector service, so no download '
+            + 'URL can be built for the file that was rendered.'
+          : 'CONNECTOR_URL is set but a download link could not be built for the '
+            + 'file that was rendered.';
+
+        return failure( tool, 'no_output_produced',
+          `${ scriptFile } wrote a ${ ext } file to ${ downloadsBase() }, but no `
+          + 'shareable link could be built, so nothing can be delivered to the '
+          + `user. ${ urlWarning }`,
+          {
+            renderer: scriptFile,
+            format: ext.replace( '.', '' ),
+            spec_bytes: staged.bytes,
+            // Distinguishes "rendered but unreachable" from "never rendered",
+            // which are different operator problems with the same error_kind.
+            file_written: true,
+            partial_reason: urlIssue,
+            download_warnings: [ urlWarning, ...warnings ],
+            renderer_contract: envelope || undefined,
+            ...( ignored.length ? { ignored_parameters: ignored } : {} ),
+            execution_time_ms: run.elapsed_ms,
+          } );
       }
 
       return failure( tool, 'no_output_produced',

@@ -1,3 +1,300 @@
+# v13.2.0 — The engine artifacts survive a redeploy
+
+The model and voice bundle are BAKED INTO THE IMAGE. A fresh deploy speaks
+immediately: no manual provisioning, no boot-time download, no network at start.
+
+THE BUG UNDERNEATH THE BUG. v13.0.0 ran `mkdir -p /data/voice/kokoro` and pointed
+the engine there. On a platform that mounts a volume at /data, THE MOUNT SHADOWS
+EVERYTHING THE IMAGE PUT THERE — so baking to that path would have produced files
+that exist in the layer and are unreachable at runtime, failing exactly like the
+problem being fixed. The artifacts go to /opt/kokoro/models instead.
+
+Resolution is layered: explicit env -> volume, if present -> the image copy. So
+the baked copy is a FLOOR, not a ceiling: a fresh deploy works immediately, and an
+operator can drop a newer model on the volume without rebuilding.
+VOICE_KOKORO_MODEL/VOICES are deliberately no longer set in the image, because
+pinning them defeats the mechanism; the test asserting they WERE set is inverted.
+
+The build proves what it ships: curl -f catches an HTTP error, size floors catch
+a truncated transfer that arrived with a 200, and a real Kokoro() load catches
+weights that download cleanly and fail to parse. It also asserts all five offered
+voices are in the bundle. The &&/|| chain was EXECUTED against truncated and valid
+artifacts rather than reasoned about — `exit 1` in a subshell exits the subshell,
+not the build.
+
+Costs ~330 MB of image and a build dependency on GitHub releases. Both deliberate.
+
+/voice/health and the smoke test now report WHICH layer supplied each artifact.
+
+Full detail in `CHANGELOG-v13.2.0.md`.
+
+# v13.1.1 — Four review findings, including two more pieces of dead scaffolding
+
+THE WHOLE CONNECTOR SUITE IS GREEN FOR THE FIRST TIME: 611 passed, 0 failed. The
+`render-tools > download contract` failure called "pre-existing" in three
+consecutive releases is FIXED, not re-categorised.
+
+1. THE EMPTY DOCUMENT BUG. With CONNECTOR_URL unset, document rendering returned
+   `ok: true, partial: true` — so every consumer checking `ok` and `download_url`
+   saw a SUCCESS with no link and presented an unopenable document. The old shape
+   assumed an operator standing next to the box; on a hosted connector the
+   downloads directory is unreachable to the user. Now a failure naming the
+   variable. Reproduce: unset CONNECTOR_URL and render. FLAGGED: edit-tools has
+   the same condition and the opposite contract, with a passing test defending
+   it. That needs an owner.
+
+2. VOICE_TTS_TENANT_VOICE was reported in /voice/health and read by NOTHING — an
+   operator could set it, see it echoed back as confirmation, and get no change.
+   Now wired, scoped so it cannot override the installed-voice check.
+
+3. PER-ASSISTANT VOICE DID NOT SHIP and cannot as specified: there is no
+   assistant-profile entity in this platform. Per-request and per-tenant shipped,
+   which is what was asked for.
+
+4. THE 16 kHz CONTROL IS NOT BROKEN. Verified end to end; the 422 fires only for
+   rates not on the offered list.
+
+The smoke test now renders a realistic PARAGRAPH and reports a realtime factor,
+so the CPU decision rests on a measured number rather than an assumption. I still
+have no number — it needs your hardware.
+
+The model is NOT in the image: `npm run voice:provision` is a required step.
+
+Full detail in `CHANGELOG-v13.1.1.md`.
+
+# v13.1.0 — The prosody preprocessor was never wired in
+
+A DEFECT RELEASE. v12.55.0 built the Section 6 preprocessor and wired it into
+nothing; the v13.0.0 swap never wired it either. Through v13.0.2 it had 34
+passing tests and was DEAD CODE. Rules 2-5 were inert: no contour shaping, no
+dialogue beats, no emphasis, no lexicon — and markdown links reached the engine
+intact, so a direct API caller would have had URLs read aloud. Browser traffic
+was protected only by accident, because the client sends innerText from rendered
+HTML.
+
+Every test tested the transform. NONE could see that nobody called it. Six new
+assertions now can; restoring the v13.0.2 wiring fails three of them.
+
+YOUR EMPHASIS DECISION, RESOLVED. Configured ON as decided, ineffective on the
+espeak path, and REPORTED as such: /voice/status returns
+`emphasis: {configured, effective, requires}`. Reporting only the first makes the
+switch look broken; only the second hides that an operator asked for something.
+
+THE G2P CEILING, STATED. The HF Space that demos Kokoro runs misaki. This
+connector runs espeak-ng — the same phonemiser CLASS Piper used. The acoustic
+model is a large step up; the front end is not, and the difference is audible on
+proper nouns and initialisms. The realism gain is real but NARROWER than the
+Space implies. /voice/status now names the running front end so this is read off
+a health endpoint rather than discovered on first listen.
+
+Audio WILL change: replies now get terminal punctuation and phrases are
+contoured. Listen before opening it up.
+
+Full detail in `CHANGELOG-v13.1.0.md`.
+
+# v13.0.2 — The Compare/Off equivalence made structural, and a deploy audit
+
+Supersedes v13.0.1.
+
+The AC5/N4 assertion kept failing on CORRECT code. It protects a real property —
+Compare's flat half must be the same call Off mode makes — but it was asserted
+first as a regex pinning an exact argument list, then as a string comparison of
+two extracted call sites. Adding `sampleRate` to BOTH sides preserved the
+equivalence and still failed the first; the second was fragile in the same
+direction.
+
+The problem was in the CODE. Three separate synthesize() call sites each carried
+their own copy of the same argument list, and three copies cannot be kept equal
+by review. They now share one `renderFlat()` closure, so the equivalence is a
+property of the code rather than a claim about it. Mutation-tested three ways,
+including the benign case the old assertion got wrong twice.
+
+DEPLOY AUDIT: removed a redundant espeak-ng Docker layer (it was already
+installed since the Piper era) and annotated the real one, because a reviewer
+pruning Piper leftovers would reasonably assume it was one — it is not, since
+phonemizer SHELLS OUT to the espeak-ng binary. Confirmed all Kokoro artifacts
+land in the runtime stage rather than a discarded build stage. Retargeted three
+stale VOICE_PIPER_* comment references. Verified the gateway/connector status
+contract in both directions, including the legacy fallback.
+
+Note before deploying: an admin must have voice enabled on their own account
+before they can configure the tenant default.
+
+Full detail in `CHANGELOG-v13.0.2.md`.
+
+# v13.0.1 — The sample rate actually reaches the engine
+
+Closes an integration gap in v13.0.0 that no single package's tests could see.
+
+The registry could express an output rate, the gateway stored a per-tenant rate
+and injected it, the client offered a control to set it -- and the connector's
+route NEVER READ `body.sample_rate`. Three green suites and a feature that did
+nothing.
+
+parseSampleRate() now runs on both synthesis routes, returning three distinct
+things: undefined (nothing asked for), a number, or false (refused, 422 already
+sent). Collapsing the first and last would let an unsupported rate silently
+produce audio at some other rate -- the one failure an admin cannot diagnose by
+listening.
+
+Threaded to EVERY engine call, not just the common one: Compare, the prosody
+fallback and the flat path are three separate calls, and a rate applied to two of
+them yields a reply whose halves are at different rates. Threaded down to each
+phrase worker too, or the WAV would declare one rate and contain another.
+
+Also: /voice/status gains a labelled `voices` array so an admin picks between
+"Bella (US, female)" and "Emma (UK, female)" rather than af_bella and bf_emma.
+voices_installed is unchanged; clients gate on it.
+
+A test failed on CORRECT code: the Compare/Off equivalence was asserted against a
+literal argument list, so adding sampleRate to both sides preserved the property
+and still failed. Rewritten as an equivalence between the two call sites.
+
+No gateway or client change required. Full detail in `CHANGELOG-v13.0.1.md`.
+
+# v13.0.0 — Kokoro-82M replaces Piper (SPEC-KOKORO-001, the cutover)
+
+BREAKING. Piper is deleted. This is the release that changes what a user hears;
+deploy behind a listening check and rebuild the image.
+
+Kokoro-82M (Apache-2.0) replaces Piper (GPL-3.0). One model plus one bundle of
+style vectors instead of one .onnx per voice, so voice selection is a per-call
+parameter rather than a model path. Five voices: af_bella (default), af_nicole,
+af_heart, bf_emma, af_aoede. Output 24 kHz native, 16 kHz selectable.
+
+WHAT YOU LOSE: Vietnamese, Chinese and Japanese speech. Kokoro has no Vietnamese
+voice at any version and none of the five deployed voices is ja or zh.
+TTS_LANGUAGES drops to ['en']. The loss is visible — the client's existing
+languageSpeakable() gate hides the Speak button rather than letting it fail.
+
+THE GPL BOUNDARY DID NOT RETIRE WITH PIPER. kokoro-onnx phonemises via
+phonemizer/espeak-ng, and espeak-ng is GPL-3.0. The dependency moved from model
+to phonemiser, so /opt/kokoro is still its own venv and every boundary test was
+retargeted rather than removed.
+
+Caught before shipping: the Dockerfile still built a Piper venv, and
+`npm run voice:smoke` imported a deleted module — the one command an operator
+runs after deploying would have crashed on import.
+
+Voice suites 236/236. Whole connector 592/593, the one failure pre-existing and
+unrelated. NOTHING has been run against a real Kokoro model — run
+`npm run voice:smoke` before opening it to users.
+
+Full detail in `CHANGELOG-v13.0.0.md`.
+
+# v12.57.0 — Kokoro worker supervisor and the two-tier fallback (part 3)
+
+CHANGES NO BEHAVIOUR. Adds `kokoro-worker-supervisor.js` and a `--once` mode on
+the worker, wired into nothing. Last of the additive releases.
+
+THE FINDING. Under Piper there were always TWO routes to audio: the resident
+worker and a fresh binary per utterance, which is why a sick worker cost latency
+rather than speech. Retiring Piper deletes the second route, so the resident
+worker would become a single point of failure for ALL speech. Section 7.1's
+subprocess mode is therefore kept as tier two rather than discarded after
+evaluation — the same script with `--once`, sharing one `synthesisRequest()` so
+the tiers cannot diverge.
+
+The refusal list is where the tiers are reasoned about: `synthesis_failed`,
+`kokoro_import_failed` and `no_audio` are deliberately absent, because all three
+can be true of a sick worker while a fresh process works perfectly.
+
+Carried over rather than relearned: an interpreter guess that is wrong by
+construction is worse than no guess, so `kokoroPython()` returns EMPTY rather
+than `python3`. And a SIGKILL is named as the likely OOM killer rather than
+reported as "exited null".
+
+Full detail in `CHANGELOG-v12.57.0.md`.
+
+# v12.56.0 — Kokoro voice registry and resident worker (SPEC-KOKORO-001, part 2)
+
+CHANGES NO BEHAVIOUR. Adds `voice-registry.js`, `kokoro_worker.py` and
+`requirements-kokoro.txt`, wired into nothing. TTS still runs on Piper. The swap
+is atomic, so the provable parts land first.
+
+Registry: af_bella (default), af_nicole, af_heart, bf_emma, af_aoede. Note the
+UNDERSCORE — the decision was written `af-bella`, and a hyphen is an unknown voice.
+
+SPEC CORRECTIONS IN CODE. Section 8 models one `.pt` per voice; kokoro-onnx ships
+one bundle of style vectors, so a row is bundle+name. Section 10's "Kokoro locks
+voices at model load" is false for kokoro-onnx — `create()` takes `voice=` per
+call, so switching is free and the reload machinery it describes is unnecessary.
+Section 7.2 asks for FastAPI; this reuses the proven stdio supervisor instead, to
+avoid a second authenticated route into synthesis. Revisit if a GPU budget lands.
+
+THE GPL BOUNDARY DID NOT RETIRE WITH PIPER. kokoro-onnx phonemises via
+phonemizer/espeak-ng, and espeak-ng is GPL-3.0. The dependency moved from model to
+phonemiser, so every boundary discipline still applies.
+
+TTS_LANGUAGES drops to ['en']. Kokoro has no Vietnamese voice at any version.
+Accepted per the 2026-08-19 decision that Piper was a POC.
+
+16 kHz admin switch verified numerically: a 10 kHz tone is suppressed to ≈ −50 dB
+rather than aliasing into the speech band, on both the scipy and numpy paths.
+
+Full detail in `CHANGELOG-v12.56.0.md`.
+
+# v12.55.0 — Kokoro prosody preprocessor (SPEC-KOKORO-001 Phase 2, part 1)
+
+CHANGES NO BEHAVIOUR. Adds `src/voice/voice-prosody-prep.js` and a `beatMarker`
+option on the normaliser, and wires neither into the synthesis path. TTS still
+runs on Piper, unchanged. The Piper→Kokoro swap is atomic — half a swap is a mute
+platform — so the parts provable without a model land first, separately.
+
+THE FINDING. Section 4's markup (`[word](+2)`, `[Kokoro](/kˈOkəɹO/)`) is a MISAKI
+feature, not a Kokoro one. kokoro-onnx phonemises via phonemizer/espeak-ng, which
+has no markdown handling: hand espeak `[best](+2)` and it says "plus two" out
+loud. Markup does not degrade to plain, it degrades to WORSE than plain. Every
+markup rule is therefore gated on the G2P actually in use, defaulting to espeak
+(what a bare `pip install kokoro-onnx` gives you), with suppression reported
+rather than hidden.
+
+Section 6.2 could not be implemented as written: normalise-then-prep means the
+beat is already a plain space by the time the preprocessor runs, so rule 3 was
+unreachable. The beat replacement is now a parameter; the default is unchanged, so
+existing callers and the Piper path are untouched.
+
+Three defects found in implementation: a doubled comma on `audit,”“Honestly` (the
+author's comma IS the beat); a markdown-link hazard where `[docs](https://x.io)`
+would be read as phonemes and the URL spoken aloud; and a suppression notice that
+fired on all traffic rather than on actual occurrence.
+
+Full detail, including the three mutation tests and what is NOT verified, in
+`CHANGELOG-v12.55.0.md`.
+
+# v12.54.3 — Strip typographic artifacts from TTS input
+
+Implements VOICE-TTS-NORMALIZE-v1.0. Connector only; no gateway, plugin or UI
+change, no migration, no new environment variable.
+
+Smart quotes, guillemets, low-9 quotes and zero-width controls were reaching
+Piper's phonemiser, which either voices them as a glyph or absorbs them into the
+neighbouring word and mis-stresses it. New pure transform
+`src/voice/voice-text-normalize.js`, applied in `synthesizePcm()` — the one
+choke point both the flat path and the prosody layer reach, and which sits
+upstream of BOTH the resident worker and the CLI spawn.
+
+DEVIATION, STATED PLAINLY. Section 3 lists U+2019 as stripped; Section 5 forbids
+producing misspelled words. U+2019 is what every modern editor and language
+model emits for an apostrophe, so obeying Section 3 literally turns `don’t` into
+`dont` — exactly what Section 5 exists to prevent. U+2018 and U+2019 are
+therefore resolved BY POSITION: between two letters they are an apostrophe and
+become ASCII `'`; anywhere else they are a delimiter and are stripped.
+
+Also: Section 4's no-merging invariant is treated as stronger than its
+lone-boundary rule, so `word"word` becomes `word word` rather than `wordword`,
+and the real dialogue shape `audit,”“Honestly` becomes `audit, Honestly` rather
+than welding the clauses. Whitespace collapse is horizontal only, so paragraph
+splitting in `prosody.js` is unaffected.
+
+Also: a quote-only phrase that survives segmentation would have normalised to
+nothing and failed the WHOLE reply with a 422, because `empty_text` is on the
+not-worth-retrying list. `speakablePhrases()` drops such phrases in both prosody
+entry points, folding their pause into the phrase before them.
+
+Full detail, including the three mutation tests and what is not covered, in
+`CHANGELOG-v12.54.3.md`.
+
 # v12.49.0 — Fix: the engines were never installed, and a misconfiguration was silent
 
 Reported as: no mic button, no audio, with `VOICE_ENABLED=true` on the connector.

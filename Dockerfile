@@ -124,12 +124,19 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/fitz
 #
 #   faster-whisper  MIT.            System site-packages, imported by
 #                                   src/voice/voice_stt.py.
-#   piper-tts       GPL-3.0.        Its OWN venv at /opt/piper, never on the
-#                                   import path of anything of ours.
+#   kokoro-onnx     Apache-2.0 model, BUT its phonemiser drives espeak-ng,
+#                   which is GPL-3.0. Its OWN venv at /opt/kokoro, never on the
+#                   import path of anything of ours.
 #
-# SPEC Section 6.2 locks this: Piper runs "as a separate OS process invoked by
+# v13: THE BOUNDARY SURVIVED THE ENGINE SWAP. Piper was GPL-3.0 and that is why
+# it had its own venv. Kokoro-82M is Apache-2.0, so it is tempting to conclude
+# the separation is now unnecessary -- it is not. kokoro-onnx phonemises through
+# `phonemizer`, which drives espeak-ng, and espeak-ng is GPL-3.0. The GPL
+# dependency moved from the model to the phonemiser; it did not go away.
+#
+# The rule is unchanged: the TTS engine runs as a separate OS process invoked by
 # the connector, never imported as a Python library into the connector's import
-# graph". Installing it alongside faster-whisper would put GPL code in the
+# graph. Installing it alongside faster-whisper would put GPL code in the
 # interpreter our MIT helper imports from, which is where the entanglement the
 # boundary exists to prevent begins.
 #
@@ -140,6 +147,16 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/fitz
 # Build cost is real: faster-whisper pulls in CTranslate2 and onnxruntime, which
 # together are a few hundred MB. That is the price of running speech locally and
 # is why the whole feature is behind VOICE_ENABLED.
+#
+# v13: espeak-ng SURVIVES THE PIPER RETIREMENT, and it is worth saying why so
+# nobody prunes it as a leftover. kokoro-onnx phonemises through `phonemizer`,
+# which SHELLS OUT to the espeak-ng binary rather than binding a wheel -- so the
+# package is a runtime dependency of the new engine, not a relic of the old one.
+# Removing it produces a worker that imports cleanly and then fails every
+# synthesis at phonemisation.
+#
+# It is also the GPL-3.0 component in this image, which is why the engine that
+# reaches it runs behind a process boundary in its own venv. See below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg espeak-ng \
     && rm -rf /var/lib/apt/lists/*
@@ -170,21 +187,113 @@ RUN pip3 install --break-system-packages --retries 5 --timeout 180 \
 RUN python3 -c "import faster_whisper; print('faster-whisper', faster_whisper.__version__, 'imports cleanly')"
 
 
-# GPL half. Own venv, own prefix, own directory. Nothing of ours imports from it.
-RUN python3 -m venv /opt/piper \
-    && /opt/piper/bin/pip install --retries 5 --timeout 180 piper-tts==1.2.0 \
+# GPL-adjacent half. Own venv, own prefix, own directory. Nothing of ours
+# imports from it.
+#
+# espeak-ng is NOT installed here. It is already present from the system package
+# block above, which has carried it since the Piper era -- a second apt-get
+# update and install would be an extra layer and an extra network round trip for
+# a package that is already there.
+#
+# The pins are INLINE, not `-r src/voice/requirements-kokoro.txt`, because src/
+# is not copied into the image until much later (see the COPY block below). A
+# -r against a path that does not exist yet fails the build -- and it would fail
+# at layer 190 of a long image, which is an expensive way to learn about
+# ordering.
+#
+# requirements-kokoro.txt remains the documented source of truth and carries the
+# reasoning for each pin; these lines must be kept in step with it. The
+# duplication is deliberate and the cheaper of the two options: the alternative
+# is moving the COPY earlier, which would bust the Docker layer cache for the
+# whole Python install on every source change.
+RUN python3 -m venv /opt/kokoro \
+    && /opt/kokoro/bin/pip install --retries 5 --timeout 180 \
+       "kokoro-onnx==0.4.9" \
+       "onnxruntime>=1.17,<2" \
+       "numpy>=1.24,<3" \
+       "scipy>=1.10,<2" \
     && rm -rf /root/.cache/pip
+
+# Proves the engine imports in the venv that will really run it. A build that
+# ships an unimportable engine produces a worker which starts, reports ready,
+# and fails every request -- the exact failure the pre-warm path was rewritten
+# to avoid.
+RUN /opt/kokoro/bin/python3 -c "import kokoro_onnx; print('kokoro-onnx imports cleanly')"
+
+# ---------------------------------------------------------------------------
+# The model and the voice bundle, BAKED INTO THE IMAGE
+# ---------------------------------------------------------------------------
+#
+# v13.2.0. Previously these were expected on the volume, provisioned by hand or
+# fetched at first boot. That made a fresh deploy mute until someone ran a
+# command, and it did not survive an environment without that volume.
+#
+# WHY /opt AND NOT /data. The earlier Dockerfile ran `mkdir -p
+# /data/voice/kokoro` and pointed the engine there. On a platform that mounts a
+# persistent volume at /data, THE MOUNT SHADOWS EVERYTHING THE IMAGE PUT THERE:
+# files baked to that path exist in the layer and are unreachable at runtime.
+# /opt is image filesystem that nothing mounts over, which is why the venv is
+# already there.
+#
+# The runtime still PREFERS a copy on the volume when one exists, so an operator
+# can drop in a newer model without rebuilding. The image copy is the floor, not
+# a ceiling.
+#
+# COST, STATED: roughly 330 MB on the image, and a build that now depends on
+# GitHub releases being reachable. Both are deliberate trades against a deploy
+# that is silently mute, and against a boot-time fetch racing a health check
+# deadline.
+ARG KOKORO_RELEASE=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+
+# Size floors are checked in the build below. `curl -f` already rejects an HTTP
+# error status, but a truncated transfer or a proxy error page can arrive with a
+# 200 -- and onnxruntime's message for a short model file is an opaque protobuf
+# parse failure at FIRST SYNTHESIS, hours after the build that caused it.
+# Failing here costs a build; failing there costs a debugging session.
+#
+# No inline comments inside the RUN: Docker does strip them, but a chained
+# `&&` block that depends on that behaviour is a fragile thing to leave for
+# whoever edits it next.
+RUN mkdir -p /opt/kokoro/models \
+    && curl -fSL --retry 5 --retry-delay 3 "${KOKORO_RELEASE}/kokoro-v1.0.onnx" -o /opt/kokoro/models/kokoro-v1.0.onnx \
+    && curl -fSL --retry 5 --retry-delay 3 "${KOKORO_RELEASE}/voices-v1.0.bin"   -o /opt/kokoro/models/voices-v1.0.bin \
+    && MODEL_BYTES="$(stat -c%s /opt/kokoro/models/kokoro-v1.0.onnx)" \
+    && VOICES_BYTES="$(stat -c%s /opt/kokoro/models/voices-v1.0.bin)" \
+    && { test "$MODEL_BYTES" -ge 104857600 || { echo "FATAL: kokoro model is only ${MODEL_BYTES} bytes; the download was truncated" >&2; exit 1; }; } \
+    && { test "$VOICES_BYTES" -ge 1048576 || { echo "FATAL: voice bundle is only ${VOICES_BYTES} bytes; the download was truncated" >&2; exit 1; }; } \
+    && echo "kokoro artifacts baked: model ${MODEL_BYTES}B, voices ${VOICES_BYTES}B"
+
+# Proves the ENGINE can load the BAKED artifacts, in the venv that will run
+# them. The import check above proves the library resolves; this proves the
+# weights do. A model that downloads cleanly and fails to load is exactly the
+# failure this whole block exists to move out of runtime and into the build.
+COPY scripts/verify-kokoro-artifacts.py /tmp/verify-kokoro-artifacts.py
+RUN /opt/kokoro/bin/python3 /tmp/verify-kokoro-artifacts.py \
+    && rm -f /tmp/verify-kokoro-artifacts.py
 
 # Model and voice caches live on the mounted volume so they survive a restart,
 # per SPEC Section 11 ("pre-downloaded at deploy"). Created here so the paths
 # exist even before the first download.
-RUN mkdir -p /data/voice/models /data/voice/piper/voices
+RUN mkdir -p /data/voice/models /data/voice/kokoro
 
 # Defaults that match the layout above, so a deployment only has to set
 # VOICE_ENABLED and the allowlist.
-ENV VOICE_PIPER_BIN=/opt/piper/bin/piper \
-    VOICE_PIPER_DIR=/data/voice/piper \
-    VOICE_VOICES_DIR=/data/voice/piper/voices \
+# v13.2.0. VOICE_KOKORO_MODEL and VOICE_KOKORO_VOICES are DELIBERATELY NOT SET.
+#
+# Setting them would pin the artifacts to one path and defeat the layered
+# resolution in kokoro-worker-supervisor.js, which is what makes the image copy
+# a floor rather than a ceiling:
+#
+#   explicit env  ->  volume, if present  ->  the copy baked into the image
+#
+# With them unset, a fresh deploy runs the image copy and works immediately,
+# while an operator who drops a newer model onto VOICE_KOKORO_DIR gets it picked
+# up on the next restart with no rebuild. Set them only to pin a specific file.
+#
+# VOICE_KOKORO_DIR stays: it names where that volume override is looked for.
+ENV VOICE_KOKORO_PYTHON=/opt/kokoro/bin/python3 \
+    VOICE_KOKORO_DIR=/data/voice/kokoro \
+    VOICE_KOKORO_G2P=espeak \
     VOICE_MODEL_DIR=/data/voice/models
 # TNX-M-017: stop Python writing .pyc files into the image and the volume. A
 # committed brain_scan.cpython-312.pyc was found in the archive while this image

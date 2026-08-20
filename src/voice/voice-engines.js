@@ -20,7 +20,7 @@
 //
 //   - Nothing GPL is ever imported by anything of ours, because our code is
 //     Node and Piper is Python/C++. There is no import graph to contaminate.
-//   - Piper runs from its OWN directory (VOICE_PIPER_DIR) via its OWN
+//   - the TTS engine runs from its OWN directory (VOICE_KOKORO_DIR) via its OWN
 //     interpreter. It never shares a process with our STT helper either, so
 //     even the MIT Python code we do control is not linked to it.
 //   - Communication is argv in, WAV bytes out over stdout. No shared memory,
@@ -62,11 +62,30 @@ import { voicePermitted }              from './voice-catalog.js';
 // spawns nothing and reads nothing, so importing it here cannot change the
 // behaviour of the flat path even by accident. See src/voice/prosody.js.
 import { analyse, prosodyConfig }     from './prosody.js';
+// v12.54.3 -- VOICE-TTS-NORMALIZE-v1.0. Also a PURE TRANSFORM, for the same
+// reason and with the same guarantee: it spawns nothing, reads nothing and
+// holds no state, so importing it cannot change the behaviour of any path by
+// accident. See src/voice/voice-text-normalize.js.
+import { normalizeForSpeech, isSpeakable } from './voice-text-normalize.js';
+// v13.1.0. SPEC-KOKORO-001 Section 6. Also a pure transform. It supersedes the
+// bare normaliser at the choke point: normalisation is stage one of its own
+// pipeline, so calling both would normalise twice (harmless, it is idempotent)
+// and skip stages two through five (not harmless -- that is the whole feature).
+import { prepareForKokoro }               from './voice-prosody-prep.js';
 // v12.53.0 -- the resident Piper worker (PIPER-PRELOAD-v1.1 Section 4).
 // SPAWNED, never imported: this is a path to a Python file, and the GPL
-// boundary is unchanged by it. See piper-worker-supervisor.js.
+// boundary is unchanged by it. See kokoro-worker-supervisor.js.
 import { synthesizeViaWorker, workerState,
-         prewarm as prewarmWorker }   from './piper-worker-supervisor.js';
+         synthesizeOnce, fallbackEnabled, bundleVoices, kokoroPython, kokoroDir,
+         g2pMode, artifactSource, modelPath as kokoroModelPath,
+         voicesPath as kokoroVoicesPath,
+         prewarm as prewarmWorker }   from './kokoro-worker-supervisor.js';
+// v13. The registry supplies what voice-catalog.js cannot: the output sample
+// rate an admin selected, and the platform default. voice-catalog.js remains the
+// licence-and-availability view and is now backed by this same registry, so the
+// two cannot disagree about which voices exist.
+import { outputSampleRate, DEFAULT_VOICE,
+         NATIVE_SAMPLE_RATE, VOICE_REGISTRY } from './voice-registry.js';
 // v12.54.0 -- the resident STT worker (PIPER-PRELOAD-v1.1 Section 6, Change 3).
 // Spawned on VOICE_PYTHON_BIN, the MIT interpreter, never the Piper one.
 import { transcribeViaWorker, sttWorkerState, sttWorkerEnabled,
@@ -80,13 +99,73 @@ import { transcribeViaWorker, sttWorkerState, sttWorkerEnabled,
 const PYTHON_BIN   = process.env.VOICE_PYTHON_BIN   || 'python3';
 const STT_HELPER   = new URL('./voice_stt.py', import.meta.url).pathname;
 
-/* Piper lives in its own directory with its own binary. Separate variables
- * rather than one, because the GPL boundary is a directory boundary as much as
- * a process one -- keeping the models beside the engine makes it obvious at a
- * glance which tree is GPL. */
-const PIPER_BIN    = process.env.VOICE_PIPER_BIN    || 'piper';
-const PIPER_DIR    = process.env.VOICE_PIPER_DIR    || '/data/voice/piper';
-const VOICES_DIR   = process.env.VOICE_VOICES_DIR   || join(PIPER_DIR, 'voices');
+/* v13. Kokoro replaced Piper. The engine paths live in
+ * kokoro-worker-supervisor.js, which owns the child process and its
+ * environment, and are surfaced here only for /voice/health.
+ *
+ * THE DIRECTORY BOUNDARY IS STILL A GPL BOUNDARY. Kokoro-82M is Apache-2.0, so
+ * this looks like ceremony now -- but kokoro-onnx phonemises through
+ * `phonemizer`, which drives espeak-ng, and espeak-ng is GPL-3.0. The GPL
+ * dependency moved from the model to the phonemiser; it did not go away. */
+
+/* v13. The OUTPUT sample rate, an admin setting (Section 12). Kokoro
+ * synthesises at 24 kHz natively; 16 kHz is a third smaller on the wire and
+ * costs a band-limited resample in the worker. An unrecognised value falls back
+ * to native rather than being honoured -- a typo must not resample every reply
+ * through an untested ratio. Read per call so a change needs no restart. */
+/* v13.1.0 -- Section 6.1 rule 4, and the platform decision of 2026-08-19.
+ *
+ * CONFIGURED ON BY DEFAULT, AS DECIDED. Whether it has any EFFECT depends on
+ * the G2P actually in use, and on the espeak path it cannot: `[word](+2)` is a
+ * misaki construct, and kokoro-onnx's espeak-ng tokenizer has no markdown
+ * parsing -- it would pronounce the brackets and the digits, so the listener
+ * hears "best plus two".
+ *
+ * voice-prosody-prep.js therefore emits no markup on the espeak path and
+ * records `emphasis_needs_misaki_g2p`, which /voice/status surfaces. The
+ * decision is honoured as far as it can be, and the gap is REPORTED rather than
+ * silently swallowed -- an admin who switched emphasis on is entitled to know
+ * why nothing changed. */
+function emphasisEnabled() {
+  const raw = String(process.env.VOICE_TTS_EMPHASIS || '').trim().toLowerCase();
+  if ('false' === raw || '0' === raw || 'no' === raw) return false;
+  return true;
+}
+
+/* v13.1.0 -- Section 6.1 rule 5. A JSON object mapping a surface word to a
+ * Kokoro phoneme string, e.g. {"Tenax":"tˈɛnæks"}.
+ *
+ * Empty by default and PARSED DEFENSIVELY: a malformed value returns {} with a
+ * warning rather than throwing, because a typo in an env var must not take
+ * every reply down. Like emphasis, it only has an effect on the misaki path. */
+function pronunciationLexicon() {
+  const raw = String(process.env.VOICE_TTS_LEXICON || '').trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return (parsed && 'object' === typeof parsed && !Array.isArray(parsed)) ? parsed : {};
+  } catch (err) {
+    console.warn(`[voice] VOICE_TTS_LEXICON is not valid JSON, ignoring it: ${err.message}`);
+    return {};
+  }
+}
+
+function ttsOutputRate(requested) {
+  // v13.0.1. A PER-REQUEST rate takes precedence over the deployment default.
+  //
+  // This is what makes the gateway's per-tenant setting reach the engine. The
+  // connector's env var expresses ONE rate for the whole process, which cannot
+  // serve two tenants differently -- so the gateway injects the tenant's choice
+  // into the request body and it arrives here.
+  //
+  // outputSampleRate() refuses anything unrecognised and falls back rather than
+  // honouring it, so a bad value on the wire degrades to the native rate rather
+  // than resampling through an untested ratio.
+  if (undefined !== requested && null !== requested && '' !== requested) {
+    return outputSampleRate(requested);
+  }
+  return outputSampleRate(process.env.VOICE_TTS_SAMPLE_RATE);
+}
 
 /* Model cache. On Railway this is the persistent volume, so models survive a
  * restart and Section 11's "pre-downloaded at deploy" holds. */
@@ -286,57 +365,56 @@ export async function probeEngines() {
     state.sttError = `${err.message} (VOICE_PYTHON_BIN=${PYTHON_BIN}, helper=${STT_HELPER})`;
   }
 
-  // TTS: is the Piper binary present, runnable, and does it have a voice model
-  // to run against? Run from PIPER_DIR so even the probe respects the directory
-  // boundary.
+  // v13. TTS: are the model and the voice bundle on disk, and can the engine be
+  // reached at all?
   //
-  // v12.50.0: the probe was `piper --version`, which the pinned engine does not
-  // support. piper-tts 1.2.0 is an argparse CLI whose --model argument is
-  // REQUIRED, so any invocation without it exits 2 with a usage message:
+  // The Piper probe asked whether a BINARY was runnable, because that is what
+  // the CLI path drove. Kokoro has no binary -- it is a Python library loading
+  // an ONNX file -- so the equivalent question is whether the files exist and an
+  // interpreter that can import the engine has been configured.
   //
-  //   piper: error: the following arguments are required: -m/--model
+  // Deliberately NOT a synthesis. `--probe` in kokoro_worker.py does render a
+  // real utterance and is the right check to run by hand at deploy, but it costs
+  // a full model load and this runs on the health path. "The files are present
+  // and an interpreter is configured" is an honest claim; claiming more would
+  // need a load this cannot afford.
   //
-  // The old probe therefore reported tts_ready:false on a perfectly healthy
-  // installation, and the connector reported itself degraded forever. --help is
-  // used instead: argparse answers it and exits 0 BEFORE required-argument
-  // validation runs, so it is a true "is this binary runnable" question.
+  // Reporting ready with no usable bundle would mean the UI renders a Speak
+  // button that fails on first press. The registry listing five voices is a
+  // statement about what this deployment OFFERS, not about what is on the volume.
   state.voicesInstalled = installedVoices();
   try {
-    const cwd = existsSync(PIPER_DIR) ? PIPER_DIR : undefined;
+    const model = kokoroModelPath();
+    const bundle = kokoroVoicesPath();
 
-    // An absolute path that does not exist gives a far clearer answer than
-    // waiting for ENOENT from spawn, which cannot say which variable was wrong.
-    if (PIPER_BIN.startsWith('/') && !existsSync(PIPER_BIN)) {
+    if (!existsSync(model)) {
       state.ttsReady = false;
-      state.ttsError = `Piper binary not found at ${PIPER_BIN}. Check VOICE_PIPER_BIN.`;
+      state.ttsError = `Kokoro model not found at ${model}. `
+        + 'Check VOICE_KOKORO_MODEL, or provision it onto the volume.';
+    } else if (!existsSync(bundle)) {
+      state.ttsReady = false;
+      state.ttsError = `Kokoro voice bundle not found at ${bundle}. `
+        + 'Check VOICE_KOKORO_VOICES, or provision it onto the volume.';
+    } else if (!kokoroPython()) {
+      // Named explicitly rather than left to fail at synthesis. An absent venv
+      // is the most common deployment mistake here, and the message that would
+      // otherwise reach an operator is ModuleNotFoundError from a child process
+      // they did not know existed.
+      state.ttsReady = false;
+      state.ttsError = 'No Kokoro interpreter found. Set VOICE_KOKORO_PYTHON to '
+        + 'the venv python3 that has kokoro-onnx installed.';
+    } else if (!state.voicesInstalled.length) {
+      state.ttsReady = false;
+      state.ttsError = 'The Kokoro bundle is present but contains none of the '
+        + 'voices this deployment offers. Check the bundle version matches the '
+        + 'registry.';
     } else {
-      const r = await run(PIPER_BIN, ['--help'], { timeout: 15_000, cwd });
-      const output = `${r.stdout.toString('utf8')}${r.stderr}`;
-      // Exit 0 is the expected answer. A usage banner on a non-zero exit still
-      // proves the binary exists and executes, which is all this probe claims
-      // to establish, so it is accepted rather than reported as a fault.
-      const runnable = r.code === 0 || /usage:\s*piper/i.test(output);
-
-      if (!runnable) {
-        state.ttsReady = false;
-        state.ttsError = r.stderr.slice(0, 400) || `${PIPER_BIN} --help exited ${r.code}`;
-      } else if (!state.voicesInstalled.length) {
-        // Runnable but useless. Reporting ready here would mean the UI renders
-        // a speak button that 500s on first press, because synthesize() needs
-        // <VOICES_DIR>/<voice>.onnx and there is no such file. The voice
-        // CATALOGUE listing five licence-cleared voices is a statement about
-        // licensing, not about what has been downloaded onto the volume.
-        state.ttsReady = false;
-        state.ttsError = `Piper runs, but no .onnx voice model is installed in ${VOICES_DIR}. `
-          + 'Download at least one voice (with its .onnx.json config) onto the volume.';
-      } else {
-        state.ttsReady = true;
-        state.ttsError = null;
-      }
+      state.ttsReady = true;
+      state.ttsError = null;
     }
   } catch (err) {
     state.ttsReady = false;
-    state.ttsError = `${err.message} (VOICE_PIPER_BIN=${PIPER_BIN})`;
+    state.ttsError = `${err.message} (VOICE_KOKORO_DIR=${kokoroDir()})`;
   }
 
   return {
@@ -361,15 +439,31 @@ export async function probeEngines() {
  * @returns {string[]} Voice ids (the filename without the .onnx suffix).
  */
 export function installedVoices() {
+  // v13. NOT A DIRECTORY LISTING ANY MORE.
+  //
+  // Piper kept one .onnx per voice, so "what is installed" was a readdir.
+  // Kokoro ships ONE model plus ONE bundle holding every voice as a style
+  // vector, so the question splits: are both files present, and which vectors
+  // does the bundle actually contain?
+  //
+  // Only the worker can answer the second. bundleVoices() returns null until it
+  // has reported -- which is NOT the same as an empty bundle. Conflating them
+  // would report zero voices during startup and make the platform look mute.
   try {
-    if (!VOICES_DIR || !existsSync(VOICES_DIR)) return [];
-    return readdirSync(VOICES_DIR)
-      .filter(f => f.endsWith('.onnx'))
-      .map(f => f.slice(0, -'.onnx'.length))
-      .sort();
+    if (!existsSync(kokoroModelPath()) || !existsSync(kokoroVoicesPath())) return [];
   } catch (err) {
     return [];
   }
+
+  const offered = VOICE_REGISTRY.filter(v => v.active).map(v => v.name);
+  const reported = bundleVoices();
+  if (!reported) return offered.slice().sort();
+
+  // Intersected once the worker has spoken: a voice this deployment offers but
+  // the bundle lacks must not be advertised as installed, because the Speak
+  // button it produces would fail at synthesis rather than be absent.
+  const inBundle = new Set(reported);
+  return offered.filter(nm => inBundle.has(nm)).sort();
 }
 
 /** Cached readiness without re-probing. */
@@ -564,16 +658,15 @@ export function voiceSampleRate(voiceId) {
   const cached = _sampleRates.get(voiceId);
   if (cached) return cached;
 
-  let rate = 22050;
-  try {
-    const cfg = JSON.parse(readFileSync(join(VOICES_DIR, `${voiceId}.onnx.json`), 'utf8'));
-    const parsed = Number(cfg && cfg.audio && cfg.audio.sample_rate);
-    if (Number.isFinite(parsed) && parsed >= 8000 && parsed <= 48000) rate = parsed;
-  } catch (err) {
-    console.warn(`[voice] could not read the sample rate for ${voiceId}, `
-      + `assuming ${rate}: ${err.message}`);
-  }
-
+  // v13. NO CONFIG FILE TO READ. Piper shipped a .onnx.json beside every voice
+  // and rates differed per voice; Kokoro has ONE rate for every voice, because
+  // it is a property of the model. So this is the configured OUTPUT rate.
+  //
+  // The cache is still overwritten from the worker's ACTUAL answer in
+  // synthesizePcm(), because a deployment that cannot resample returns native
+  // audio and says so. The reported value wins, so the WAV header always
+  // describes the bytes rather than the intent.
+  const rate = ttsOutputRate();
   _sampleRates.set(voiceId, rate);
   return rate;
 }
@@ -658,7 +751,11 @@ export async function synthesize(opts) {
     text: o.text,
     voice: o.voice,
     lengthScale: (Number.isFinite(o.speed) && o.speed > 0) ? (1 / o.speed) : undefined,
+    sampleRate: o.sampleRate,
   });
+  // voiceSampleRate() reads the cache synthesizePcm just wrote from the worker's
+  // ACTUAL answer, so the header describes the bytes even when a deployment
+  // could not resample and returned native audio instead.
   return wrapPcmAsWav(pcm, voiceSampleRate(o.voice));
 }
 
@@ -681,8 +778,49 @@ export async function synthesize(opts) {
  */
 export async function synthesizePcm(opts) {
   const o = opts || {};
-  const text = String(o.text || '');
-  if (!text.trim()) {
+
+  // v12.54.3 -- VOICE-TTS-NORMALIZE-v1.0 Section 2. THE CHOKE POINT.
+  //
+  // This is the one function both synthesis paths reach: the flat path calls
+  // it once for the whole reply, the prosody layer once per phrase, and BOTH
+  // the resident worker and the CLI spawn sit downstream of it. Normalising
+  // here rather than at either engine is what makes the transform uniform --
+  // and is why the worker path cannot quietly keep speaking glyphs after the
+  // CLI path stopped.
+  //
+  // It is applied BEFORE the empty check, not after, because the check is
+  // asking a question about what will actually be spoken. Text consisting of
+  // nothing but typography has no speech in it, and sending it on to Piper
+  // produces an empty utterance rather than an error the caller can act on.
+  //
+  // Idempotent, so a phrase normalised by a caller and normalised again here
+  // is unchanged.
+  // v13.1.0. THE SECTION 6 PIPELINE, at the same choke point normalisation
+  // occupied. prepareForKokoro runs normalisation as its own first stage, so
+  // this is a replacement rather than an addition -- and the four stages that
+  // were missing until now (link flattening, dialogue beats as punctuation,
+  // emphasis, contour shaping) finally run.
+  //
+  // `position` comes from the CALLER because a chunk cannot know where it sits.
+  // The prosody layer synthesises each phrase separately: a mid-sentence phrase
+  // with no final punctuation lands flat, and the same phrase given a full stop
+  // makes the sentence audibly break in the middle.
+  const prepared = prepareForKokoro(String(o.text || ''), {
+    g2p: g2pMode(),
+    emphasis: emphasisEnabled(),
+    lexicon: pronunciationLexicon(),
+    position: o.position || 'whole',
+  });
+  const text = prepared.text;
+
+  // Reported once per utterance, not per phrase. A suppression that fired on
+  // every phrase of every reply would be noise an operator learns to scroll
+  // past, which costs the warning its only purpose.
+  if (prepared.suppressed.length && 'whole' === (o.position || 'whole')) {
+    console.info(`[voice] prosody markup suppressed: ${prepared.suppressed.join(', ')}`);
+  }
+
+  if (!text) {
     const err = new Error('No text to synthesise.');
     err.code = 'empty_text';
     throw err;
@@ -698,7 +836,13 @@ export async function synthesizePcm(opts) {
     throw err;
   }
 
-  const modelPath = join(VOICES_DIR, `${o.voice}.onnx`);
+  // v13. The voice is a PARAMETER now, not a file path. Section 10 claims
+  // Kokoro locks voices at model load and that switching needs a bundle reload;
+  // that is not true of kokoro-onnx, where create() takes voice= per call and
+  // selecting one is an array lookup. So there is no path to compute and no
+  // reload to schedule.
+  const voice = o.voice;
+  const sampleRate = ttsOutputRate(o.sampleRate);
 
   // v12.53.0 -- PIPER-PRELOAD-v1.1 Section 4. THE RESIDENT PATH FIRST.
   //
@@ -716,15 +860,23 @@ export async function synthesizePcm(opts) {
   // A synthesis REFUSAL, by contrast, throws from here and is not retried:
   // running the CLI path to reach the same refusal more slowly helps nobody.
   const viaWorker = await synthesizeViaWorker({
-    text, modelPath, lengthScale: o.lengthScale,
+    text, voice, lengthScale: o.lengthScale, sampleRate,
   });
   if (viaWorker) {
     // The worker reports the rate from the voice object it loaded. Cached here
     // so wrapPcmAsWav and the prosody concatenator agree with it without
     // re-reading the config file -- and so the two paths cannot disagree about
     // the rate of the same voice.
+    // v13. The worker reports the rate of the bytes it ACTUALLY produced, which
+    // is not always the rate asked for: a deployment without scipy or the numpy
+    // fallback returns native 24 kHz and reports `resample_unavailable` rather
+    // than shipping aliased audio. Caching the reported value keeps the WAV
+    // header honest and keeps the prosody concatenator in agreement.
     if (viaWorker.sampleRate >= 8000 && viaWorker.sampleRate <= 48000) {
-      _sampleRates.set(o.voice, viaWorker.sampleRate);
+      _sampleRates.set(voice, viaWorker.sampleRate);
+    }
+    if (viaWorker.degraded && viaWorker.degraded.length) {
+      console.warn(`[voice] kokoro degraded: ${viaWorker.degraded.join(', ')}`);
     }
     return viaWorker.pcm;
   }
@@ -734,173 +886,64 @@ export async function synthesizePcm(opts) {
   // Queued, so concurrent replies cannot spawn concurrent cold Piper processes
   // (Section 5). The queue is here and not around the worker call above
   // because only this branch creates a process per request.
+  // v13. THIS TIER IS WHY RETIRING PIPER DID NOT CREATE A SINGLE POINT OF
+  // FAILURE. Under Piper the fallback was a different program reached by a
+  // different route. Kokoro has one implementation, so the second tier is the
+  // SAME script in a FRESH process -- which still covers the failures that
+  // actually happen: a worker OOM-killed mid-request, a model corrupted in
+  // memory, a child that died during backoff. None of those say a new process
+  // cannot load the same file from disk.
+  //
+  // Queued for the same reason the CLI path was: only this branch creates a
+  // process per request, and two cold model loads at once on a small instance is
+  // the OOM signature described in describeFailure().
+  if (!fallbackEnabled()) {
+    const err = new Error(
+      'The speech worker is unavailable and the subprocess fallback is disabled '
+      + '(VOICE_TTS_SUBPROCESS_FALLBACK=false).');
+    err.code = 'tts_unavailable';
+    throw err;
+  }
+
   await acquireTts();
   try {
-    return await synthesizePcmViaCli({ text, modelPath, lengthScale: o.lengthScale });
+    const once = await synthesizeOnce({
+      text, voice, lengthScale: o.lengthScale, sampleRate,
+    });
+    if (once.sampleRate >= 8000 && once.sampleRate <= 48000) {
+      _sampleRates.set(voice, once.sampleRate);
+    }
+    return once.pcm;
   } finally {
     releaseTts();
   }
 }
 
-/**
- * The per-request Piper CLI spawn.
+
+/* v13. The Piper triple (binary, directory, voices directory) is replaced by the
+ * Kokoro pair (model, bundle) plus the interpreter and the G2P front end -- the
+ * four things an operator has to get right, and the four that appear in every
+ * failure message this module can produce.
  *
- * v12.53.0: extracted from synthesizePcm() so the resident worker can sit in
- * front of it without either path acquiring a comment about the other. The
- * body below is byte-for-byte the v12.52.0 implementation -- same argv, same
- * environment, same cwd, same timeout, same error handling -- because A5
- * requires that "with the worker disabled by flag, behaviour is byte-identical
- * to the current CLI path".
- *
- * @param {{text: string, modelPath: string, lengthScale?: number}} opts
- * @returns {Promise<Buffer>} Signed 16-bit little-endian mono PCM.
- */
-function synthesizePcmViaCli(opts) {
-  const o = opts || {};
-  const text = o.text;
-  const modelPath = o.modelPath;
-
-  // v12.52.0 -- THE PRODUCTION 500.
-  //
-  // This used to be ['--output_file', '-'], asking Piper to write a WAV to
-  // stdout. Piper does that with Python's `wave` module, and `wave` patches the
-  // RIFF header on close by SEEKING back to byte 4 to write the final length.
-  //
-  // A pipe cannot seek. The connector spawns Piper with stdio: 'pipe', so once
-  // enough audio has been written for the buffer to flush to the real file
-  // descriptor, the next header patch calls tell()/seek() on the pipe and the
-  // process dies:
-  //
-  //   File ".../piper/voice.py", line 103, in synthesize
-  //     wav_file.writeframes(audio_bytes)
-  //   File ".../wave.py", line 560, in writeframes
-  //     self._patchheader()
-  //   OSError: [Errno 29] Illegal seek
-  //
-  // Exit 1, after several seconds of successful synthesis and hundreds of
-  // kilobytes of correct audio -- which is exactly what production showed: a
-  // 500 at 2.7 s for a 283-character request. It is SIZE DEPENDENT, which is
-  // why a short probe or a quick manual test passes: a small utterance never
-  // fills the buffer, so no flush happens and no seek is ever attempted. The
-  // same command redirected to a file works perfectly, because files seek.
-  //
-  // So we no longer ask Piper for a container it cannot write to a pipe.
-  // --output_raw streams headerless PCM, which needs no seeking at all, and
-  // the 44-byte WAV header is assembled here from the voice's own config. We
-  // know the sample rate, the channel count and the sample width exactly, so
-  // there is nothing to patch afterwards.
-  const args = ['--model', modelPath, '--output_raw'];
-
-  // v12.53.0. The caller now supplies the ABSOLUTE length_scale rather than a
-  // speed, because the prosody layer needs to vary it per phrase and cannot
-  // express "the voice's own base times 1.08" as a speed multiplier.
-  //
-  // The flat path preserves the previous behaviour exactly: synthesize() passes
-  // `1 / speed` when a speed was given and `undefined` otherwise, so the argv
-  // built here is byte-for-byte what v12.52.0 built. Piper's output depends on
-  // nothing but the model and the argv, which is what makes AC3's byte-identity
-  // claim checkable rather than hopeful.
-  //
-  // Piper expresses speed as length_scale, which is INVERSE: larger is slower.
-  if (Number.isFinite(o.lengthScale) && o.lengthScale > 0) {
-    args.push('--length_scale', String(o.lengthScale));
-  }
-
-  return new Promise((resolve, reject) => {
-    let child;
-    try {
-      child = spawn(PIPER_BIN, args, {
-        cwd: existsSync(PIPER_DIR) ? PIPER_DIR : undefined,
-        // Section 11: no connector secrets, no database access. An explicit
-        // minimal environment is how that is enforced -- the default would hand
-        // this GPL process every API key the connector holds.
-        env: {
-          PATH: process.env.PATH, HOME: PIPER_DIR, PYTHONDONTWRITEBYTECODE: '1',
-          // v12.52.0. onnxruntime and OpenMP size their thread pools from the
-          // CPU count they can SEE, which on a container is the host's count,
-          // not the share this service is entitled to. On a small Railway
-          // instance that means a dozen threads fighting over a fraction of a
-          // core, each with its own arena, which is both slower and heavier
-          // than running single-threaded.
-          //
-          // Overridable, because the right number depends on the plan, and
-          // Section 14's benchmark is what should eventually set it.
-          OMP_NUM_THREADS: String(TTS_THREADS),
-          ORT_NUM_THREADS: String(TTS_THREADS),
-        },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-    } catch (err) { reject(err); return; }
-
-    const out = [];
-    let errText = '';
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { child.kill('SIGKILL'); } catch (e) { /* already gone */ }
-      const err = new Error(`Piper timed out after ${TTS_TIMEOUT}ms`);
-      // Given a code so the route can report a timeout as a timeout rather
-      // than as a generic failure.
-      err.code = 'tts_timeout';
-      reject(err);
-    }, TTS_TIMEOUT);
-
-    child.stdout.on('data', c => out.push(c));
-    child.stderr.on('data', (c) => { if (errText.length < 16_384) errText += c.toString(); });
-
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true; clearTimeout(timer); reject(err);
-    });
-
-    child.on('close', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const pcm = Buffer.concat(out);
-      // v12.53.0. The WAV header is no longer built here. This function returns
-      // headerless PCM and the CALLER wraps it -- once, around the whole reply
-      // -- because a prosody reply is many of these buffers joined end to end
-      // and a header in the middle of one is a burst of noise, not a header.
-      if (code !== 0 || pcm.length === 0) {
-        // v12.52.0. The old message was `errText || "Piper exited <code>"`, and
-        // on the failure that matters most -- the process being KILLED -- both
-        // halves are useless: stderr is empty because nothing got to write it,
-        // and `code` is null because the process did not exit, it was
-        // terminated. The operator was left with "Piper exited null with no
-        // audio", which names neither the cause nor where to look.
-        //
-        // A signal is now reported by name, and SIGKILL is called what it
-        // almost always is on a small container: the kernel's OOM killer.
-        // onnxruntime holds the 61 MB model plus its arenas, so a synthesis
-        // that runs for seconds and then dies without a word is the signature.
-        const err = new Error(describeFailure(code, signal, errText));
-        err.code = 'tts_failed';
-        // Structured fields for the route to log. Deliberately separate from
-        // the message so the log can carry them without the client ever seeing
-        // any of it.
-        err.exitCode = code;
-        err.signal = signal;
-        err.stderr = errText.slice(0, 2000);
-        err.bytes = pcm.length;
-        reject(err);
-        return;
-      }
-      resolve(pcm);
-    });
-
-    // stdin can EPIPE if Piper dies early. The close handler already reports
-    // that failure with the real reason, so this must not reject over the top
-    // of it with a less useful one.
-    child.stdin.on('error', () => {});
-    child.stdin.end(text, 'utf8');
-  });
-}
-
+ * TTS_SAMPLE_RATE is the OUTPUT rate an admin selected, which is not necessarily
+ * the rate of the last reply: a deployment that cannot resample returns native
+ * audio and says so. Both are reported so the difference is visible. */
 export const config = Object.freeze({
-  PYTHON_BIN, STT_HELPER, PIPER_BIN, PIPER_DIR, VOICES_DIR, MODEL_DIR,
+  PYTHON_BIN, STT_HELPER, MODEL_DIR,
+  KOKORO_DIR: kokoroDir(), KOKORO_MODEL: kokoroModelPath(),
+  KOKORO_VOICES: kokoroVoicesPath(), KOKORO_PYTHON: kokoroPython(),
+  KOKORO_G2P: g2pMode(),
+  // v13.2.0. WHERE the artifacts came from, not just where they are.
+  //
+  // The paths alone cannot answer "why does it sound different since the
+  // redeploy", because a volume path and an image path look equally plausible
+  // in a log line. This says which layer won: `image` (baked, the floor),
+  // `volume` (an operator dropped a newer file in), or `configured` (pinned by
+  // env var).
+  KOKORO_ARTIFACT_SOURCE: artifactSource(),
+  TTS_SAMPLE_RATE: outputSampleRate(process.env.VOICE_TTS_SAMPLE_RATE),
+  TTS_NATIVE_SAMPLE_RATE: NATIVE_SAMPLE_RATE,
+  DEFAULT_VOICE, TENANT_VOICE: String(process.env.VOICE_TTS_TENANT_VOICE || '').trim(),
   STT_TIER, STT_TIMEOUT, TTS_TIMEOUT, STT_CONCURRENCY,
 });
 
@@ -939,21 +982,12 @@ export function voiceLengthScale(voiceId) {
   const cached = _lengthScales.get(voiceId);
   if (cached) return cached;
 
-  let scale = 1;
-  try {
-    const cfg = JSON.parse(readFileSync(join(VOICES_DIR, `${voiceId}.onnx.json`), 'utf8'));
-    const parsed = Number(cfg && cfg.inference && cfg.inference.length_scale);
-    // Bounded for the same reason the sample rate is: a config value outside
-    // this range is a corrupt file, and passing it to Piper produces either
-    // silence or a minutes-long drawl from a one-line reply.
-    if (Number.isFinite(parsed) && parsed >= 0.1 && parsed <= 10) scale = parsed;
-  } catch (err) {
-    // Not a warning. Piper falls back to 1.0 itself when the field is absent,
-    // and most voice configs simply do not carry an inference block, so a
-    // console line here would fire on every healthy synthesis.
-    scale = 1;
-  }
-
+  // v13. Kokoro voices carry no per-voice base rate. The indirection is KEPT
+  // rather than collapsed, because the prosody profiles in prosody.js are
+  // expressed as multipliers against this base, and rewriting them to absolutes
+  // would change every profile's meaning for no gain. The base is 1, so a
+  // profile multiplier of 1.08 is a length_scale of 1.08.
+  const scale = 1;
   _lengthScales.set(voiceId, scale);
   return scale;
 }
@@ -1092,6 +1126,67 @@ async function mapWithLimit(items, limit, worker) {
 }
 
 /**
+ * Drop phrases that have nothing speakable in them, preserving the beat.
+ *
+ * v12.54.3 -- VOICE-TTS-NORMALIZE-v1.0.
+ *
+ * ── The failure this exists to prevent ────────────────────────────────────
+ *
+ * analyse() merges fragments shorter than minPhraseChars BACKWARDS into their
+ * predecessor, and a fragment consisting only of an opening quote has a bare
+ * length of zero, so it is almost always absorbed. Almost: the merge needs a
+ * predecessor to merge INTO, so a quote-only fragment that lands first in its
+ * sentence survives as a phrase of its own.
+ *
+ * Before normalisation that phrase synthesised to a moment of nothing and no
+ * one noticed. After it, the phrase normalises to an empty string,
+ * synthesizePcm raises empty_text -- and empty_text is on the route's
+ * not-worth-retrying list, so it is rethrown rather than falling back to flat.
+ * One stray quote would answer the whole request with a 422.
+ *
+ * Dropping the phrase is also simply the right answer: there is no speech in
+ * it. The pause it was carrying is folded into the phrase before it, so the
+ * rhythm the analysis computed survives the removal rather than shortening by
+ * however many milliseconds the dropped fragment was holding.
+ *
+ * Exported for the test suite, following silencePcm/applyEdgeFades/
+ * concatPhrasePcm: the pause arithmetic is the part that can go quietly wrong,
+ * and asserting it through a full synthesis would need Piper.
+ *
+ * @param {Array<{text: string, pauseAfterMs?: number}>} phrases
+ * @returns {Array<object>} A new array; the input is not mutated.
+ */
+export function speakablePhrases(phrases) {
+  const kept = [];
+  // Carries the pause of a dropped phrase forward when there is no predecessor
+  // to hand it to, so a leading drop gives its beat to the first phrase kept
+  // rather than losing it.
+  let orphanedPauseMs = 0;
+
+  for (const phrase of phrases) {
+    if (isSpeakable(phrase.text)) {
+      const next = { ...phrase };
+      if (orphanedPauseMs) {
+        next.pauseAfterMs = Math.max(0, Number(next.pauseAfterMs) || 0) + orphanedPauseMs;
+        orphanedPauseMs = 0;
+      }
+      kept.push(next);
+      continue;
+    }
+    const pause = Math.max(0, Number(phrase.pauseAfterMs) || 0);
+    if (kept.length) {
+      // The usual case: hand the beat to the phrase that now precedes the gap.
+      const prev = kept[kept.length - 1];
+      prev.pauseAfterMs = Math.max(0, Number(prev.pauseAfterMs) || 0) + pause;
+    } else {
+      orphanedPauseMs += pause;
+    }
+  }
+
+  return kept;
+}
+
+/**
  * Synthesise a reply through the prosody layer.
  *
  * The Section 3 pipeline, in order: register detection and segmentation (both
@@ -1126,6 +1221,14 @@ export async function synthesizeProsody(opts) {
   }
 
   const cfg = o.config || prosodyConfig();
+  // v13.0.1. Seeded from the per-request rate BEFORE it is read, so a
+  // tenant-selected rate reaches the phrase workers and the concatenated header
+  // agrees with the bytes they returned. Without this the phrases would be
+  // rendered at the requested rate while the WAV declared the deployment
+  // default, and every reply would play at the wrong pitch and speed.
+  if (undefined !== o.sampleRate && null !== o.sampleRate && '' !== o.sampleRate) {
+    _sampleRates.set(o.voice, ttsOutputRate(o.sampleRate));
+  }
   const sampleRate = voiceSampleRate(o.voice);
   const analysis = analyse(text, {
     baseLengthScale: voiceLengthScale(o.voice),
@@ -1133,10 +1236,17 @@ export async function synthesizeProsody(opts) {
     config: cfg,
   });
 
+  // v12.54.3. Phrases with nothing speakable in them are removed BEFORE the
+  // degenerate check below, so a reply whose every phrase was typography falls
+  // into the same flat path as one the segmenter never split -- and raises
+  // empty_text from there, once, about the whole reply, rather than from a
+  // phrase worker mid-render. See speakablePhrases.
+  const speakable = speakablePhrases(analysis.phrases);
+
   // A reply the segmenter reduced to nothing -- punctuation only, or an empty
   // markdown artefact. The flat path handles it identically, so hand it there
   // rather than returning a zero-length WAV.
-  if (!analysis.phrases.length) {
+  if (!speakable.length) {
     const pcm = await synthesizePcm({
       text, voice: o.voice,
       lengthScale: (Number.isFinite(o.speed) && o.speed > 0) ? (1 / o.speed) : undefined,
@@ -1146,10 +1256,16 @@ export async function synthesizeProsody(opts) {
   }
 
   const rendered = await mapWithLimit(
-    analysis.phrases, TTS_PHRASE_CONCURRENCY,
-    async (phrase) => ({
+    speakable, TTS_PHRASE_CONCURRENCY,
+    async (phrase, index) => ({
       pcm: await synthesizePcm({
         text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
+        sampleRate: sampleRate,
+        // v13.1.0 -- Section 6.1 rule 2. Only the LAST phrase gets a falling
+        // close; the rest get a continuation rise. Giving every phrase terminal
+        // punctuation would make one sentence audibly break into several, which
+        // is worse than the flatness it was meant to fix.
+        position: (index === speakable.length - 1) ? 'final' : 'continuation',
       }),
       pauseAfterMs: phrase.pauseAfterMs,
     })
@@ -1199,6 +1315,14 @@ export async function synthesizeProsodyStream(opts, onSegment) {
   }
 
   const cfg = o.config || prosodyConfig();
+  // v13.0.1. Seeded from the per-request rate BEFORE it is read, so a
+  // tenant-selected rate reaches the phrase workers and the concatenated header
+  // agrees with the bytes they returned. Without this the phrases would be
+  // rendered at the requested rate while the WAV declared the deployment
+  // default, and every reply would play at the wrong pitch and speed.
+  if (undefined !== o.sampleRate && null !== o.sampleRate && '' !== o.sampleRate) {
+    _sampleRates.set(o.voice, ttsOutputRate(o.sampleRate));
+  }
   const sampleRate = voiceSampleRate(o.voice);
   const analysis = analyse(text, {
     baseLengthScale: voiceLengthScale(o.voice),
@@ -1206,8 +1330,14 @@ export async function synthesizeProsodyStream(opts, onSegment) {
     config: cfg,
   });
 
-  const phrases = analysis.phrases.length
-    ? analysis.phrases
+  // v12.54.3. Same removal as synthesizeProsody, and for the same reason: an
+  // unspeakable phrase would raise empty_text from a worker mid-stream, where
+  // the status line has already been sent and the only way to report it is an
+  // in-band error line that costs the client the whole reply.
+  const speakable = speakablePhrases(analysis.phrases);
+
+  const phrases = speakable.length
+    ? speakable
     // Same degenerate case as synthesizeProsody: speak it flat rather than
     // return silence.
     : [{ text, lengthScale: (Number.isFinite(o.speed) && o.speed > 0) ? (1 / o.speed) : 1,
@@ -1235,6 +1365,11 @@ export async function synthesizeProsodyStream(opts, onSegment) {
   await mapWithLimit(phrases, TTS_PHRASE_CONCURRENCY, async (phrase, index) => {
     const pcm = await synthesizePcm({
       text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
+      sampleRate: sampleRate,
+      // v13.1.0. Same rule as the buffered path. The two MUST agree: a reply
+      // that streamed and one that fell back would otherwise be phrased
+      // differently, which sounds like the assistant changing its mind.
+      position: (index === phrases.length - 1) ? 'final' : 'continuation',
     });
     pending.set(index, {
       index, total,
@@ -1272,6 +1407,35 @@ export function prosodyState() {
     // not code", and an operator tuning by ear needs to see what is live rather
     // than infer it from which variables they remember setting.
     config: cfg,
+
+    // v13.1.0 -- THE G2P CEILING, REPORTED RATHER THAN DISCOVERED.
+    //
+    // The Hugging Face Space that sells Kokoro runs MISAKI. This connector runs
+    // kokoro-onnx, whose tokenizer is phonemizer/espeak-ng -- the same frontend
+    // CLASS Piper used. The acoustic model is a large step up; the
+    // grapheme-to-phoneme front end is not, and the difference is audible on
+    // proper nouns, initialisms and anything out of dictionary.
+    //
+    // So the realism gain over Piper is real but NARROWER than the Space
+    // implies, and an operator comparing the two by ear deserves to know which
+    // front end they are actually hearing before they conclude the model
+    // underdelivered.
+    g2p: g2pMode(),
+
+    // Section 6.1 rules 4 and 5. `configured` is the operator's setting;
+    // `effective` is what the running G2P can actually honour. They differ on
+    // the espeak path, and reporting only one of them is how a switch comes to
+    // look broken.
+    emphasis: {
+      configured: emphasisEnabled(),
+      effective: emphasisEnabled() && 'misaki' === g2pMode(),
+      requires: 'misaki',
+    },
+    lexicon: {
+      terms: Object.keys(pronunciationLexicon()).length,
+      effective: 'misaki' === g2pMode(),
+      requires: 'misaki',
+    },
   };
 }
 
@@ -1311,7 +1475,11 @@ export async function prewarmTts(voiceId) {
   const voice = voiceId && installed.includes(voiceId) ? voiceId : installed[0];
 
   try {
-    return await prewarmWorker(join(VOICES_DIR, `${voice}.onnx`));
+    // v13. No path argument: the worker loads the one model at startup and
+    // selects voices per call, so there is nothing voice-specific to pre-warm.
+    // The named voice is still validated above, because a typo in a config
+    // should surface as a refusal rather than be silently ignored.
+    return await prewarmWorker();
   } catch (err) {
     console.error(`[voice] pre-warm failed for ${voice}: ${err.message}`);
     return false;

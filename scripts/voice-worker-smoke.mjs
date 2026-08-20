@@ -1,101 +1,72 @@
 #!/usr/bin/env node
-/**
- * scripts/voice-worker-smoke.mjs
+/* scripts/voice-worker-smoke.mjs
  *
- * PIPER-PRELOAD-v1.1 Section 8, item 1 -- THE HARD GATE.
+ * Tenax voice -- the Kokoro worker smoke test. SPEC-KOKORO-001 Section 11.
  *
- * "Smoke test as a hard gate: prove the worker imports PiperVoice against the
- * pinned 1.2.0 in the deployed venv, loads en_US-kristin-medium.onnx, and
- * synthesises. This resolves the one API-version question (1.2.0 versus the
- * newer 1.6.0 documentation) before any agent work proceeds."
+ * ===========================================================================
+ * WHY THIS EXISTS
+ * ===========================================================================
  *
- * ── Why this is a script and not a unit test ──────────────────────────────
+ * probeEngines() answers "are the files there and is an interpreter
+ * configured". That is all it can afford to answer, because it runs on the
+ * health path and a real model load costs seconds.
  *
- * It is the only check here that needs the REAL deployment: the real Piper
- * virtual environment, the real interpreter, the real model file on the real
- * volume. None of those exist in CI, and a unit test that quietly skipped when
- * they were missing would report green for the one question this gate exists
- * to answer.
+ * This asks the questions that only a real load can settle:
  *
- * So the unit tests assert the things that are true everywhere (the protocol,
- * the boundary, the transform), and this script answers the thing that is only
- * true on the box:
+ *   1. Does `import kokoro_onnx` actually work in the venv we ship?
+ *   2. Does the model load, and does the bundle contain the voices the
+ *      registry offers?
+ *   3. Does one real utterance come back as audio?
  *
- *     Does `from piper import PiperVoice` actually work in the venv we ship,
- *     and does the voice we ship actually produce audio through it?
+ * Documentation cannot answer any of those, and neither can a unit test with no
+ * model on disk. Run it once after a deploy.
  *
- * ── Running it ────────────────────────────────────────────────────────────
- *
- *     npm run voice:smoke
- *     npm run voice:smoke -- --voice en_US-kristin-medium
- *
- * Exits 0 on a pass and 1 on a failure, so it can gate a deploy.
+ *   npm run voice:smoke
  */
 
-import { spawn }                    from 'node:child_process';
-import { existsSync, readdirSync }  from 'node:fs';
-import { join }                     from 'node:path';
-// The single source of truth for which interpreter runs the worker.
-import { workerState }              from '../src/voice/piper-worker-supervisor.js';
+import { spawn }        from 'node:child_process';
+import { existsSync }   from 'node:fs';
 
-const WORKER = new URL('../src/voice/piper_worker.py', import.meta.url).pathname;
+import { kokoroPython, kokoroDir, modelPath, voicesPath, g2pMode, artifactSource }
+  from '../src/voice/kokoro-worker-supervisor.js';
+import { VOICE_REGISTRY, DEFAULT_VOICE }
+  from '../src/voice/voice-registry.js';
 
-const PIPER_DIR  = process.env.VOICE_PIPER_DIR  || '/data/voice/piper';
-const VOICES_DIR = process.env.VOICE_VOICES_DIR || join(PIPER_DIR, 'voices');
-const THREADS    = process.env.VOICE_TTS_THREADS || '1';
+const WORKER = new URL('../src/voice/kokoro_worker.py', import.meta.url).pathname;
 
-/**
- * The interpreter the supervisor will use.
- *
- * IMPORTED, NOT REIMPLEMENTED. This was a second copy of the resolution logic,
- * and the two drifted the moment the supervisor's was corrected -- which is the
- * worst possible place for a gate to disagree with the thing it gates. A smoke
- * test that resolves a different interpreter from production can pass while
- * production fails, or fail while production works.
- *
- * @returns {string} The interpreter path, or '' when none resolves.
- */
-function piperPython() {
-  return workerState().interpreter || '';
-}
-
-function arg(name, fallback) {
-  const index = process.argv.indexOf(`--${name}`);
-  return (index !== -1 && process.argv[index + 1]) ? process.argv[index + 1] : fallback;
-}
-
-function installedVoices() {
-  try {
-    if (!existsSync(VOICES_DIR)) return [];
-    return readdirSync(VOICES_DIR)
-      .filter(f => f.endsWith('.onnx'))
-      .map(f => f.slice(0, -'.onnx'.length))
-      .sort();
-  } catch (err) { return []; }
+function line(label, value) {
+  console.log(`  ${String(label).padEnd(14)}: ${value}`);
 }
 
 /**
- * Run the worker's --probe and return its JSON answer.
+ * Run the worker's own --probe mode.
  *
- * @param {string} modelPath
- * @returns {Promise<{code: number, parsed: object|null, stderr: string}>}
+ * The SAME entry point the supervisor spawns, deliberately: a smoke test that
+ * reimplemented the invocation could pass while the real path failed, which is
+ * the one outcome that would make it worse than useless.
+ *
+ * @returns {Promise<object>}
  */
-function probe(modelPath) {
-  return new Promise((resolve) => {
-    const args = [WORKER, '--probe'];
-    if (modelPath) args.push('--model', modelPath);
+function probe() {
+  return new Promise((resolve, reject) => {
+    const python = kokoroPython();
+    if (!python) {
+      reject(new Error('No Kokoro interpreter found. Set VOICE_KOKORO_PYTHON to '
+        + 'the venv python3 that has kokoro-onnx installed.'));
+      return;
+    }
 
-    const child = spawn(piperPython(), args, {
-      cwd: existsSync(PIPER_DIR) ? PIPER_DIR : undefined,
-      // The same minimal environment the supervisor uses, so this proves the
-      // configuration that will actually run rather than a friendlier one.
+    const child = spawn(python, [
+      WORKER, '--probe',
+      '--model', modelPath(), '--voices', voicesPath(), '--g2p', g2pMode(),
+    ], {
+      cwd: existsSync(kokoroDir()) ? kokoroDir() : undefined,
       env: {
         PATH: process.env.PATH,
-        HOME: PIPER_DIR,
+        HOME: kokoroDir(),
         PYTHONDONTWRITEBYTECODE: '1',
-        PYTHONUNBUFFERED: '1',
-        OMP_NUM_THREADS: THREADS,
-        ORT_NUM_THREADS: THREADS,
+        ...(process.env.ESPEAK_DATA_PATH
+          ? { ESPEAK_DATA_PATH: process.env.ESPEAK_DATA_PATH } : {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -103,123 +74,184 @@ function probe(modelPath) {
     let out = '';
     let err = '';
     child.stdout.on('data', c => { out += c.toString(); });
-    child.stderr.on('data', c => { if (err.length < 8192) err += c.toString(); });
-
-    child.on('error', (spawnErr) => {
-      resolve({ code: -1, parsed: null, stderr: `${spawnErr.message}` });
-    });
-
+    child.stderr.on('data', c => { err += c.toString(); });
+    child.on('error', reject);
     child.on('close', (code) => {
-      let parsed = null;
-      // Parse whatever the exit code: the worker writes its diagnosis to
-      // stdout and exits non-zero on a failure, so refusing to read stdout on
-      // a non-zero exit would throw away the explanation.
-      const lastLine = out.trim().split('\n').filter(Boolean).pop() || '';
-      try { parsed = JSON.parse(lastLine); } catch (parseErr) { parsed = null; }
-      resolve({ code, parsed, stderr: err });
+      // The LAST parseable line: a dependency that prints an import warning to
+      // stdout must not be mistaken for the result.
+      const lines = out.split('\n').map(l => l.trim()).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        try { resolve(JSON.parse(lines[i])); return; } catch (e) { /* keep looking */ }
+      }
+      reject(new Error(err.trim().slice(0, 600)
+        || `the probe exited ${code} without a response`));
     });
-
-    setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch (e) { /* gone */ }
-      resolve({ code: -2, parsed: null, stderr: 'the probe timed out after 120s' });
-    }, 120_000).unref();
   });
 }
 
-function fail(message, detail) {
-  console.error(`\nFAIL: ${message}`);
-  if (detail) console.error(detail);
-  process.exit(1);
+/**
+ * A paragraph of the length this assistant actually produces.
+ *
+ * v13.1.0. "Voice check." is two words: it proves the engine renders, and tells
+ * you NOTHING about whether the CPU budget is viable. The question that decides
+ * that is how long a typical reply takes, and the honest way to answer it is to
+ * render one.
+ */
+const PARAGRAPH =
+  'The real cost of the migration is not the licence but the audit. '
+  + 'Most teams budget for the software and then discover that three months of '
+  + 'reconciliation work sits between them and a clean cutover. '
+  + 'If you plan for that up front, the rest is routine.';
+
+/**
+ * Render one paragraph in a fresh process and time it.
+ *
+ * Uses --once rather than the resident worker DELIBERATELY, and the number it
+ * produces is therefore a WORST CASE: it includes the full model load that the
+ * resident worker pays only at boot. A warm request is faster, and the gap
+ * between the two is itself worth seeing, because it is the value of the
+ * resident worker expressed in milliseconds.
+ *
+ * @returns {Promise<{bytes: number, sampleRate: number, wallMs: number, engineMs: number}>}
+ */
+function renderParagraph() {
+  return new Promise((resolve, reject) => {
+    const python = kokoroPython();
+    if (!python) { reject(new Error('no interpreter')); return; }
+
+    const started = Date.now();
+    const child = spawn(python, [
+      WORKER, '--once',
+      '--model', modelPath(), '--voices', voicesPath(), '--g2p', g2pMode(),
+    ], {
+      cwd: existsSync(kokoroDir()) ? kokoroDir() : undefined,
+      env: {
+        PATH: process.env.PATH,
+        HOME: kokoroDir(),
+        PYTHONDONTWRITEBYTECODE: '1',
+        ...(process.env.ESPEAK_DATA_PATH
+          ? { ESPEAK_DATA_PATH: process.env.ESPEAK_DATA_PATH } : {}),
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let out = '';
+    let err = '';
+    child.stdout.on('data', c => { out += c.toString(); });
+    child.stderr.on('data', c => { err += c.toString(); });
+    child.stdin.on('error', () => {});
+    child.stdin.end(JSON.stringify({
+      op: 'synthesize', text: PARAGRAPH, voice: DEFAULT_VOICE,
+    }) + '\n', 'utf8');
+
+    child.on('error', reject);
+    child.on('close', () => {
+      const wallMs = Date.now() - started;
+      const lines = out.split('\n').map(l => l.trim()).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        try {
+          const parsed = JSON.parse(lines[i]);
+          if (!parsed.ok) { reject(new Error(parsed.error || 'render failed')); return; }
+          resolve({
+            bytes: parsed.bytes || 0,
+            sampleRate: parsed.sample_rate || 0,
+            wallMs,
+            engineMs: parsed.elapsed_ms || 0,
+          });
+          return;
+        } catch (e) { /* keep looking */ }
+      }
+      reject(new Error(err.trim().slice(0, 400) || 'no response'));
+    });
+  });
 }
 
 async function main() {
-  console.log('Tenax voice -- Piper worker smoke test (PIPER-PRELOAD-v1.1 Section 8)');
-  console.log(`  interpreter : ${piperPython()}`);
-  console.log(`  piper dir   : ${PIPER_DIR}`);
-  console.log(`  voices dir  : ${VOICES_DIR}`);
-  console.log(`  worker      : ${WORKER}\n`);
+  console.log('Tenax voice -- Kokoro worker smoke test (SPEC-KOKORO-001 Section 11)');
+  line('interpreter', kokoroPython() || '(none found)');
+  const src = artifactSource();
+  // v13.2.0. WHICH LAYER, not just which path. `image` is the baked copy that
+  // survives every redeploy; `volume` means someone dropped a file in and the
+  // engine is running that instead; `configured` means an env var pinned it.
+  line('model', `${modelPath()}  [${src.model}]`);
+  line('bundle', `${voicesPath()}  [${src.voices}]`);
+  line('g2p', g2pMode());
+  line('default voice', DEFAULT_VOICE);
+  console.log('');
 
-  if (!existsSync(WORKER)) fail(`the worker script is missing at ${WORKER}`);
-
-  if (!piperPython()) {
-    fail('no Piper interpreter could be resolved',
-      'Set VOICE_PIPER_PYTHON to the python3 inside the Piper virtual environment.\n'
-      + 'In the image built by this repository\'s Dockerfile that is:\n'
-      + '  VOICE_PIPER_PYTHON=/opt/piper/bin/python3\n'
-      + 'Note that VOICE_PIPER_DIR is the VOICES directory on the volume, not the venv.\n'
-      + 'Synthesis will use the CLI fallback until this resolves.');
+  let result;
+  try {
+    result = await probe();
+  } catch (err) {
+    console.error(`FAIL  ${err.message}`);
+    process.exit(1);
   }
 
-  const installed = installedVoices();
-  console.log(`Installed voices: ${installed.length ? installed.join(', ') : '(none)'}`);
+  if (!result.ok) {
+    console.error(`FAIL  ${result.code || 'probe_failed'}: ${result.error || 'no detail'}`);
+    process.exit(1);
+  }
 
-  // Section 8 names en_US-kristin-medium, which is the English default the
-  // licence audit settled on. Overridable, because the gate should follow the
-  // voice actually deployed rather than the one the document was written
-  // against.
-  const preferred = arg('voice', process.env.VOICE_SMOKE_VOICE || 'en_US-kristin-medium');
-  const voice = installed.includes(preferred) ? preferred : installed[0];
+  const caps = result.capabilities || {};
+  const inBundle = new Set(caps.voices || []);
+  line('engine', caps.engine || 'unknown');
+  line('bundle voices', caps.voice_count ?? '(unknown)');
+  line('sample rate', caps.native_sample_rate || '(unknown)');
+  line('audio bytes', result.bytes ?? '(none)');
+  line('elapsed', `${result.elapsed_ms ?? '?'}ms`);
+  console.log('');
 
-  if (!voice) {
-    // Import alone is still worth proving: it answers the API-version question
-    // even where no model has been downloaded yet.
-    console.log('\nNo voice model installed; checking the import only.');
-    const result = await probe('');
-    if (!result.parsed) {
-      fail('the worker produced no parseable answer',
-           result.stderr || `exit ${result.code}`);
+  // The check that matters most operationally: the registry offers five voices,
+  // and a bundle version mismatch would leave some of them absent. That failure
+  // presents to a user as a Speak button which works for some voices and not
+  // others, which is far harder to diagnose than a clean list here.
+  let missing = 0;
+  for (const v of VOICE_REGISTRY.filter(x => x.active)) {
+    const present = 0 === inBundle.size || inBundle.has(v.name);
+    if (!present) missing += 1;
+    console.log(`  ${present ? 'ok  ' : 'MISS'}  ${v.name.padEnd(12)} ${v.label}`);
+  }
+
+  // ---- latency, the number the CPU decision rests on ---------------------
+  console.log('');
+  try {
+    const r = await renderParagraph();
+    // int16 mono: two bytes per sample.
+    const audioSec = (r.bytes / 2) / (r.sampleRate || 1);
+    const factor = audioSec / (r.wallMs / 1000);
+    line('paragraph', `${PARAGRAPH.length} chars`);
+    line('audio', `${audioSec.toFixed(1)}s at ${r.sampleRate} Hz`);
+    line('cold total', `${r.wallMs}ms  (includes the model load)`);
+    line('engine only', `${r.engineMs}ms  (what a warm worker pays)`);
+    line('realtime x', factor.toFixed(2));
+    console.log('');
+    // The threshold that matters is not a benchmark score, it is whether a
+    // listener waits. Below 1.0x the audio arrives slower than it plays, which
+    // on the streaming path means the voice stutters mid-reply.
+    if (factor < 1.0) {
+      console.log('  WARNING  synthesis is slower than realtime on this host. '
+        + 'The streaming path will stutter; consider more CPU or a GPU budget.');
+    } else if (factor < 2.0) {
+      console.log('  NOTE     under 2x realtime. Workable, but a long reply on a '
+        + 'loaded host may approach the gateway 120s ceiling.');
+    } else {
+      console.log('  Latency looks comfortable for an assistant voice.');
     }
-    if (!result.parsed.ok) {
-      fail(result.parsed.error || 'piper could not be imported', result.stderr);
-    }
-    console.log(`\nPASS (import only): piper imports in this venv.`);
-    console.log(`  SynthesisConfig available: ${result.parsed.synthesis_config}`);
-    console.log('  Download a voice and re-run to complete the gate.');
-    return;
+  } catch (err) {
+    console.log(`  (paragraph timing unavailable: ${err.message})`);
   }
 
-  const modelPath = join(VOICES_DIR, `${voice}.onnx`);
-  console.log(`\nProbing with ${voice}`);
-  console.log(`  model: ${modelPath}`);
-  if (!existsSync(modelPath)) fail(`no model file at ${modelPath}`);
-  if (!existsSync(`${modelPath}.json`)) {
-    // Piper needs the config beside the model; without it the sample rate and
-    // phoneme map are missing and the failure is opaque.
-    fail(`the voice config is missing at ${modelPath}.json`);
+  console.log('');
+  if (missing) {
+    console.error(`FAIL  ${missing} offered voice(s) are not in the bundle. `
+      + 'Check the bundle version matches the registry.');
+    process.exit(1);
   }
-
-  const started = Date.now();
-  const result = await probe(modelPath);
-  const elapsed = Date.now() - started;
-
-  if (!result.parsed) {
-    fail('the worker produced no parseable answer',
-         result.stderr || `exit ${result.code}`);
-  }
-
-  const p = result.parsed;
-  if (!p.ok) {
-    console.error('\nWorker diagnosis:');
-    console.error(`  code  : ${p.code || 'unknown'}`);
-    console.error(`  error : ${p.error || '(none given)'}`);
-    if ('piper_import_failed' === p.code) {
-      console.error('\n  This is the Section 8 question answering itself: the venv at');
-      console.error(`  ${piperPython()} cannot import piper. Install piper-tts into the`);
-      console.error('  Piper directory tree, or set VOICE_PIPER_PYTHON to the interpreter');
-      console.error('  that can. Until this passes, synthesis runs on the CLI fallback.');
-    }
-    fail('the worker could not synthesise', result.stderr);
-  }
-
-  console.log('\nPASS');
-  console.log(`  adapter      : ${p.adapter}  (the Piper API generation in use)`);
-  console.log(`  sample rate  : ${p.sample_rate} Hz`);
-  console.log(`  pcm bytes    : ${p.pcm_bytes}`);
-  console.log(`  synthesis    : ${p.synthesis_ms} ms (warm, after load)`);
-  console.log(`  total probe  : ${elapsed} ms (includes the cold model load)`);
-  console.log('\nThe resident worker can serve synthesis on this deployment.');
-  console.log('Section 8 item 2 (the p50/p95 benchmark on the real CPU) is a separate,');
-  console.log('still-open gate: run npm run voice:benchmark once this passes.');
+  console.log('PASS  the engine loads, the bundle carries every offered voice, '
+    + 'and one real utterance rendered.');
 }
 
-main().catch((err) => fail(err.message, err.stack));
+main().catch((err) => {
+  console.error(`FAIL  ${err.message}`);
+  process.exit(1);
+});

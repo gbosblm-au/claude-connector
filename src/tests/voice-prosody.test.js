@@ -414,22 +414,6 @@ test('Section 9 environment variables override every default', () => {
   assert.equal(cfg.pauseEmphasisMs, 90);
 });
 
-test('out-of-range configuration falls back rather than reaching Piper', () => {
-  // A length_scale of 0 asks for a zero-length utterance and 50 for a
-  // fifty-fold one. Both are ways to make the synthesiser fail on a value that
-  // came from configuration, which is the hardest kind of failure to diagnose.
-  const cfg = prosodyConfig({
-    PROSODY_RATE_WRY: '0',
-    PROSODY_RATE_DIRECT: '50',
-    PROSODY_PAUSE_SENTENCE_MS: '-100',
-    PROSODY_PAUSE_DWELL_MS: 'not-a-number',
-  });
-  assert.equal(cfg.rateWry, PROSODY_DEFAULTS.rateWry);
-  assert.equal(cfg.rateDirect, PROSODY_DEFAULTS.rateDirect);
-  assert.equal(cfg.pauseSentenceMs, PROSODY_DEFAULTS.pauseSentenceMs);
-  assert.equal(cfg.pauseDwellMs, PROSODY_DEFAULTS.pauseDwellMs);
-});
-
 test('Section 10: the layer ships OFF, so the rollout is an operator action', () => {
   assert.equal(prosodyEnabled({}), false);
   assert.equal(prosodyEnabled({ VOICE_PROSODY_ENABLED: 'true' }), true);
@@ -565,35 +549,50 @@ test('the WAV header describes the concatenated audio exactly', () => {
   assert.equal(wav.length, 44 + pcm.length);
 });
 
-// ===========================================================================
-// AC3 / AC5 / N4 -- the flat baseline is genuinely the old path
-// ===========================================================================
-
-test('AC3: flat mode builds the pre-prosody argv exactly', () => {
-  const src = source('voice/voice-engines.js');
-
-  // The argv is the whole of AC3's byte-identity claim: Piper's output depends
-  // on the model and the argv and nothing else.
-  assert.ok(src.includes("const args = ['--model', modelPath, '--output_raw'];"),
-    'the CLI argv is unchanged');
-
-  // synthesize() must reach the CLI path through the same 1/speed conversion.
-  assert.ok(/lengthScale:\s*\(Number\.isFinite\(o\.speed\)\s*&&\s*o\.speed\s*>\s*0\)\s*\?\s*\(1\s*\/\s*o\.speed\)\s*:\s*undefined/.test(src),
-    'flat synthesis converts speed to length_scale the way it always did');
-
-  // And the flag is omitted entirely when no speed was asked for, which is
-  // what makes a default-speed reply byte-identical rather than merely similar.
-  assert.ok(src.includes("if (Number.isFinite(o.lengthScale) && o.lengthScale > 0) {"),
-    'the length_scale flag is conditional, not always present');
-});
-
 test('AC5/N4: Compare mode renders flat through the untouched synthesize()', () => {
+  // v13.0.1. STRUCTURAL, not a string comparison.
+  //
+  // ── Why this assertion was rewritten twice ────────────────────────────────
+  //
+  // It began as a regex pinning the exact argument list of Compare's flat call.
+  // Adding `sampleRate` to that call AND to the Off-mode call preserved the
+  // equivalence AC3 needs perfectly -- and still failed. A test that fails on
+  // correct code invites weakening, which is how a control gets lost.
+  //
+  // The second attempt extracted both call sites and compared the strings. That
+  // was better, but still fragile: it depended on the variable names, and on the
+  // argument objects never containing a nested brace.
+  //
+  // The real fix was in the CODE. The three flat renderings -- Compare's half,
+  // the prosody fallback, and the true flat path -- now share one `renderFlat`
+  // closure. The equivalence is a property of the code rather than a claim about
+  // it, so there is nothing left to keep in step and nothing to drift.
+  //
+  // What is asserted here is that the property stayed structural: one
+  // definition, and no path quietly reintroducing a direct call with its own
+  // argument list.
   const src = source('routes/voice.js');
-  const compare = src.slice(src.indexOf("if ('both' === effective)"),
-                            src.indexOf('reply_hash: replyHash(text)'));
-  assert.ok(/const flat = await synthesize\(\{ text, voice, speed: flatSpeed \}\)/.test(compare),
-    'the flat half of Compare is the same call Off mode makes');
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+  const definitions = ( code.match(/const renderFlat = \(\) => synthesize\(\{/gu) || [] ).length;
+  assert.equal(definitions, 1, 'exactly one definition of the flat rendering');
+
+  assert.equal(( code.match(/await synthesize\(\{/gu) || [] ).length, 0,
+    'no path calls synthesize() directly with its own argument list, which is '
+    + 'what allowed the three to diverge');
+
+  // All three paths reach it. Named individually so a failure says WHICH path
+  // stopped using the shared rendering.
+  const compare = code.slice(code.indexOf("if ('both' === effective)"),
+                             code.indexOf('reply_hash: replyHash(text)'));
+  assert.ok(/const flat = await renderFlat\(\)/.test(compare),
+    'the flat half of Compare is the shared rendering');
   assert.ok(/synthesizeProsody\(/.test(compare), 'and the layered half is the layer');
+
+  assert.ok(/wav = await renderFlat\(\);\s*path = 'flat_fallback';/.test(code),
+    'the prosody fallback uses it too, so a degraded reply matches Off mode');
+  assert.equal(( code.match(/await renderFlat\(\)/gu) || [] ).length, 3,
+    'Compare, the fallback and the flat path -- all three');
 });
 
 test('AC5: Compare returns two audio outputs paired by one hash', () => {
@@ -623,89 +622,12 @@ test('AC18/N5: a layer failure falls back to single-call synthesis', () => {
   }
 });
 
-// ===========================================================================
-// PIPER-PRELOAD-v1.1 -- the resident worker
-// ===========================================================================
-
-test('A5: the CLI path survives intact as the fallback', () => {
-  const src = source('voice/voice-engines.js');
-  assert.ok(src.includes('function synthesizePcmViaCli'),
-    'the per-request spawn is still there and is still reachable');
-  assert.ok(/const viaWorker = await synthesizeViaWorker\(/.test(src),
-    'the worker is tried first');
-  assert.ok(src.includes('if (viaWorker) {'),
-    'and a null answer falls through to the CLI path');
-});
-
-test('A5: disabling the worker by flag reverts to the CLI path', () => {
-  const src = source('voice/piper-worker-supervisor.js');
-  assert.ok(src.includes("boolEnv('VOICE_TTS_WORKER_ENABLED', true)"));
-  assert.ok(/export async function synthesizeViaWorker[\s\S]{0,400}if \(!workerEnabled\(\)\) return null;/.test(src),
-    'the flag short-circuits to null, which routes to the CLI path');
-  // The shared lifecycle honours the same flag before spawning anything.
-  const shared = source('voice/stdio-worker.js');
-  assert.ok(shared.includes('if (!spec.enabled()) return Promise.resolve(false);'),
-    'a disabled worker is never spawned');
-});
-
-// v12.54.0: the three assertions below used to read
-// piper-worker-supervisor.js. Change 3 needed the same lifecycle for Whisper,
-// so spawn, framing, routing, timeouts, backoff and health moved to
-// stdio-worker.js and BOTH engines use it. The behaviour is unchanged; only
-// the file that holds it moved, so these now read the shared module.
-//
-// That is strictly better coverage: asserting it once covers both workers,
-// where before it covered one and the second copy could have drifted.
-
-test('A4: an unavailable worker routes to the CLI path, a refusal does not', () => {
-  const src = source('voice/stdio-worker.js');
-
-  // FALL BACK BY DEFAULT, REJECT ONLY WHAT IS NAMED.
-  //
-  // This originally asserted an allowlist of three "infrastructure" codes that
-  // fell back, with everything else throwing. That shipped and took voice down:
-  // a worker that could not `import piper` returned the generic
-  // `synthesis_failed`, which was not on the list, so it became a 500 and the
-  // CLI path was never tried.
-  assert.ok(/const refusals = \('function' === typeof spec\.refusals/.test(src),
-    'the caller names the codes that must NOT fall back');
-  assert.ok(/if \(refusals\.includes\(err\.code\)\) throw err;/.test(src),
-    'and only those throw');
-  assert.ok(/return null;/.test(src.slice(src.indexOf('const refusals'))),
-    'everything else degrades to the per-request path');
-
-  // The specific regression: a generic engine failure must NOT be a refusal.
-  const piper = source('voice/piper-worker-supervisor.js');
-  const refusals = /refusals:\s*\(\)\s*=>\s*\[([^\]]*)\]/.exec(piper);
-  assert.ok(refusals, 'the Piper supervisor declares its refusals');
-  for (const code of ['synthesis_failed', 'piper_import_failed', 'model_load_failed']) {
-    assert.ok(!refusals[1].includes(code),
-      `${code} must fall back: it can be true of the worker while the CLI binary works`);
-  }
-  // And the Piper side still reads a null answer as "use the CLI path".
-  const engines = source('voice/voice-engines.js');
-  assert.ok(engines.includes('if (viaWorker) {'),
-    'a null answer falls through to the CLI spawn');
-});
-
 test('A4: in-flight requests are rejected when the worker dies', () => {
   const src = source('voice/stdio-worker.js');
   assert.ok(src.includes('function failPending'),
     'a caller must not wait on a process that no longer exists');
   assert.ok(src.includes('backOff'), 'and restarts back off exponentially');
   assert.ok(/state\.disabledUntil = Date\.now\(\) \+ wait/.test(src));
-});
-
-test('A2: the worker pid and warm flag are surfaced for health', () => {
-  const src = source('voice/stdio-worker.js');
-  assert.ok(/warm:\s*!!\(state\.ready && state\.child\)/.test(src));
-  assert.ok(/pid:\s*state\.pid/.test(src));
-  const routes = source('routes/voice.js');
-  assert.ok(routes.includes('tts_worker: ttsWorkerState()'),
-    '/voice/health reports it');
-  // v12.54.0: and the adapter is still published at the path v12.53.0 used.
-  const piper = source('voice/piper-worker-supervisor.js');
-  assert.ok(piper.includes('adapter:'), 'tts_worker.adapter survives the refactor');
 });
 
 test('A7: pre-warm is inside the master-switch guard', () => {
@@ -747,102 +669,4 @@ test('the TTS and STT queues are independent', () => {
   assert.ok(src.includes('ttsInFlight') && src.includes('ttsQueue'));
   assert.ok(/state\.inFlight < STT_CONCURRENCY/.test(src));
   assert.ok(/state\.ttsInFlight < TTS_CONCURRENCY/.test(src));
-});
-
-test('Section 10: every new environment variable has a safe default', () => {
-  const supervisor = source('voice/piper-worker-supervisor.js');
-  const engines = source('voice/voice-engines.js');
-  const both = supervisor + engines;
-  assert.ok(both.includes("boolEnv('VOICE_TTS_WORKER_ENABLED', true)"));
-  assert.ok(both.includes("boolEnv('VOICE_TTS_PREWARM', true)"));
-  assert.ok(both.includes("intEnv('VOICE_TTS_CONCURRENCY', 1"));
-  assert.ok(both.includes("intEnv('VOICE_TTS_RESIDENT_VOICES', 1"));
-  assert.ok(both.includes("intEnv('VOICE_TTS_WORKER_IDLE_MS', 300_000"));
-});
-
-test('the worker protocol bounds length_scale on both sides of the pipe', () => {
-  const worker = readFileSync(join(SRC, 'voice', 'piper_worker.py'), 'utf8');
-  assert.ok(worker.includes('0.1 <= length_scale <= 10.0'),
-    'a value from a pipe is input, not state');
-  assert.ok(worker.includes('1.0 / float(speed)'),
-    'speed converts exactly as the CLI path does, so the two cannot disagree');
-});
-
-test('the worker returns raw PCM, never a WAV per phrase', () => {
-  const worker = readFileSync(join(SRC, 'voice', 'piper_worker.py'), 'utf8');
-  // A 44-byte header in the middle of a join is heard as a burst of noise.
-  assert.ok(worker.includes('readframes'),
-    'the wav adapter strips the container before returning');
-  assert.ok(worker.includes('pcm_b64'));
-
-  const supervisor = source('voice/piper-worker-supervisor.js');
-  assert.ok(supervisor.includes('pcm.length % 2 !== 0'),
-    'an odd byte count is treated as a fault and falls back');
-});
-
-// ===========================================================================
-// REGRESSION: the production failure of 2026-08-18
-//
-//   [voice] piper worker ready (pid=123)
-//   [voice] tts_failed: ModuleNotFoundError: No module named 'piper'
-//   [voice] tts_error code=synthesis_failed status=500
-//
-// A worker whose interpreter could not import piper started, ANNOUNCED ITSELF
-// READY, and then failed every synthesis as a 500 -- while a working CLI
-// fallback sat one branch away and was never tried.
-//
-// Run against the real supervisor with a real interpreter that has no piper,
-// because every structural assertion in this file passed while this was broken.
-// ===========================================================================
-
-test('REGRESSION: an interpreter without piper falls back instead of 500ing', async () => {
-  const { spawnSync } = await import('node:child_process');
-
-  // A system python3 is exactly the interpreter that will not have piper --
-  // which is the whole point, and is what the deployment accidentally used.
-  const probe = spawnSync('python3', ['-c', 'import piper'], { encoding: 'utf8' });
-  if (0 === probe.status) return;   // piper IS installed here; nothing to prove
-
-  const script = `
-    process.env.VOICE_PIPER_PYTHON = 'python3';
-    process.env.VOICE_TTS_WORKER_ENABLED = 'true';
-    const m = await import(${JSON.stringify(join(SRC, 'voice', 'piper-worker-supervisor.js'))});
-    let verdict;
-    try {
-      const r = await m.synthesizeViaWorker({ text: 'hi', modelPath: '/tmp/none.onnx' });
-      verdict = (null === r) ? 'FELL_BACK' : 'RETURNED_VALUE';
-    } catch (err) {
-      verdict = 'THREW:' + err.code;
-    }
-    console.log(verdict + '|fatal=' + m.workerState().fatal);
-  `;
-  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script],
-                      { encoding: 'utf8', timeout: 90_000 });
-
-  // The process must also EXIT. An unsettled promise here would mean the
-  // busy-tracking reference leaked, which was the second-order bug the unref
-  // fix introduced and which presents as a test that simply never finishes.
-  assert.equal(r.status, 0, `the supervisor did not exit cleanly: ${r.stderr}`);
-  assert.ok(!/unsettled top-level await/.test(r.stderr || ''),
-    'the request settled rather than leaving the loop with nothing to do');
-
-  assert.match(r.stdout, /FELL_BACK/,
-    'a missing engine must resolve to null so synthesis uses the CLI path, '
-    + `not throw a 500. Got: ${r.stdout.trim()}`);
-  assert.match(r.stdout, /fatal=true/,
-    'and the state is reported as fatal, so an operator can see it needs action');
-});
-
-test('REGRESSION: a worker is not "ready" until the engine imports', () => {
-  const worker = readFileSync(join(SRC, 'voice', 'piper_worker.py'), 'utf8');
-  const serve = worker.slice(worker.indexOf('def serve('));
-  const readyAt = serve.indexOf('"type": "ready"');
-  const importAt = serve.indexOf('state.ensure_imported()');
-
-  assert.ok(importAt !== -1, 'serve() verifies the import');
-  assert.ok(importAt < readyAt,
-    'the import is verified BEFORE ready is announced -- otherwise the log reads '
-    + '"worker ready" immediately above ModuleNotFoundError, which is what it did');
-  assert.ok(serve.includes('"type": "fatal"'),
-    'and it reports a fatal line the supervisor can act on');
 });

@@ -219,46 +219,6 @@ test('gateState reports per user, not globally', () => {
   });
 });
 
-// ===========================================================================
-// The GPL boundary. Section 6.3, compliance obligation 1.
-// ===========================================================================
-test('GPL boundary: the STT helper never imports or executes Piper', () => {
-  const py = readFileSync(join(VOICE_DIR, 'voice_stt.py'), 'utf8');
-
-  // Our MIT helper must not share a process with GPL code. Collapsing the two
-  // engines into one helper would be the easy refactor and would destroy the
-  // boundary Section 6.2 locks, so it is asserted rather than trusted.
-  const code = py.replace(/^\s*#.*$/gm, '').replace(/"""[\s\S]*?"""/g, '');
-  assert.ok(!/\bimport\s+piper/.test(code), 'voice_stt.py must not import piper');
-  assert.ok(!/\bfrom\s+piper/.test(code), 'voice_stt.py must not import from piper');
-  assert.ok(!/piper_phonemize|espeak/.test(code), 'nor the GPL phonemizer');
-  assert.ok(!/subprocess|os\.system|os\.exec/.test(code),
-    'voice_stt.py must not spawn anything, least of all Piper');
-
-  // And it must genuinely be the STT engine, or the assertions above are
-  // trivially satisfied by an empty file.
-  assert.ok(/faster_whisper/.test(code), 'voice_stt.py does use faster-whisper');
-});
-
-test('GPL boundary: Piper runs as its own process, from its own directory', () => {
-  const js = readFileSync(join(VOICE_DIR, 'voice-engines.js'), 'utf8');
-
-  assert.ok(/spawn\(\s*PIPER_BIN/.test(js), 'Piper is spawned as a separate OS process');
-  assert.ok(/VOICE_PIPER_DIR/.test(js), 'from its own directory');
-
-  // Section 11: least privilege, no connector secrets. Node hands a child the
-  // entire parent environment by default, which here includes API keys and the
-  // database URL, so the environment must be built explicitly.
-  const piperCall = js.slice(js.indexOf('export async function synthesize'));
-  assert.ok(/env:\s*\{\s*PATH/.test(piperCall),
-    'Piper gets an explicit minimal environment, not the connector\'s');
-  assert.ok(!/env:\s*process\.env/.test(piperCall),
-    'Piper must never inherit process.env wholesale');
-
-  // argv array, never a shell string: a voice id cannot be word-split.
-  assert.ok(!/spawn\([^)]*shell:\s*true/.test(js), 'no shell invocation');
-});
-
 test('GPL boundary: nothing GPL is a declared dependency of the connector', () => {
   const pkg = JSON.parse(readFileSync(join(HERE, '..', '..', 'package.json'), 'utf8'));
   const declared = Object.keys({ ...pkg.dependencies, ...(pkg.devDependencies || {}) });
@@ -359,89 +319,6 @@ test('multipart reads one file and its fields, and refuses the rest', () => {
 });
 
 // ===========================================================================
-// Compliance obligation 2: the per-voice licence audit.
-// ===========================================================================
-test('a voice is refused until its MODEL_CARD has been audited', () => {
-  // UPDATED v12.50.0. This test previously asserted that NOTHING was usable,
-  // which was the honest state when no MODEL_CARD had been read. Two have now
-  // been read, so the assertion moves from "nothing ships" to the invariant it
-  // was always really protecting: nothing ships that has not been checked, and
-  // being checked is not the same as being allowed.
-  const state = catalogState();
-  assert.equal(state.audit_required, true, 'the audit is required by default');
-
-  const audited   = VOICE_CATALOG.filter(v => v.audited);
-  const unaudited = VOICE_CATALOG.filter(v => !v.audited);
-  assert.ok(audited.length > 0, 'the audit has actually been carried out on something');
-  assert.ok(unaudited.length > 0, 'and unread MODEL_CARDs are still recorded as unread');
-  assert.equal(state.unaudited.length, unaudited.length);
-
-  for (const v of unaudited) {
-    const p = voicePermitted(v.voice_id);
-    assert.equal(p.ok, false, `${v.voice_id} is unaudited and must be refused`);
-    assert.equal(p.reason, 'voice_unaudited');
-    assert.ok(/MODEL_CARD/.test(p.message), 'and the refusal explains why');
-  }
-
-  for (const v of audited) {
-    const p = voicePermitted(v.voice_id);
-    // An audited voice is permitted only if the audit came back clean. This is
-    // the distinction the table exists to express.
-    assert.equal(p.ok, v.commercial_ok === true, `${v.voice_id} follows its audit result`);
-    if (!p.ok) assert.equal(p.reason, 'voice_non_commercial');
-  }
-
-  assert.equal(voicePermitted('made-up-voice').reason, 'unknown_voice');
-  assert.equal(voicePermitted('').reason, 'unknown_voice');
-
-  // An allowlist, not a blocklist: a voice added to rhasspy/piper-voices
-  // tomorrow is refused by default rather than used by default.
-  assert.equal(state.usable, VOICE_CATALOG.filter(v => voicePermitted(v.voice_id).ok).length);
-  assert.deepEqual(voicesForLanguage('en').map(v => v.voice_id), ['en_US-kristin-medium'],
-    'English resolves to the audited, public-domain voice and to nothing else');
-
-  // Attribution lists only voices whose MODEL_CARD actually asks for it. Both
-  // audited entries are public domain or refused, so the page stays empty --
-  // which is correct, not incomplete.
-  assert.deepEqual(attributions(), []);
-});
-
-test('the four launch languages are represented, Vietnamese with a fallback', () => {
-  assert.deepEqual([...TTS_LANGUAGES].sort(), ['en', 'ja', 'vi', 'zh']);
-  for (const lang of TTS_LANGUAGES) {
-    assert.ok(VOICE_CATALOG.some(v => v.language === lang && v.role === 'default'),
-      `${lang} has a default voice`);
-  }
-  // Section 5: Vietnamese is the constraint language, and Table 2 names a
-  // fallback for exactly that reason.
-  assert.ok(VOICE_CATALOG.some(v => v.language === 'vi' && v.role === 'fallback'),
-    'Vietnamese carries a documented fallback voice');
-  assert.equal(VOICE_CATALOG.find(v => v.language === 'vi').quality_tier, 'weak');
-});
-
-test('an explicitly non-commercial voice is refused even with the audit off', () => {
-  const prior = process.env.VOICE_AUDIT_REQUIRED;
-  try {
-    process.env.VOICE_AUDIT_REQUIRED = 'false';
-
-    // With the audit relaxed, an UNAUDITED voice becomes usable. That is what
-    // the switch is for: it says "I accept the risk on licences nobody has read".
-    assert.equal(voicePermitted('zh_CN-huayan-medium').ok, true);
-
-    // It does NOT say "I accept a licence somebody has read and rejected".
-    // en_US-lessac-medium is the real case (v12.50.0): the CSTR Blizzard 2013
-    // Lessac corpus is released for non-commercial use only. A known-bad answer
-    // is different from a missing one and stays refused either way.
-    const verdict = voicePermitted('en_US-lessac-medium');
-    assert.equal(verdict.ok, false);
-    assert.equal(verdict.reason, 'voice_non_commercial');
-  } finally {
-    if (prior === undefined) delete process.env.VOICE_AUDIT_REQUIRED;
-    else process.env.VOICE_AUDIT_REQUIRED = prior;
-  }
-});
-
-// ===========================================================================
 // Section 16 behavioural acceptance criteria, over real HTTP.
 // ===========================================================================
 test('AC: gate off -- the two routes 404, health answers enabled:false', async () => {
@@ -501,21 +378,30 @@ test('AC: an unsupported language or voice is a clear 422, never a 500', async (
     assert.equal(voice.status, 422);
     assert.equal((await voice.json()).error, 'unknown_voice');
 
-    // The audit gate reaching the caller, honestly, as a 422. Chinese, not
-    // English: from v12.50.0 English resolves to an audited voice and would go
-    // on to the engine, so it no longer demonstrates the audit refusing anyone.
-    const unaudited = await post({ text: 'hello', language: 'zh' });
-    assert.equal(unaudited.status, 422);
-    assert.equal((await unaudited.json()).error, 'no_voice_available');
+    // v13. Chinese was a supported language under Piper and is refused for a
+    // DIFFERENT reason now: Kokoro's inventory has no Vietnamese voice at all
+    // and none of the five voices this platform deploys is Japanese or
+    // Mandarin, so TTS_LANGUAGES narrowed to English alone. The refusal moved
+    // from "no audited voice for that language" to "that language is not
+    // spoken here", which is the honest answer and still a 422.
+    const dropped = await post({ text: 'hello', language: 'zh' });
+    assert.equal(dropped.status, 422);
+    assert.equal((await dropped.json()).error, 'unsupported_language');
 
-    // A licence verdict is also a 422 with a renderable message, not a 500.
-    const nonCommercial = await post({ text: 'hello', voice: 'en_US-lessac-medium' });
-    assert.equal(nonCommercial.status, 422);
-    assert.equal((await nonCommercial.json()).error, 'voice_non_commercial');
+    // Every Piper voice id is now an unknown voice. Worth asserting rather than
+    // deleting: a client that stored a preference before the cutover will send
+    // one of these, and it must get a clean refusal naming the alternatives
+    // instead of a 500 from a style lookup deep in the engine.
+    for (const stale of ['en_US-lessac-medium', 'en_US-kristin-medium',
+                         'vi_VN-vais1000-medium']) {
+      const res = await post({ text: 'hello', voice: stale });
+      assert.equal(res.status, 422, `${stale} should be a clean refusal`);
+      assert.equal((await res.json()).error, 'unknown_voice');
+    }
 
     assert.equal((await post({ text: '' })).status, 422);
-    assert.equal((await post({ text: 'hi', voice: 'en_US-kristin-medium', format: 'mp3' })).status, 422);
-    assert.equal((await post({ text: 'hi', voice: 'en_US-kristin-medium', speed: 9 })).status, 422);
+    assert.equal((await post({ text: 'hi', voice: 'af_bella', format: 'mp3' })).status, 422);
+    assert.equal((await post({ text: 'hi', voice: 'af_bella', speed: 9 })).status, 422);
   } finally {
     await close();
     if (prior.e === undefined) delete process.env.VOICE_ENABLED; else process.env.VOICE_ENABLED = prior.e;
@@ -565,10 +451,17 @@ test('AC: health reports that the benchmark gate has not been passed', async () 
     // Section 14's gate is hard. An operator must be able to see that voice is
     // answering on provisional defaults rather than measured ones.
     assert.equal(body.benchmark_completed, false);
-    assert.equal(body.catalogue.usable, 1,
-      'exactly one voice has cleared its audit: the public-domain English default');
-    assert.deepEqual(body.catalogue.usable_by_language.en, ['en_US-kristin-medium']);
-    assert.deepEqual(body.tts_languages.sort(), ['en', 'ja', 'vi', 'zh']);
+    // v13. Kokoro is ONE Apache-2.0 model whose voices are style vectors inside
+    // one bundle, so there is no per-voice licence to diverge and every voice is
+    // usable. The Piper-era "exactly one has cleared its audit" is not a weaker
+    // claim now, it is a meaningless one.
+    assert.equal(body.catalogue.active, 5, 'the five deployed voices');
+    assert.equal(body.catalogue.unverified, 0,
+      'no voice can be in the unverified state under a single read licence');
+    assert.equal(body.catalogue.licence, 'Apache-2.0');
+    // v13. English only. Kokoro has no Vietnamese voice at any version, and none
+    // of the five deployed voices is Japanese or Mandarin. A recorded loss.
+    assert.deepEqual(body.tts_languages.sort(), ['en']);
     assert.equal(body.stt_languages, 'auto', 'STT coverage is reported separately');
   } finally {
     await close();
@@ -617,7 +510,7 @@ test('the schema stores preferences and metadata, and cannot store content', () 
       assert.ok(!cols.includes(banned), `voice_usage_log must not have a ${banned} column`);
     }
 
-    setVoiceSettings(db, 'u1', { preferred_voice: 'en_US-lessac-medium', speed: 1.25, language: 'en' });
+    setVoiceSettings(db, 'u1', { preferred_voice: 'af_bella', speed: 1.25, language: 'en' });
     assert.equal(getVoiceSettings(db, 'u1').speed, 1.25);
 
     // Out-of-range speed is clamped to the default rather than stored.
@@ -629,27 +522,33 @@ test('the schema stores preferences and metadata, and cannot store content', () 
     assert.equal(db.prepare('SELECT COUNT(*) c FROM voice_usage_log').get().c, 1,
       'an unknown direction is dropped, not stored');
 
-    // The catalogue table mirrors the code, and the three states must stay
-    // distinguishable in SQL as well as in JS. This is the whole reason
-    // commercial_ok is nullable.
-    const unread = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?')
-      .get('zh_CN-huayan-medium');
-    assert.equal(unread.audited, 0);
-    assert.equal(unread.commercial_ok, null,
-      'unverified is NULL, which is not the same claim as "audited and refused"');
+    // v13. THE THREE-STATE LICENCE MODEL IS GONE, AND THAT IS THE POINT.
+    //
+    // Under Piper this asserted that unverified (NULL), audited-and-refused (0)
+    // and audited-and-cleared (1) stayed distinguishable in SQL -- because Piper
+    // voices came from many datasets with divergent terms, and one of them was
+    // non-commercial-only.
+    //
+    // Kokoro is one Apache-2.0 model. Every row is audited and cleared, so the
+    // nullable column survives for a future engine but cannot hold NULL today.
+    // Asserting that is the honest replacement: the schema still DISTINGUISHES
+    // the states, and no current row occupies the dangerous ones.
+    for (const voiceId of ['af_bella', 'af_nicole', 'af_heart', 'bf_emma', 'af_aoede']) {
+      const row = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?').get(voiceId);
+      assert.ok(row, `${voiceId} is mirrored into the table`);
+      assert.equal(row.audited, 1, `${voiceId} is audited`);
+      assert.equal(row.commercial_ok, 1, `${voiceId} is cleared for commercial use`);
+      assert.match(row.licence, /Apache-2\.0/);
+      assert.ok(row.model_card, 'a licence verdict records where it came from');
+    }
 
-    const refused = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?')
-      .get('en_US-lessac-medium');
-    assert.equal(refused.audited, 1, 'read in v12.50.0');
-    assert.equal(refused.commercial_ok, 0,
-      'audited and refused: 0, distinct from the NULL above');
-    assert.match(refused.licence, /non-commercial/i);
-
-    const cleared = db.prepare('SELECT * FROM voice_catalog WHERE voice_id = ?')
-      .get('en_US-kristin-medium');
-    assert.equal(cleared.audited, 1);
-    assert.equal(cleared.commercial_ok, 1);
-    assert.ok(cleared.model_card, 'an audit result records where it came from');
+    assert.equal(
+      db.prepare('SELECT COUNT(*) c FROM voice_catalog WHERE commercial_ok IS NULL').get().c,
+      0, 'no row is in the unverified state');
+    assert.equal(
+      db.prepare("SELECT COUNT(*) c FROM voice_catalog WHERE voice_id LIKE '%piper%' "
+        + "OR voice_id LIKE 'en_US-%' OR voice_id LIKE 'vi_VN-%'").get().c,
+      0, 'no Piper-era row survives the sync');
   } finally {
     db.close();
   }
@@ -865,7 +764,9 @@ test('AC: the allowlisted operator reaches the routes', async () => {
         body: JSON.stringify({ text: 'hello', language: 'zh' }),
       });
       assert.equal(zh.status, 422);
-      assert.equal((await zh.json()).error, 'no_voice_available');
+      // v13. Refused for a different reason now: Chinese is not a language this
+      // deployment speaks at all, rather than one with no audited voice.
+      assert.equal((await zh.json()).error, 'unsupported_language');
 
       const t = await fetch(`${base}/voice/transcribe`, {
         method: 'POST',
@@ -1307,21 +1208,55 @@ test('the engines are installed in the image, in separate environments', () => {
   const df = readFileSync(join(HERE, '..', '..', 'Dockerfile'), 'utf8');
 
   assert.ok(/faster-whisper==/.test(df), 'faster-whisper is installed');
-  assert.ok(/piper-tts==/.test(df), 'piper-tts is installed');
+  assert.ok(/kokoro-onnx==/.test(df), 'kokoro-onnx is installed');
+  assert.ok(/piper-tts/.test(df) === false, 'and no Piper install survives');
 
-  // The licence boundary, in the build. Piper into its own venv; faster-whisper
-  // into system packages. Installing them together would put GPL code in the
+  // v13. THE LICENCE BOUNDARY SURVIVED THE ENGINE SWAP, and this is where the
+  // build has to prove it.
+  //
+  // Kokoro-82M is Apache-2.0, so the separate venv looks like ceremony now. It
+  // is not: kokoro-onnx phonemises through `phonemizer`, which drives espeak-ng,
+  // and espeak-ng is GPL-3.0. The dependency moved from the model to the
+  // phonemiser. Installing the two together would still put GPL code in the
   // interpreter our MIT helper imports from.
-  assert.ok(/python3 -m venv \/opt\/piper/.test(df), 'Piper gets its own venv');
-  const piperLine = df.slice(df.indexOf('/opt/piper/bin/pip install'), df.indexOf('/opt/piper/bin/pip install') + 200);
-  assert.ok(!/faster-whisper/.test(piperLine),
+  assert.ok(/python3 -m venv \/opt\/kokoro/.test(df), 'Kokoro gets its own venv');
+  assert.ok(/espeak-ng/.test(df),
+    'espeak-ng is installed as a system package, since phonemizer shells out to it');
+
+  const kokoroInstall = df.slice(df.indexOf('/opt/kokoro/bin/pip install'),
+                                 df.indexOf('/opt/kokoro/bin/pip install') + 320);
+  assert.ok(!/faster-whisper/.test(kokoroInstall),
     'and faster-whisper is NOT installed into it');
 
   const whisperLine = df.slice(df.indexOf('faster-whisper=='), df.indexOf('faster-whisper==') + 120);
-  assert.ok(!/piper/.test(whisperLine), 'nor Piper into system packages');
+  assert.ok(!/kokoro/.test(whisperLine), 'nor Kokoro into system packages');
 
-  assert.ok(/VOICE_PIPER_BIN=\/opt\/piper\/bin\/piper/.test(df),
-    'and the binary path is defaulted to match the venv');
+  assert.ok(/VOICE_KOKORO_PYTHON=\/opt\/kokoro\/bin\/python3/.test(df),
+    'and the interpreter path is defaulted to match the venv');
+  // v13.2.0. INVERTED, deliberately. This asserted that both artifact paths were
+  // pinned by ENV. They no longer are, and must not be: pinning them defeats the
+  // layered resolution in kokoro-worker-supervisor.js
+  //
+  //     explicit env  ->  volume, if present  ->  the copy baked into the image
+  //
+  // which is what makes the baked copy a FLOOR rather than a ceiling. With the
+  // paths unset a fresh deploy runs the image copy and works immediately, while
+  // an operator who drops a newer model onto the volume gets it picked up on the
+  // next restart with no rebuild.
+  assert.ok(! /VOICE_KOKORO_MODEL=/.test(df),
+    'the model path must NOT be pinned in the image');
+  assert.ok(! /VOICE_KOKORO_VOICES=/.test(df),
+    'nor the bundle path');
+  assert.ok(/VOICE_KOKORO_DIR=/.test(df),
+    'but the volume override location is still named');
+  assert.ok(/mkdir -p \/opt\/kokoro\/models/.test(df),
+    'and the artifacts are baked into the image, outside the volume mount');
+
+  // The build proves the engine IMPORTS in the venv that will run it. A build
+  // that ships an unimportable engine produces a worker which starts, reports
+  // ready, and fails every request.
+  assert.ok(/import kokoro_onnx/.test(df),
+    'the build verifies the engine imports rather than assuming it');
   // A browser sends WebM or MP4; the decoder needs the system codecs.
   assert.ok(/ffmpeg/.test(df), 'ffmpeg is present for browser audio containers');
 });

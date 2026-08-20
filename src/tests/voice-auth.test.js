@@ -46,8 +46,18 @@ import { registerVoiceRoutes }                   from '../routes/voice.js';
 import { classifyVoiceCredential, constantTimeEquals,
          extractBearer, extractRestoreToken }    from '../voice/voice-auth.js';
 import { installedVoices }                       from '../voice/voice-engines.js';
-import { VOICE_SOURCES, MISSING_UPSTREAM,
-         installVoice, voicesDir }              from '../voice/voice-provision.js';
+// v13.2.0. The voice-provision import is GONE, not trimmed.
+//
+// It pulled in VOICE_SOURCES, MISSING_UPSTREAM, installVoice and voicesDir for
+// the Piper-era provisioning tests, which were removed in v13.0.0 when
+// per-voice downloads stopped existing. All four were left behind as a dead
+// import -- and a dead import of a module that performs NETWORK DOWNLOADS is
+// not inert: it only takes one future test calling the symbol that is already
+// conveniently in scope for the suite to acquire a 28 MB fetch and a network
+// dependency nobody chose.
+//
+// Verified empirically before removal: the suite was run with the artifact
+// deleted from the volume, and nothing re-downloaded it.
 import { VOICE_CATALOG }                        from '../voice/voice-catalog.js';
 
 const MCP_KEY      = 'k'.repeat(48);
@@ -419,105 +429,6 @@ test('installed voices are read from the volume, not from the licence catalogue'
   });
 });
 
-// ===========================================================================
-// Voice model provisioning (v12.50.0)
-// ===========================================================================
-
-test('every catalogue voice either has a download source or is named as missing', () => {
-  // The failure this catches: a voice offered by the API that nothing can ever
-  // download, discovered by a user pressing a speak button. Each catalogue
-  // entry must resolve to a repository path, or be explicitly recorded as
-  // unavailable with a reason.
-  for (const entry of VOICE_CATALOG) {
-    const known = Object.prototype.hasOwnProperty.call(VOICE_SOURCES, entry.voice_id)
-      || Object.prototype.hasOwnProperty.call(MISSING_UPSTREAM, entry.voice_id);
-    assert.equal(known, true,
-      `${entry.voice_id} is offered by the catalogue but has no recorded source`);
-  }
-});
-
-test('a catalogue voice that does not exist upstream is reported, not substituted', async () => {
-  // ja_JP-ryoko-medium is the Japanese default in VOICE_CATALOG and is not
-  // published by rhasspy/piper-voices. VOICE_CATALOG is a LICENCE record, so
-  // silently pointing that id at a different voice would put an unreviewed
-  // model behind a reviewed name. The provisioner must refuse and explain.
-  const result = await installVoice('ja_JP-ryoko-medium');
-  assert.equal(result.status, 'unavailable');
-  assert.match(result.error, /ja_JA-hi_fi_captain-medium/);
-  assert.equal(Object.prototype.hasOwnProperty.call(VOICE_SOURCES, 'ja_JP-ryoko-medium'), false,
-    'the missing id must not be aliased to another voice');
-});
-
-test('an unknown voice id is refused without touching the network', async () => {
-  const result = await installVoice('../../etc/passwd');
-  assert.equal(result.status, 'unknown');
-  // The id is looked up in a fixed table, so a path-shaped id resolves to
-  // nothing rather than to a path.
-  assert.match(result.error, /No source is recorded/);
-});
-
-test('the voices directory follows the same variables as the engine', async () => {
-  await withEnv({ VOICE_VOICES_DIR: '/tmp/tenax-voice-test-dir' }, () => {
-    assert.equal(voicesDir(), '/tmp/tenax-voice-test-dir');
-  });
-  await withEnv({ VOICE_VOICES_DIR: undefined, VOICE_PIPER_DIR: '/data/voice/piper' }, () => {
-    // Must match voice-engines.js, or the provisioner writes where nothing reads.
-    assert.equal(voicesDir(), '/data/voice/piper/voices');
-  });
-});
-
-test('provisioning is opt-in and never fires unrequested', async () => {
-  const { provisionFromEnv } = await import('../voice/voice-provision.js');
-  await withEnv({ VOICE_PROVISION_VOICES: undefined }, () => {
-    assert.equal(provisionFromEnv(() => {}), null, 'unset must do nothing at all');
-  });
-  await withEnv({ VOICE_PROVISION_VOICES: '  ,  ,' }, () => {
-    assert.equal(provisionFromEnv(() => {}), null, 'an empty list must do nothing');
-  });
-});
-
-// ===========================================================================
-// English default and the licence audit (v12.50.0)
-// ===========================================================================
-
-test('the English default is the audited, public-domain voice', async () => {
-  const { voicesForLanguage, findVoice } = await import('../voice/voice-catalog.js');
-  await withEnv({ VOICE_AUDIT_REQUIRED: 'true' }, () => {
-    const usable = voicesForLanguage('en');
-    assert.equal(usable[0].voice_id, 'en_US-kristin-medium',
-      'a caller taking the first entry must get the audited default');
-    const kristin = findVoice('en_US-kristin-medium');
-    assert.equal(kristin.audited, true);
-    assert.equal(kristin.commercial_ok, true);
-    assert.equal(kristin.attribution_required, false);
-    assert.match(kristin.model_card, /MODEL_CARD/,
-      'an audited entry must record where the finding came from');
-  });
-});
-
-test('the non-commercial voice is refused whatever the audit setting says', async () => {
-  const { voicePermitted } = await import('../voice/voice-catalog.js');
-  // The CSTR Blizzard 2013 Lessac data is released for non-commercial use only.
-  // VOICE_AUDIT_REQUIRED=false relaxes UNKNOWN licences; it must never relax a
-  // known-bad one, or the escape hatch for "not checked yet" becomes an escape
-  // hatch for "checked, and not allowed".
-  for (const setting of ['true', 'false', undefined]) {
-    await withEnv({ VOICE_AUDIT_REQUIRED: setting }, () => {
-      const verdict = voicePermitted('en_US-lessac-medium');
-      assert.equal(verdict.ok, false, `must stay refused with VOICE_AUDIT_REQUIRED=${setting}`);
-      assert.equal(verdict.reason, 'voice_non_commercial');
-    });
-  }
-});
-
-test('a disqualified voice is refused, not deleted', async () => {
-  const { findVoice, voicePermitted } = await import('../voice/voice-catalog.js');
-  // Removing the entry would make voicePermitted answer "unknown_voice", which
-  // reads like a typo to whoever has the id configured. It must say why instead.
-  assert.notEqual(findVoice('en_US-lessac-medium'), null);
-  assert.match(voicePermitted('en_US-lessac-medium').message, /non-commercial/i);
-});
-
 test('every audited entry records a licence and a model card', async () => {
   const { VOICE_CATALOG } = await import('../voice/voice-catalog.js');
   for (const v of VOICE_CATALOG.filter(v => v.audited)) {
@@ -526,83 +437,4 @@ test('every audited entry records a licence and a model card', async () => {
     assert.notEqual(v.commercial_ok, null,
       `${v.voice_id} claims to be audited but leaves commercial_ok unanswered`);
   }
-});
-
-// ===========================================================================
-// Speakable languages: licence AND installation (v12.51.0)
-// ===========================================================================
-
-test('a language is speakable only when a PERMITTED voice is also INSTALLED', async () => {
-  const { speakableLanguages } = await import('../voice/voice-catalog.js');
-  await withEnv({ VOICE_AUDIT_REQUIRED: 'true' }, () => {
-    // The catalogue clears voices; the volume holds files. A UI told only the
-    // first offers languages that fail at the engine, which is what four
-    // advertised languages beside one installed voice actually meant.
-    assert.deepEqual(speakableLanguages([]).languages, [],
-      'a full catalogue and an empty volume can speak nothing');
-
-    const live = speakableLanguages(['en_US-kristin-medium']);
-    assert.deepEqual(live.languages, ['en']);
-    assert.deepEqual(live.by_language.en, ['en_US-kristin-medium']);
-
-    // Installed is not sufficient: this one is licence-refused.
-    assert.deepEqual(speakableLanguages(['en_US-lessac-medium']).languages, [],
-      'a non-commercial voice on disk unlocks nothing');
-
-    // Nor is it sufficient while the audit is required.
-    assert.equal(speakableLanguages(['zh_CN-huayan-medium']).languages.includes('zh'), false);
-  });
-});
-
-test('the audit switch changes what is speakable, and only for unaudited voices', async () => {
-  const { speakableLanguages } = await import('../voice/voice-catalog.js');
-  await withEnv({ VOICE_AUDIT_REQUIRED: 'false' }, () => {
-    assert.equal(speakableLanguages(['zh_CN-huayan-medium']).languages.includes('zh'), true,
-      'relaxing the audit unlocks an installed but unread voice');
-    assert.deepEqual(speakableLanguages(['en_US-lessac-medium']).languages, [],
-      'but never one that has been read and refused');
-  });
-});
-
-test('synthesis prefers an installed voice and refuses cleanly when there is none', async () => {
-  const { bestVoiceForLanguage } = await import('../voice/voice-catalog.js');
-  await withEnv({ VOICE_AUDIT_REQUIRED: 'true' }, () => {
-    const ready = bestVoiceForLanguage('en', ['en_US-kristin-medium']);
-    assert.equal(ready.voice_id, 'en_US-kristin-medium');
-    assert.equal(ready.installed, true);
-
-    // Catalogue order alone would have returned this voice and sent it to
-    // Piper, which fails on a missing file and reports a 500 -- an engine
-    // error for what is really a download that never happened.
-    const missing = bestVoiceForLanguage('en', []);
-    assert.equal(missing.installed, false);
-    assert.ok(missing.candidates >= 1, 'the licence answer is still reported');
-
-    const unsupported = bestVoiceForLanguage('ko', ['en_US-kristin-medium']);
-    assert.equal(unsupported.voice_id, null);
-    assert.equal(unsupported.candidates, 0);
-  });
-});
-
-test('health separates the launch set from what can actually be spoken', async () => {
-  await withEnv({ ...VOICE_ON, VOICE_AUDIT_REQUIRED: 'true',
-                  VOICE_VOICES_DIR: '/nonexistent/voices' }, async () => {
-    const { base, close } = await listenWithAuthGate();
-    try {
-      const body = await (await fetch(`${base}/voice/health`, {
-        headers: { ...asOperator(), ...identity('38', 'ava') },
-      })).json();
-
-      assert.equal(body.tts_languages.length, 4, 'the launch set is unchanged');
-      assert.deepEqual(body.speakable_languages, [],
-        'and nothing is speakable with no models on the volume');
-      assert.deepEqual(body.speakable_by_language, {});
-      // A client that gated on either of the other two fields would offer four
-      // languages here and deliver none.
-      assert.ok(body.catalogue.usable >= 1,
-        'while the licence answer still reports a cleared voice');
-    } finally {
-      await close();
-    }
-  });
 });

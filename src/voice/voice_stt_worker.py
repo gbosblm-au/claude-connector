@@ -38,7 +38,8 @@ it is compensated for by asserting the separation explicitly in
 src/tests/voice-gpl-boundary.test.js.
 
 Concretely: this file runs on VOICE_PYTHON_BIN. piper_worker.py runs on
-VOICE_PIPER_PYTHON. Conflating them puts faster-whisper and piper in one
+VOICE_KOKORO_PYTHON. Conflating them puts faster-whisper and the TTS engine
+(which reaches GPL-3.0 espeak-ng through phonemizer) in one
 site-packages, which is the entanglement the boundary exists to prevent.
 
 ===========================================================================

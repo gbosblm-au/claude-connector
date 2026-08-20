@@ -1,61 +1,38 @@
 #!/usr/bin/env node
-// scripts/voice-provision.mjs
-//
-// Download Piper voice models onto the Railway volume.
-//
-//   node scripts/voice-provision.mjs                    # every known voice
-//   node scripts/voice-provision.mjs en_US-lessac-medium
-//   node scripts/voice-provision.mjs --list
-//   node scripts/voice-provision.mjs --force en_US-lessac-medium
-//
-// Run it once per deployment that has a fresh volume. The files persist across
-// restarts, so it does not need to run again unless the volume is replaced.
-//
-// The alternative to running this by hand is VOICE_PROVISION_VOICES, which does
-// the same work in the background at boot. Both call the same module, so they
-// cannot disagree about where the files go or which voice maps to which path.
+/* scripts/voice-provision.mjs
+ *
+ * Fetch the Kokoro engine artifacts onto the volume.
+ *
+ *   npm run voice:provision
+ *
+ * v13. Under Piper this downloaded one file pair PER VOICE from
+ * rhasspy/piper-voices, and "install a voice" was a meaningful operation.
+ * Kokoro is TWO FILES TOTAL: the model, and a bundle holding every voice as a
+ * style vector. Adding a voice to the offered set is a registry edit, not a
+ * download.
+ */
 
-import { installVoices, voicesDir,
-         VOICE_SOURCES, MISSING_UPSTREAM } from '../src/voice/voice-provision.js';
+import { installVoices, voicesDir, VOICE_SOURCES }
+  from '../src/voice/voice-provision.js';
+import { VOICE_REGISTRY } from '../src/voice/voice-registry.js';
 
-const argv  = process.argv.slice(2);
-const force = argv.includes('--force');
-const list  = argv.includes('--list');
-const voices = argv.filter(a => !a.startsWith('--'));
-
-if (list) {
-  console.log(`Voice directory: ${voicesDir()}\n`);
-  console.log('Available:');
-  for (const [id, path] of Object.entries(VOICE_SOURCES)) {
-    console.log(`  ${id.padEnd(30)} rhasspy/piper-voices/${path}`);
-  }
-  if (Object.keys(MISSING_UPSTREAM).length) {
-    console.log('\nNamed by the catalogue but NOT published upstream:');
-    for (const [id, why] of Object.entries(MISSING_UPSTREAM)) {
-      console.log(`  ${id}\n    ${why}`);
-    }
-  }
-  process.exit(0);
+console.log('Tenax voice -- Kokoro provisioning');
+console.log(`  target: ${voicesDir()}`);
+for (const [name, source] of Object.entries(VOICE_SOURCES)) {
+  console.log(`  ${name.padEnd(7)} ${source.file}`);
 }
+console.log('');
+console.log(`  ${VOICE_REGISTRY.filter(v => v.active).length} voices are offered from the `
+  + 'bundle; none is downloaded separately.');
+console.log('');
 
-const wanted = voices.length ? voices : Object.keys(VOICE_SOURCES);
-
-console.log(`Installing into ${voicesDir()}`);
-console.log(`Voices: ${wanted.join(', ')}\n`);
-
-const results = await installVoices(wanted, { force, log: m => console.log(m) });
+const result = await installVoices(['model', 'voices'], { log: m => console.log(m) });
 
 console.log('');
-let bad = 0;
-for (const r of results) {
-  if (r.status === 'installed' || r.status === 'present') {
-    console.log(`  OK       ${r.voice} (${r.status})`);
-  } else {
-    bad += 1;
-    console.log(`  PROBLEM  ${r.voice}: ${r.error}`);
-  }
+if (result.ok) {
+  console.log('PASS  both artifacts are present. Run `npm run voice:smoke` to '
+    + 'confirm the engine loads them.');
+  process.exit(0);
 }
-
-// Non-zero exit on any problem, so this can be used in a deployment step that
-// is supposed to stop when a voice does not arrive.
-process.exit(bad ? 1 : 0);
+console.error(`FAIL  could not provision: ${result.failed.join(', ')}`);
+process.exit(1);
