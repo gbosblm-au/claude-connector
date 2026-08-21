@@ -391,9 +391,33 @@ test('both prosody paths supply a phrase position', () => {
   // sentence audibly breaks into several -- worse than the flatness Section 6.1
   // rule 2 exists to fix.
   const code = engineCode();
-  const positions = code.match(/position: \(index === \w+\.length - 1\) \? 'final' : 'continuation'/gu) || [];
+
+  // v13.5.0. The pattern was pinned to the EXACT expression
+  //   position: (index === X.length - 1) ? 'final' : 'continuation'
+  // and v13.4.0 added a guard to the streaming worker so a mid-reply
+  // incremental batch does not close on a falling contour:
+  //   position: (closesReply && index === phrases.length - 1) ? ...
+  //
+  // That is a correct change, and the old regex counted it as a MISSING
+  // position rather than a modified one -- the assertion failed while the
+  // property it names ("both paths supply a position") was still true.
+  //
+  // Widened to allow an optional leading guard, and no further: the ternary,
+  // the last-phrase test and both branch values are still pinned, so a path
+  // that drops the position or inverts the branches still fails.
+  const positions = code.match(
+    /position: \((?:\w+ && )?index === \w+\.length - 1\) \? 'final' : 'continuation'/gu) || [];
   assert.equal(positions.length, 2,
     'the buffered and streaming phrase workers both pass position');
+
+  // The guard belongs to the STREAMING worker only. The buffered path handles
+  // whole replies, where the last phrase always ends the reply, so a guard
+  // appearing there would mean a whole reply could end without a final
+  // contour.
+  const guarded = code.match(
+    /position: \(\w+ && index === \w+\.length - 1\) \? 'final' : 'continuation'/gu) || [];
+  assert.equal(guarded.length, 1,
+    'exactly one path -- the streaming one -- guards the final position');
 });
 
 test('the emphasis decision is honoured as far as the G2P allows', () => {

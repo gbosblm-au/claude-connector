@@ -243,7 +243,13 @@ async function boot() {
         return { phrases: phrases.length, bytes: phrases.length * 4, sampleRate: 24000 };
       },
       voiceLengthScale: () => 1,
-      prosodyState:     () => ({ enabled: true }),
+      // Env-driven rather than hard-coded true. The first draft returned
+      // `{ enabled: true }` unconditionally, which made the
+      // "capability is false when the layer is off" test assert against the
+      // MOCK instead of against the conditional in voice.js -- it could never
+      // have failed, whatever the route did. Reading the same env var the real
+      // implementation reads puts the route's own logic back under test.
+      prosodyState:     () => ({ enabled: 'false' !== String(process.env.VOICE_PROSODY_ENABLED) }),
       prewarmTts:       async () => undefined,
       ttsWorkerState:   () => ({ ready: true }),
       prewarmStt:       async () => undefined,
@@ -440,4 +446,41 @@ test('an invalid speed is a 422 with a message the UI can render', async () => {
   const body = await res.json();
   assert.equal(body.error, 'invalid_speed');
   assert.ok(body.message, 'a rejection must carry a human-readable message');
+});
+
+// ===========================================================================
+// Section 3.5.1 (Option A) — the capability the chain advertises
+// ===========================================================================
+
+test('the health route advertises the incremental capability', async () => {
+  const app = await boot();
+
+  const res = await fetch(`${app.base}/voice/health`, { headers: HEADERS });
+  assert.equal(res.status, 200);
+
+  const body = await res.json();
+  assert.equal(body.incremental_available, true,
+    'a build with the route and the prosody layer on advertises it');
+
+  // It must be a REAL boolean, not a truthy object. The gateway relays it with
+  // `!!` and the client tests it with `true ===`, so anything else silently
+  // reads as false at the far end of the chain.
+  assert.equal(typeof body.incremental_available, 'boolean');
+});
+
+test('the capability is false when the prosody layer is off', async () => {
+  const app = await boot();
+
+  // Per-phrase audio IS the prosody layer, so with it off the route answers
+  // 409. Advertising it anyway would send the client to a dead end.
+  const previous = process.env.VOICE_PROSODY_ENABLED;
+  process.env.VOICE_PROSODY_ENABLED = 'false';
+  try {
+    const res = await fetch(`${app.base}/voice/health`, { headers: HEADERS });
+    const body = await res.json();
+    assert.equal(body.incremental_available, false,
+      'the capability tracks the prosody layer rather than just the route existing');
+  } finally {
+    process.env.VOICE_PROSODY_ENABLED = previous;
+  }
 });

@@ -597,6 +597,25 @@ export function registerVoiceRoutes(app) {
       // disabled one.
       prosody: prosodyState(),
 
+      // v13.5.0 -- Tenax Voice Sentence-Boundary Streaming Fix Section 3.5.1
+      // (Option A, the recommended gating).
+      //
+      // The client needs to know whether the WHOLE CHAIN supports incremental
+      // synthesis before it tries. Option B -- attempt and fall back on a 404 --
+      // works and remains the safety net, but it costs one failed request and a
+      // stretch of silence on the first reply of every session against an older
+      // connector. That silence is indistinguishable from a broken feature.
+      //
+      // Reported as a capability of the DEPLOYMENT, not of the caller: the route
+      // still enforces the gate and the credential per request. A client that
+      // sees `true` here and is not entitled still gets a 404 from the route.
+      //
+      // Two conditions, both required:
+      //   - the route exists (it does, in this build)
+      //   - the prosody layer is on, because per-phrase audio IS that layer and
+      //     the incremental route answers 409 without it
+      incremental_available: true === prosodyState().enabled,
+
       // v12.53.0 -- PIPER-PRELOAD-v1.1 A2. `warm` and `pid` are what make
       // "two consecutive requests reused the same process" an observable fact
       // rather than an inference from a stopwatch.

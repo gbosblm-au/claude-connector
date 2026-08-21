@@ -270,15 +270,55 @@ test('the route refuses an unsupported rate rather than ignoring it', () => {
   assert.match(routes, /return false;/u);
 });
 
-test('both routes parse the rate before doing any work', () => {
+test('every route that accepts a sample rate parses it before doing any work', () => {
   const routes = _code('routes/voice.js');
-  // Anchored on the assignment, not the bare call: the function DEFINITION
-  // contains the same text, so an unanchored count is three and the assertion
-  // fails on correct code.
-  assert.equal((routes.match(/= parseSampleRate\(body, res\)/gu) || []).length, 2,
-    'the single-call and stream routes both parse it');
-  assert.equal((routes.match(/if \(false === \w+Rate\) return;/gu) || []).length, 2,
-    'and both stop on a refusal instead of continuing with an invalid value');
+
+  // v13.5.0. REWRITTEN, because the previous version of this test passed for
+  // the wrong reason and hid a live defect.
+  //
+  // It counted `= parseSampleRate(body, res)` and asserted exactly 2, with the
+  // message "the single-call and stream routes both parse it". The two matches
+  // were actually /voice/synthesize and /voice/prosody/analyse. The STREAM
+  // route never parsed it -- it referenced a `streamRate` declared inside the
+  // analyse handler, a different function scope, and threw ReferenceError on
+  // every streamed request. The test was green throughout.
+  //
+  // A global count cannot express "each of these routes does X"; it only
+  // expresses "X appears N times somewhere". Checked per route now, so a route
+  // that skips the parse fails whatever the total happens to be, and adding a
+  // fifth route that parses correctly does not turn a correct extension red.
+  const handlers = ['/voice/synthesize', '/voice/synthesize/stream',
+                    '/voice/synthesize/incremental', '/voice/prosody/analyse'];
+
+  /**
+   * The body of one route handler, from its declaration to the next one.
+   *
+   * @param {string} path
+   * @returns {string}
+   */
+  function handlerFor(path) {
+    const at = routes.indexOf(`app.post('${path}'`);
+    assert.notEqual(at, -1, `the ${path} route must exist`);
+    const rest = routes.slice(at + 1);
+    const next = rest.search(/app\.(post|get)\('/u);
+    return next === -1 ? rest : rest.slice(0, next);
+  }
+
+  for (const path of handlers) {
+    const body = handlerFor(path);
+    assert.match(body, /= parseSampleRate\(body, res\)/u,
+      `${path} parses the requested sample rate`);
+    assert.match(body, /if \(false === \w+Rate\) return;/u,
+      `${path} stops on a refusal instead of continuing with an invalid value`);
+  }
+
+  // The declaration and the refusal check must be in the SAME handler, which
+  // is the property whose absence caused the stream-route defect. Comparing
+  // the two totals catches a declaration that has drifted out of the scope
+  // that reads it.
+  assert.equal((routes.match(/= parseSampleRate\(body, res\)/gu) || []).length,
+               (routes.match(/if \(false === \w+Rate\) return;/gu) || []).length,
+    'every parse is paired with its own refusal check');
 });
 
 test('the rate reaches EVERY engine call, not just the common one', () => {
