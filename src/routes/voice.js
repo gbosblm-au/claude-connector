@@ -80,6 +80,10 @@ import { probeEngines, engineState, installedVoices,
          prewarmStt, sttWorkerHealth } from '../voice/voice-engines.js';
 import { analyse, prosodyConfig, replyHash,
          summarise }                 from '../voice/prosody.js';
+// v13.4.0 -- Kokoro Sentence-Boundary Streaming Spec Sections 6.1, 6.2. The
+// incremental route's segmentation. Pure and synchronous: it decides only which
+// text is FINISHED, and does no prosody of its own.
+import { splitStream, splitDefaults } from '../voice/voice-stream-split.js';
 
 /* Section 15: "Rate limiting per user on both voice routes." Voice is far more
  * expensive per request than a normal API call -- one transcription can occupy
@@ -148,6 +152,43 @@ const voiceLimiter = rateLimit({
     res.status(429).json({
       error: 'rate_limited',
       message: 'Too many voice requests. Wait a moment and try again.',
+      retry_after_seconds: Math.ceil(WINDOW_MS / 1000),
+    });
+  },
+});
+
+/* v13.4.0 -- the incremental route's own ceiling.
+ *
+ * WHY IT IS NOT voiceLimiter. That limit is 20 requests per minute, and it is
+ * correct for routes called ONCE PER REPLY. The incremental route is called once
+ * per batch of complete phrases, so one long reply can legitimately spend a
+ * dozen requests and two replies in a minute would exhaust the shared bucket --
+ * the user would hear one reply and then silence, with a 429 nothing in the UI
+ * surfaces.
+ *
+ * The rate limit exists to bound WORK, and the work per reply has not changed;
+ * only the number of requests it is divided into has. Synthesis concurrency is
+ * bounded independently and unchanged, inside the phrase pool (FR-2.2), which is
+ * the limit that actually protects the CPU. This one protects against a client
+ * looping on the route, so it is generous rather than tight.
+ *
+ * Keyed identically to voiceLimiter so one user cannot get a second budget by
+ * moving between the two routes. */
+const INCREMENTAL_MAX = intEnv('VOICE_INCREMENTAL_RATE_MAX', 240);
+
+const incrementalLimiter = rateLimit({
+  windowMs: WINDOW_MS,
+  max: INCREMENTAL_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const id = req.tsTenantId || (req.user && req.user.id) || req.userId;
+    return id ? `voice-inc:${id}` : `voice-inc:ip:${req.ip}`;
+  },
+  handler: (req, res) => {
+    res.status(429).json({
+      error: 'rate_limited',
+      message: 'Too many incremental voice requests. Wait a moment and try again.',
       retry_after_seconds: Math.ceil(WINDOW_MS / 1000),
     });
   },
@@ -1024,6 +1065,24 @@ export function registerVoiceRoutes(app) {
         return;
       }
 
+      // v13.4.0 -- DEFECT FIX. This declaration was missing entirely.
+      //
+      // The call to synthesizeProsodyStream below passed `sampleRate:
+      // streamRate`, and the only `streamRate` in the file was a const declared
+      // inside the /voice/prosody/analyse handler -- a different function scope.
+      // Reading it here threw ReferenceError on EVERY streamed request.
+      //
+      // The throw landed inside this route's try block, so it was caught and
+      // reported as an in-band {"type":"error"} line rather than crashing. The
+      // client's contract on seeing that line is to fall back to
+      // /voice/synthesize, which works. So the feature failed silently into
+      // exactly the one-shot behaviour it exists to replace, and no log said so.
+      //
+      // Resolved here the same way the non-streaming route resolves it, so the
+      // two cannot answer a per-tenant rate differently.
+      const streamRate = parseSampleRate(body, res);
+      if (false === streamRate) return;   // parseSampleRate has answered.
+
       const prosodyCfg = prosodyConfig();
       if (!prosodyCfg.enabled) {
         // Streaming exists to deliver per-phrase audio, and per-phrase audio is
@@ -1135,6 +1194,328 @@ export function registerVoiceRoutes(app) {
             // The same discretion the non-streaming route applies: Piper's
             // stderr names paths and model internals and does not go to a
             // browser. The connector log above has the real reason.
+            message: 'Speech synthesis failed. The connector log has the reason.',
+          });
+        } catch (writeErr) { /* the socket is gone; nothing left to say */ }
+      } finally {
+        res.end();
+      }
+    });
+
+  // -------------------------------------------------------------------------
+  // POST /voice/synthesize/incremental   (v13.4.0)
+  // Kokoro Sentence-Boundary Streaming Spec v1, Sections 3.2, 6.1-6.3
+  // -------------------------------------------------------------------------
+  //
+  // ── The problem this route exists to solve ───────────────────────────────
+  //
+  // /voice/synthesize/stream already streams per-phrase audio, but it takes the
+  // WHOLE reply as its input. The client therefore cannot call it until the
+  // reply has finished generating, which is Section 1 exactly: "the full text
+  // response is generated and completed first, then sent to Kokoro". The
+  // overlap that route buys is real and it is entirely INSIDE the connector.
+  // The sync offset the user hears is untouched by it.
+  //
+  // This route accepts a reply that is STILL GROWING. That is the whole
+  // difference, and it is what moves the overlap across the generation boundary
+  // (FR-2.1: synthesis of chunk N must not wait for the full response).
+  //
+  // ── Why it is stateless, and why the cursor is an offset ─────────────────
+  //
+  // The client holds the accumulated text and a character offset marking how
+  // much of it has been committed to audio. Each call re-splits from that
+  // offset and returns the newly-complete phrases plus the new offset.
+  //
+  // Holding that cursor server-side would need a session store keyed by reply,
+  // with an eviction policy for replies that are abandoned mid-flight -- and it
+  // would not survive the reconnect it most needs to survive. Statelessness
+  // makes EC-6 (duplicate stream events from a retry or reconnect) a
+  // non-problem rather than a case to handle: replaying a call with the same
+  // offset returns the same phrases and the same new offset, so a replay cannot
+  // double-speak. That is NFR-4.1 obtained structurally instead of by a dedup
+  // table.
+  //
+  // An offset rather than a phrase index because boundaries are not stable
+  // under growth. `Dr.` looks sentence-final until ` Smith` arrives, so phrase
+  // 3 in one call can be a different span in the next; indexing a list that can
+  // be re-cut skips or repeats. The offset addresses the TEXT, which only grows.
+  // See src/voice/voice-stream-split.js for the full argument.
+  //
+  // ── Ordering across calls ────────────────────────────────────────────────
+  //
+  // synthesizeProsodyStream guarantees order WITHIN a call (NFR-4.2). Across
+  // calls the client is single-flight, but it must not have to rely on that to
+  // stay in order, so every phrase carries an absolute `sequence` the caller
+  // seeds from the previous response. A client that receives sequence N when it
+  // has already played N discards it -- the second half of EC-6.
+  app.post('/voice/synthesize/incremental',
+    voiceCredential,
+    gate,
+    requireAuth,
+    // NOT voiceLimiter. That ceiling is 20/minute, sized for one call per
+    // reply. This route is called once per batch of complete phrases, so a
+    // single long reply can legitimately make a dozen calls and two replies
+    // would exhaust it -- the user would hear the first reply and silence
+    // after. The WORK per reply is unchanged; only the number of requests it
+    // is divided into has changed, so the request ceiling moves and the
+    // synthesis concurrency (bounded in the pool, FR-2.2) does not.
+    incrementalLimiter,
+    express.json({ limit: '256kb' }),
+    async (req, res) => {
+      const started = Date.now();
+      const body = (req.body && typeof req.body === 'object') ? req.body : {};
+
+      const text = String(body.text || '');
+      const final = true === body.final || 'true' === body.final;
+
+      // An EMPTY body is legitimate here and must not be a 422. The client
+      // fires on a cheap local trigger and the authoritative answer about
+      // whether a phrase is complete lives in this route -- so "you sent me
+      // nothing new" is a normal, expected outcome, not a caller error. The
+      // non-incremental routes refuse empty text because for them it can only
+      // be a mistake.
+      const MAX_CHARS = intEnv('VOICE_MAX_TTS_CHARS', 5000);
+      if (text.length > MAX_CHARS) {
+        res.status(413).json({
+          error: 'text_too_long',
+          message: `Text is ${text.length} characters; the limit is ${MAX_CHARS}.`,
+        });
+        return;
+      }
+
+      // The cursor. Clamped rather than refused: a client that has drifted
+      // (a resumed session, a text that was truncated) should re-sync to
+      // something sane and keep speaking, not lose the rest of the reply to a
+      // 422. Out-of-range values cannot corrupt anything because splitStream
+      // clamps again internally.
+      const rawOffset = Number(body.offset);
+      const offset = Number.isFinite(rawOffset) && rawOffset > 0
+        ? Math.min(Math.floor(rawOffset), text.length) : 0;
+
+      const rawSequence = Number(body.sequence);
+      const sequence = Number.isFinite(rawSequence) && rawSequence > 0
+        ? Math.floor(rawSequence) : 0;
+
+      const speed = Number(body.speed);
+      if (body.speed !== undefined && (!Number.isFinite(speed) || speed < 0.5 || speed > 2)) {
+        res.status(422).json({ error: 'invalid_speed', message: 'Speed must be between 0.5 and 2.' });
+        return;
+      }
+
+      const incrementalRate = parseSampleRate(body, res);
+      if (false === incrementalRate) return;   // parseSampleRate has answered.
+
+      // Resolved BEFORE the split so a bad voice is a real status code rather
+      // than an in-band error line. Costs one catalogue lookup per call.
+      const resolved = await resolveVoice(body, res);
+      if (!resolved) return;   // resolveVoice has already answered.
+
+      const prosodyCfg = prosodyConfig();
+      if (!prosodyCfg.enabled) {
+        // Same reasoning as the stream route: per-phrase audio IS the prosody
+        // layer, and with it off there is nothing incremental to deliver.
+        // 409 tells the client to stop calling this route for this reply and
+        // use the single-call path at the end, which is behaviour it has.
+        res.status(409).json({
+          error: 'prosody_disabled',
+          message: 'Incremental synthesis needs the prosody layer, which is switched '
+            + 'off on this connector. Use POST /voice/synthesize instead.',
+        });
+        return;
+      }
+
+      // ── The split (Sections 6.1, 6.2) ────────────────────────────────────
+      //
+      // Pure and synchronous. Decides only which text is FINISHED; it does no
+      // prosody, because analyse() needs whole sentences and re-deciding
+      // earlier phrases as more text arrives is the failure this staging
+      // avoids. The phrases it returns are then handed to the normal synthesis
+      // path, which still applies analyse() to them.
+      let split;
+      try {
+        split = splitStream(text, {
+          offset,
+          final,
+          config: {
+            maxPhraseLength: intEnv('VOICE_MAX_PHRASE_LENGTH', splitDefaults().maxPhraseLength),
+            runtFloor: intEnv('VOICE_RUNT_FLOOR', splitDefaults().runtFloor),
+            markdownStripping: 'false' !== String(process.env.VOICE_MARKDOWN_STRIPPING || ''),
+            deferSynthesisInCodeBlock:
+              'false' !== String(process.env.VOICE_DEFER_IN_CODE_BLOCK || ''),
+          },
+        });
+      } catch (err) {
+        // The splitter is pure and total, so this is a programming fault rather
+        // than a bad request. Reported as a 500 with nothing from the exception
+        // in the body.
+        console.error('[voice] incremental split failed:', err.message);
+        res.status(500).json({
+          error: 'split_failed',
+          message: 'Could not segment the reply. The connector log has the reason.',
+        });
+        return;
+      }
+
+      // NOTHING NEW YET. Answered as a normal 200 with an empty phrase list, in
+      // the same NDJSON shape as any other call, so the client has exactly one
+      // response format to parse and one place to read the new cursor from.
+      //
+      // Deliberately NOT a 204: the client needs the `offset` and `sequence`
+      // echoed back to stay in step, and a body-less status cannot carry them.
+      if (!split.phrases.length) {
+        res.status(200);
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.end(`${JSON.stringify({
+          type: 'end',
+          offset: split.consumed,
+          sequence,
+          phrases: 0,
+          bytes: 0,
+          deferred: split.deferred,
+          final,
+        })}\n`);
+        return;
+      }
+
+      // Committed to 200 from here. Everything after reports failure IN BAND,
+      // because the status line has been sent and cannot be changed.
+      res.status(200);
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+
+      /**
+       * Write one NDJSON line, respecting backpressure.
+       *
+       * Same rule as the stream route: a phrase is tens of kilobytes and
+       * ignoring a false return from write() lets one slow client queue a
+       * reply's worth of audio in this process's heap.
+       *
+       * @param {object} obj
+       * @returns {Promise<void>}
+       */
+      function writeLine(obj) {
+        return new Promise((resolve) => {
+          const ok = res.write(`${JSON.stringify(obj)}\n`);
+          if (ok) { resolve(); return; }
+          res.once('drain', resolve);
+        });
+      }
+
+      let aborted = false;
+      req.on('aborted', () => { aborted = true; });
+      res.on('close', () => { aborted = true; });
+
+      // FR-3.1/FR-3.2 accounting. `consumed` only ever advances past text that
+      // was actually turned into audio, so a batch that is cut short by an
+      // abort leaves the cursor where the last DELIVERED phrase ended and the
+      // undelivered text is re-split on the next call rather than skipped.
+      let committed = offset;
+      let emittedCount = 0;
+
+      // The text handed to the synthesiser is the joined phrase text, not the
+      // raw slice: the splitter has already stripped markdown (EC-2) and
+      // resolved the protected regions (EC-1), and re-deriving either here
+      // would be a second answer to a question already answered.
+      const batchText = split.phrases.map((p) => p.text).join(' ');
+
+      try {
+        const result = await synthesizeProsodyStream(
+          { text: batchText, voice: resolved.voice,
+            speed: Number.isFinite(speed) ? speed : undefined,
+            config: prosodyCfg, sampleRate: incrementalRate,
+            // Only the batch that flushes the end of the stream closes the
+            // reply. Without this every batch would land on a falling final
+            // contour and a long reply would sound like a list of separate
+            // short statements.
+            finalPosition: final },
+          async (segment) => {
+            if (aborted) {
+              const stop = new Error('client went away');
+              stop.code = 'client_aborted';
+              throw stop;
+            }
+            await writeLine({
+              type: 'phrase',
+              // Absolute across the whole reply, seeded by the caller. This is
+              // what lets the client discard a phrase it has already played
+              // after a retry (EC-6) without trusting request ordering.
+              sequence: sequence + segment.index,
+              // Local to this batch, kept because it is what the existing
+              // stream route's clients already read.
+              index: segment.index,
+              total: segment.total,
+              sample_rate: segment.sampleRate,
+              pause_after_ms: segment.pauseAfterMs,
+              profile: segment.profile,
+              length_scale: segment.lengthScale,
+              audio_base64: segment.pcm.toString('base64'),
+            });
+            emittedCount += 1;
+
+            // The cursor advances only for phrases that have actually been
+            // WRITTEN. Advancing it up front would mean an abort halfway
+            // through a batch silently swallowed the phrases that never went
+            // out, because the next call would resume past them.
+            //
+            // Guarded on the index: analyse() may segment the batch differently
+            // from the splitter (it merges runts and splits on register), so
+            // segment.index is not necessarily a valid index into split.phrases.
+            // When it is not, the cursor holds until the batch completes below.
+            if (segment.index < split.phrases.length) {
+              committed = split.phrases[segment.index].end;
+            }
+          }
+        );
+
+        // The batch completed, so the whole span it covered is spoken --
+        // whatever re-segmentation analyse() applied inside it.
+        if (!aborted) {
+          committed = split.phrases[split.phrases.length - 1].end;
+          await writeLine({
+            type: 'end',
+            offset: committed,
+            sequence: sequence + result.phrases,
+            phrases: result.phrases,
+            bytes: result.bytes,
+            deferred: split.deferred,
+            final,
+          });
+        }
+
+        logMeta('tts_incremental', {
+          voice: resolved.voice, language: resolved.permit.voice.language,
+          chars: text.length, from: offset, to: committed,
+          phrases: result.phrases, bytes: result.bytes,
+          final: final || undefined,
+          aborted: aborted || undefined,
+          elapsed_ms: Date.now() - started,
+        });
+      } catch (err) {
+        if ('client_aborted' === err.code) {
+          logMeta('tts_incremental', { voice: resolved.voice, chars: text.length,
+                                       aborted: true, elapsed_ms: Date.now() - started });
+          res.end();
+          return;
+        }
+
+        console.error('[voice] incremental synthesis failed:', err.message);
+        logMeta('tts_incremental_error', { code: err.code || 'tts_failed',
+                                           phrases_delivered: emittedCount,
+                                           elapsed_ms: Date.now() - started });
+        try {
+          // The offset is reported on the error line too. Without it a client
+          // that got three phrases and then a fault would not know whether to
+          // resume at phrase 4 or replay from the start -- and replaying is
+          // the option that speaks the same sentence twice.
+          await writeLine({
+            type: 'error',
+            error: err.code || 'tts_failed',
+            offset: committed,
+            sequence: sequence + emittedCount,
             message: 'Speech synthesis failed. The connector log has the reason.',
           });
         } catch (writeErr) { /* the socket is gone; nothing left to say */ }

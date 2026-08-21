@@ -202,6 +202,27 @@ const SELF_AUTHENTICATED_ROUTES = [
   { exact: '/voice/health' },
   { exact: '/voice/transcribe' },
   { exact: '/voice/synthesize' },
+  // v13.4.0 -- DEFECT FIX, and the reason the `exact` policy above needs a
+  // matching discipline when a voice route is ADDED.
+  //
+  // /voice/synthesize/stream shipped in v12.53.0 and was never listed here. The
+  // production caller is the Gateway Service, which holds the per-tenant restore
+  // token and not MCP_API_KEY, so mcpAuthMiddleware -- mounted long before
+  // registerVoiceRoutes -- answered 401 to every streamed request before any
+  // voice code ran. The client reads any non-OK status as "streaming
+  // unavailable" and falls back to /voice/synthesize, so the feature degraded
+  // silently into the single-shot behaviour it was built to replace.
+  //
+  // The `exact` entries are still right: a '/voice/' prefix would exempt every
+  // future voice route by default, which is the failure TNX-C-001 was about.
+  // The cost of that correctness is that each new voice route must be added
+  // here deliberately, which is what these two lines are.
+  //
+  // Both verify the SAME credential as the three above, in src/voice/voice-auth.js
+  // (MCP_API_KEY or RAILWAY_RESTORE_TOKEN, constant-time), and both still run
+  // the full two-layer feature gate, which answers 404 rather than 403.
+  { exact: '/voice/synthesize/stream' },
+  { exact: '/voice/synthesize/incremental' },
 ];
 
 /** Cached digest of MCP_API_KEY. Populated by assertConfigured(). */

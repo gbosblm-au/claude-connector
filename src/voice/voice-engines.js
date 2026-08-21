@@ -1294,7 +1294,21 @@ export async function synthesizeProsody(opts) {
  * phrase 2 would reorder the sentence. Concurrency buys the overlap; the
  * ordered emit keeps the reply intelligible.
  *
- * @param {{text: string, voice: string, speed?: number, config?: object}} opts
+ * ── finalPosition (v13.4.0, Kokoro Sentence-Boundary Streaming Spec) ───────
+ *
+ * The last phrase of a call is normally given position 'final', which shapes a
+ * falling, sentence-ending contour. That is correct when the call carries the
+ * WHOLE reply, and wrong when it carries one slice of a reply that is still
+ * being generated: every slice would land on a closing cadence and the reply
+ * would sound like a series of short, unrelated announcements.
+ *
+ * So the incremental route passes finalPosition:false for every batch except
+ * the one that flushes the end of the stream. The default is `true`, which is
+ * the behaviour every existing caller already has -- this option cannot change
+ * what /voice/synthesize/stream produces.
+ *
+ * @param {{text: string, voice: string, speed?: number, config?: object,
+ *          sampleRate?: number, finalPosition?: boolean}} opts
  * @param {(segment: {index: number, total: number, pcm: Buffer, pauseAfterMs: number, profile: string, lengthScale: number, sampleRate: number}) => Promise<void>|void} onSegment
  * @returns {Promise<{phrases: number, bytes: number, sampleRate: number}>}
  */
@@ -1344,6 +1358,10 @@ export async function synthesizeProsodyStream(opts, onSegment) {
          pauseAfterMs: 0, profile: 'neutral' }];
 
   const total = phrases.length;
+  // v13.4.0. Default true preserves the existing contract exactly: a caller
+  // that says nothing gets 'final' on its last phrase, as every caller did
+  // before this option existed.
+  const closesReply = (undefined === o.finalPosition) ? true : Boolean(o.finalPosition);
   let emitted = 0;
   let bytes = 0;
 
@@ -1369,7 +1387,12 @@ export async function synthesizeProsodyStream(opts, onSegment) {
       // v13.1.0. Same rule as the buffered path. The two MUST agree: a reply
       // that streamed and one that fell back would otherwise be phrased
       // differently, which sounds like the assistant changing its mind.
-      position: (index === phrases.length - 1) ? 'final' : 'continuation',
+      //
+      // v13.4.0. `closesReply` is what makes an incremental BATCH different
+      // from a whole reply: the last phrase of a mid-reply batch is not the
+      // last phrase of the reply, and giving it a closing contour would make
+      // the reply land on a full stop several times before it ends.
+      position: (closesReply && index === phrases.length - 1) ? 'final' : 'continuation',
     });
     pending.set(index, {
       index, total,
