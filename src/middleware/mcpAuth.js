@@ -223,6 +223,19 @@ const SELF_AUTHENTICATED_ROUTES = [
   // the full two-layer feature gate, which answers 404 rather than 403.
   { exact: '/voice/synthesize/stream' },
   { exact: '/voice/synthesize/incremental' },
+  // v13.7.0 -- Tutoring Homework Upload and Assessment Spec Section 6.
+  //
+  // Added deliberately, and for the same reason the two voice routes above had
+  // to be: the caller is the Gateway Service, which holds the per-tenant
+  // restore token and not MCP_API_KEY. Without this entry mcpAuthMiddleware
+  // answers 401 before the route runs, and the upload silently fails to parse
+  // -- which is precisely how /voice/synthesize/stream stayed broken from
+  // v12.53.0 to v13.4.0.
+  //
+  // The route is NOT unauthenticated as a result. It runs voiceCredential,
+  // which verifies the same secret in constant time; this entry only decides
+  // WHICH gate applies, not whether one does.
+  { exact: '/homework/parse-upload' },
 ];
 
 /** Cached digest of MCP_API_KEY. Populated by assertConfigured(). */

@@ -133,6 +133,9 @@ import { registerVolumeSnapshotRoutes } from './routes/volume-snapshot.js';
 // VOICE_ENABLED unset nothing about voice runs -- which is what Section 16
 // requires to be verifiable from the process list.
 import { registerVoiceRoutes } from './routes/voice.js';
+// v13.7.0 -- Tutoring Homework Upload and Assessment Spec Section 6. The
+// deterministic upload parser: bytes and registry questions in, verdicts out.
+import { registerHomeworkRoutes } from './routes/homework.js';
 import express from "express";
 // v12.28.0 (TNX-C-001): express-rate-limit was a declared but unused dependency.
 import rateLimit from "express-rate-limit";
@@ -4436,6 +4439,10 @@ registerProvisionRoute(app);
 registerExportRoute(app);
 registerVolumeSnapshotRoutes(app);
 registerVoiceRoutes(app);
+// Registered alongside the voice routes, and like them AFTER mcpAuthMiddleware
+// so the gate applies. /homework/parse-upload is NOT self-authenticated: it is
+// called by the gateway with the same credential every other tool proxy uses.
+registerHomeworkRoutes(app);
 
 app.use((_req, res) => {
   res.status(404).json({

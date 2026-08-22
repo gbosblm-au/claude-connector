@@ -1,6 +1,6 @@
 {
   "name": "claude-connector",
-  "version": "13.5.0",
+  "version": "13.17.0",
   "description": "MCP server for Claude with persistent memory, real-time web search, news search, LinkedIn connections lookup, TrueSource outreach email send/tracking/scheduling, Google Drive/Calendar/Sheets integration, Slack/Teams messaging, inbound webhooks, WordPress publishing, image search/download, psychology assessment, plus comprehensive statistical analysis and machine learning + multi-tenant client gateway support",
   "type": "module",
   "main": "src/index.js",
@@ -29,6 +29,8 @@
     "test:prosody-prep": "node --test src/tests/voice-prosody-prep.test.js",
     "test:registry": "node --test src/tests/voice-registry.test.js src/tests/voice-stream-split.test.js",
     "test:stream-split": "node --test src/tests/voice-stream-split.test.js",
+    "test:homework-normalise": "node --test src/tests/homework-normalise.test.js",
+    "test:homework": "node --test src/tests/homework-normalise.test.js src/tests/homework-extract.test.js src/tests/homework-route.test.js src/tests/homework-roundtrip.test.js src/tests/homework-real-worksheet.test.js",
     "test:incremental": "node --experimental-test-module-mocks --test src/tests/voice-incremental.test.js",
     "test:gpl-boundary": "node --test src/tests/voice-gpl-boundary.test.js",
     "test:voice-all": "node --test src/tests/voice.test.js src/tests/voice-auth.test.js src/tests/voice-prosody.test.js src/tests/voice-gpl-boundary.test.js src/tests/voice-stt-worker.test.js src/tests/voice-text-normalize.test.js src/tests/voice-prosody-prep.test.js src/tests/voice-registry.test.js src/tests/voice-stream-split.test.js",
