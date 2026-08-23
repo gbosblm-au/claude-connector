@@ -546,6 +546,90 @@ function applyLearnedLinkages(dispatchRules, query, candidates) {
   return additions;
 }
 
+/**
+ * Fill in `line_count` for any module the manifest did not measure.
+ *
+ * Fix 2, Compile Budget Code Guard (v13.18.0).
+ *
+ * ── The failure this makes structurally impossible ───────────────────────
+ *
+ * The budget arithmetic reads `line_count_estimate || line_count || 20`. That
+ * fallthrough is a reasonable default for one unmeasured module; it is a
+ * disaster when EVERY module falls through, because the budget then believes a
+ * 4,000-line skill is 20 lines per entry and admits far more than it can carry.
+ *
+ * A manifest that was regenerated, hand-edited, or written by a tool that did
+ * not know about the field produces exactly that state, and produces it
+ * silently -- nothing in the compile looks wrong, the skill is simply too big.
+ *
+ * The data repair fixes today's manifests. This measures anything that arrives
+ * unmeasured tomorrow, so the budget is sized from what will actually be
+ * concatenated rather than from a placeholder.
+ *
+ * ── Why it costs nothing in the healthy case ─────────────────────────────
+ *
+ * A no-op the moment a manifest carries counts, which is the normal state after
+ * repair: the loop short-circuits on the first condition and touches no disk.
+ * Only entries actually missing data are read, once each per compile.
+ *
+ * ── Why a missing file is left alone rather than zeroed ──────────────────
+ *
+ * Writing 0 would make the module free, and a free module is always selectable
+ * -- the budget would admit it ahead of modules that honestly declared their
+ * size. Leaving it untouched keeps the existing default-20 fallthrough, so the
+ * module stays selectable at a conservative estimate, and the log line is what
+ * tells the operator the manifest needs repairing.
+ *
+ * Exported so the guard can be tested directly. `compileSkill` is internal, and
+ * a guard that can only be exercised through a full compile is a guard whose
+ * regressions are found in production.
+ *
+ * @param {object} manifest The merged manifest; modules are mutated in place.
+ * @param {object} paths From getModularPaths().
+ * @returns {{ measured: number, unmeasured: string[] }}
+ */
+export function hydrateLineCounts(manifest, paths) {
+  const unmeasured = [];
+  let measured = 0;
+
+  for (const m of (manifest && manifest.modules) || []) {
+    if (!m || m.line_count_estimate || m.line_count || !m.path) continue;
+
+    const modulePath = paths.avaDir + m.path;
+    if (existsSync(modulePath)) {
+      try {
+        const count = countLines(readFileSync(modulePath, 'utf8'));
+        if (count > 0) {
+          m.line_count = count;
+          measured += 1;
+        } else {
+          // NOT written as 0. A zero-cost module is always selectable, so the
+          // budget would admit an empty file ahead of modules that honestly
+          // declared their size. Left unmeasured, it takes the default and is
+          // reported -- an empty module file is a manifest problem either way.
+          unmeasured.push(`${m.id || m.path} (file is empty)`);
+        }
+      } catch (err) {
+        // A read failure is the same situation as a missing file: no measurement
+        // is available, so the default applies and the operator is told. It must
+        // not abort the compile -- one unreadable module would cost the session
+        // its entire skill.
+        unmeasured.push(`${m.id || m.path} (unreadable: ${err.message})`);
+      }
+    } else {
+      unmeasured.push(`${m.id || m.path} (file missing)`);
+    }
+  }
+
+  if (unmeasured.length) {
+    log('warn', `compileSkill: ${unmeasured.length} module(s) have no line-count data `
+      + `and no readable file, so the budget is using the default estimate for them. `
+      + `Repair the manifest for: ${unmeasured.join(', ')}`);
+  }
+
+  return { measured, unmeasured };
+}
+
 function compileSkill(query, contextHint, paths, personPrior = null, moduleAccessLevel = 'full') {
   // v12.21.0: MANIFEST.json + MANIFEST_APPEND.json + references/manifest/*.json
   // fragments merged through the shared loader. APPEND semantics are
@@ -556,6 +640,8 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   // manifest_rebuild.py step.
   const merged = loadMergedManifest(paths, readJsonFile);
   const manifest = merged.manifest;
+
+  hydrateLineCounts(manifest, paths);
 
   const dispatchRules = readJsonFile(paths.dispatchRulesFile, { layer0_mandatory: { rules: [] }, learned_linkages: { rules: [] } });
 
