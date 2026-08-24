@@ -242,9 +242,23 @@ export function voicePermitted(name) {
  * read by one voice across every assistant they have.
  *
  *   1. an explicit per-request voice     (an API caller asked for one)
- *   2. the assistant's configured voice  (Section 10)
- *   3. the tenant's configured voice     (the Client Gateway setting)
- *   4. the platform default              (af_bella)
+ *   2. the USER's pinned voice           (SPEC-VOICE-DEFAULTS-v1.0 Section 10)
+ *   3. the assistant's configured voice  (Section 10)
+ *   4. the tenant's configured voice     (the Client Gateway setting)
+ *   5. the platform default              (af_bella)
+ *
+ * ── Why the user tier sits above the assistant (v13.20.2) ────────────────
+ *
+ * SPEC-VOICE-DEFAULTS-v1.0 Section 10 places it there, and the reason is that
+ * a personal voice choice is an accessibility setting as often as it is a
+ * preference. Someone who pinned a voice because they can follow it more
+ * easily should not have that silently overridden every time they open an
+ * assistant that names its own.
+ *
+ * It sits BELOW an explicit per-request voice because that is a caller saying
+ * "this utterance, in this voice" -- a narrower instruction than a standing
+ * preference, and the only tier the user themselves cannot have set by
+ * accident.
  *
  * An unusable value at any level falls through to the next rather than failing.
  * A stale voice name in a tenant setting is a configuration problem, and the
@@ -252,13 +266,15 @@ export function voicePermitted(name) {
  * silence. This function therefore reports which level answered, so that log
  * line can say something useful.
  *
- * @param {{requested?: string, assistant?: string, tenant?: string}} [opts]
+ * @param {{requested?: string, user?: string, assistant?: string,
+ *          tenant?: string}} [opts]
  * @returns {{voice: string, source: string, ignored: Array<{level: string, value: string}>}}
  */
 export function resolveVoice(opts) {
   const o = opts || {};
   const levels = [
     ['request', o.requested],
+    ['user', o.user],
     ['assistant', o.assistant],
     ['tenant', o.tenant],
   ];

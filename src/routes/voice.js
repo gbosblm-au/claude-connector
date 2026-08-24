@@ -324,13 +324,44 @@ async function resolveVoice(body, res) {
   // A stale or unknown value at either level falls through to the next rather
   // than failing, and is reported. A bad env var should cost a log line, not
   // every reply.
+  // v13.20.2 -- SPEC-VOICE-DEFAULTS-v1.0 Sections 8 and 10.
+  //
+  // The gateway now sends the tiers SEPARATELY rather than collapsing them
+  // into body.voice. That collapse was itself a defect: a tenant default
+  // arrived as though the caller had explicitly asked for it, so it outranked
+  // an assistant's own configured voice, which Section 10 puts above it.
+  //
+  // Both shapes are accepted, deliberately. An older gateway sends only
+  // `voice`, and it must keep working -- so an injected value with no tier
+  // information still lands in the request tier exactly as it did before. The
+  // new fields simply let a gateway that knows better say which is which.
   const fromRegistry = resolveFromRegistry({
     requested: body.voice,
-    tenant: process.env.VOICE_TTS_TENANT_VOICE,
+    user: body.user_voice,
+    assistant: body.assistant_voice,
+    tenant: body.tenant_voice || process.env.VOICE_TTS_TENANT_VOICE,
   });
+
+  // Section 11 item 5, and risk 29: a name that was installed when the
+  // gateway's catalog last synced but has since been removed. It falls through
+  // to the next tier rather than failing the synthesis -- the reply is spoken,
+  // in a different voice, and the degradation is REPORTED rather than silent.
+  //
+  // Reported in-band as well as logged, because a log line reaches an operator
+  // who is already looking. The response header reaches whoever is wondering
+  // why the voice changed.
   for (const ignored of fromRegistry.ignored) {
     console.warn(`[voice] ignoring unusable ${ignored.level} voice `
       + `"${ignored.value}"; falling back`);
+  }
+  if (fromRegistry.ignored.length && res && 'function' === typeof res.setHeader) {
+    try {
+      res.setHeader('X-Tenax-Voice-Degraded',
+        fromRegistry.ignored.map(i => `${i.level}:${i.value}`).join(','));
+      res.setHeader('X-Tenax-Voice-Source', fromRegistry.source);
+    } catch (err) {
+      // Headers already sent. The log line above is the record either way.
+    }
   }
 
   // Only adopted when the caller named nothing AND no language was given. With
@@ -338,6 +369,11 @@ async function resolveVoice(body, res) {
   // it checks what is actually installed -- and overriding it here would
   // reintroduce the "licence-cleared but never downloaded" 500 that
   // bestVoiceForLanguage exists to prevent.
+  // v13.20.2: the registry's answer is taken whenever it found ANY tier, not
+  // just when body.voice was set. Before the split fields existed, `voice` was
+  // the only channel an injected value could arrive on, so reading it here was
+  // equivalent. It no longer is: a user preference arrives on user_voice and
+  // would otherwise be resolved and then thrown away.
   let voice = String(body.voice || '').trim();
   if (!voice && !language && 'default' !== fromRegistry.source) {
     voice = fromRegistry.voice;

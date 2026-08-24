@@ -94,6 +94,57 @@ test('a refusal names the available set rather than saying "invalid"', () => {
 // Section 10 -- voice resolution
 // ===========================================================================
 
+test('SPEC-VOICE-DEFAULTS Section 10: the user tier sits between request and assistant', () => {
+  // Risk 28 in the spec asked for this to be CONFIRMED. It was not there: the
+  // levels were request, assistant, tenant, default. A per-user preference had
+  // nowhere to land, so the gateway could not have injected one.
+  assert.equal(resolveVoice({ user: 'af_nicole', assistant: 'af_heart',
+    tenant: 'bf_emma' }).voice, 'af_nicole',
+    'a pinned user voice must beat the assistant and the tenant');
+  assert.equal(resolveVoice({ user: 'af_nicole', assistant: 'af_heart' }).source, 'user');
+
+  // But not the caller's own explicit choice for this utterance.
+  assert.equal(resolveVoice({ requested: 'bf_emma', user: 'af_nicole' }).voice, 'bf_emma');
+  assert.equal(resolveVoice({ requested: 'bf_emma', user: 'af_nicole' }).source, 'request');
+});
+
+test('the full Section 10 order holds end to end', () => {
+  const all = { requested: 'af_bella', user: 'af_nicole',
+                assistant: 'af_heart', tenant: 'bf_emma' };
+  assert.equal(resolveVoice(all).source, 'request');
+
+  const { requested, ...noRequest } = all;
+  assert.equal(resolveVoice(noRequest).source, 'user');
+
+  const { user, ...noUser } = noRequest;
+  assert.equal(resolveVoice(noUser).source, 'assistant');
+
+  const { assistant, ...noAssistant } = noUser;
+  assert.equal(resolveVoice(noAssistant).source, 'tenant');
+
+  assert.equal(resolveVoice({}).source, 'default');
+});
+
+test('risk 29: a voice removed since the catalog synced falls through, and is reported', () => {
+  // The spec's own mitigation for a stale cache. A name that passed the
+  // gateway's cached validation but is no longer installed must NOT fail the
+  // synthesis -- the reply is spoken in the next available voice, and the
+  // degradation is named so it can be traced.
+  const r = resolveVoice({ user: 'af_removed_since_sync', tenant: 'af_heart' });
+
+  assert.equal(r.voice, 'af_heart', 'synthesis continues');
+  assert.equal(r.source, 'tenant');
+  assert.deepEqual(r.ignored, [{ level: 'user', value: 'af_removed_since_sync' }],
+    'and the discarded tier is reported, not swallowed');
+});
+
+test('every tier being unusable still yields the platform default', () => {
+  const r = resolveVoice({ requested: 'nope1', user: 'nope2',
+                           assistant: 'nope3', tenant: 'nope4' });
+  assert.equal(r.source, 'default');
+  assert.equal(r.ignored.length, 4);
+});
+
 test('Section 10: resolution follows request, assistant, tenant, default', () => {
   assert.equal(resolveVoice({ requested: 'bf_emma', assistant: 'af_heart',
                               tenant: 'af_nicole' }).voice, 'bf_emma');
@@ -380,8 +431,24 @@ test('the tenant voice env var is actually used for resolution', () => {
     /resolveVoice as resolveFromRegistry/u,
     'the route imports the registry resolver');
   assert.match(routes,
-    /tenant: process\.env\.VOICE_TTS_TENANT_VOICE/u,
+    /tenant: body\.tenant_voice \|\| process\.env\.VOICE_TTS_TENANT_VOICE/u,
     'and feeds the env var into it');
+
+  // v13.20.2: the env var is now the FALLBACK behind a gateway-injected tenant
+  // voice, not the only source. The ordering in that expression is the whole
+  // point -- reversing it would make a single-tenant env var silently outrank
+  // the per-tenant setting an operator configured in the Client Gateway, which
+  // is the same class of bug this test was written to catch.
+  const tenantExpr = routes.slice(routes.indexOf('tenant: body.tenant_voice'));
+  assert.ok(tenantExpr.indexOf('body.tenant_voice')
+    < tenantExpr.indexOf('process.env.VOICE_TTS_TENANT_VOICE'),
+    'the injected tenant voice must be tried before the env var');
+
+  // And the two new tiers reach the resolver at all.
+  assert.match(routes, /user: body\.user_voice/u,
+    'the per-user preference must be fed in');
+  assert.match(routes, /assistant: body\.assistant_voice/u,
+    'the assistant voice must be fed in');
 });
 
 test('an explicit request still outranks the tenant default', () => {
