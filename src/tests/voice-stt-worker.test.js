@@ -356,8 +356,16 @@ class FakeWhisper:
         built["n"]+=1
         assert device=="cpu" and compute_type=="int8"
         s.tier=tier
-    def transcribe(s,path,language=None,beam_size=None,vad_filter=None):
-        assert beam_size==5 and vad_filter is True
+    def transcribe(s,path,language=None,beam_size=None,vad_filter=None,
+                   condition_on_previous_text=None):
+        # v13.19.0 (STREAM-WHISPER Section 4): the worker now passes beam width
+        # and conditioning explicitly so a streaming partial can ask for beam 1
+        # and independent windows. A request that omits them -- which is every
+        # request on the non-streaming path -- must still produce the call this
+        # fake has always asserted, so the defaults are pinned here rather than
+        # merely accepted.
+        assert beam_size==5 and vad_filter is True \
+            and condition_on_previous_text is True
         return iter([Seg(0.0,1.5," Hello "),Seg(1.5,3.25," world. ")]), Info()
 
 def prime(state):

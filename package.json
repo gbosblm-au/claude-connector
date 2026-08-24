@@ -1,6 +1,6 @@
 {
   "name": "claude-connector",
-  "version": "13.18.0",
+  "version": "13.20.0",
   "description": "MCP server for Claude with persistent memory, real-time web search, news search, LinkedIn connections lookup, TrueSource outreach email send/tracking/scheduling, Google Drive/Calendar/Sheets integration, Slack/Teams messaging, inbound webhooks, WordPress publishing, image search/download, psychology assessment, plus comprehensive statistical analysis and machine learning + multi-tenant client gateway support",
   "type": "module",
   "main": "src/index.js",
@@ -36,7 +36,9 @@
     "test:gpl-boundary": "node --test src/tests/voice-gpl-boundary.test.js",
     "test:voice-all": "node --test src/tests/voice.test.js src/tests/voice-auth.test.js src/tests/voice-prosody.test.js src/tests/voice-gpl-boundary.test.js src/tests/voice-stt-worker.test.js src/tests/voice-text-normalize.test.js src/tests/voice-prosody-prep.test.js src/tests/voice-registry.test.js src/tests/voice-stream-split.test.js",
     "voice:smoke": "node scripts/voice-worker-smoke.mjs",
-    "test:stt-worker": "node --test src/tests/voice-stt-worker.test.js"
+    "test:stt-worker": "node --test src/tests/voice-stt-worker.test.js",
+    "test:voice-stream": "node --test src/tests/voice-stream.test.js",
+    "test:skill-cache": "node --test src/tests/skill-file-cache.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
@@ -61,6 +63,7 @@
     "nodemailer": "^6.10.1",
     "simple-statistics": "^7.8.7",
     "uuid": "^10.0.0",
+    "ws": "^8.21.3",
     "zod": "^3.23.8"
   },
   "engines": {

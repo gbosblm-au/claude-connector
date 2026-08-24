@@ -212,6 +212,54 @@ class WorkerState(object):
         return True
 
 
+def _pcm_to_audio(path):
+    """Read a raw signed-16-bit little-endian PCM file as float32 samples.
+
+    STREAM-WHISPER-v1.0.0 Section 4.
+
+    ── Why raw PCM reaches this worker at all ────────────────────────────────
+
+    A streaming partial transcribes the last few seconds of a live microphone.
+    There is no container, no header and no encoder in that path -- the browser
+    sends int16 frames and the session assembles a window of them. Wrapping
+    that window in a WAV header purely so faster-whisper's decoder could strip
+    it again would add an encode and a decode to the hot path, several times a
+    second, for no information gained.
+
+    ── Why a path and not bytes ─────────────────────────────────────────────
+
+    The protocol has always passed a path (see the module docstring), and the
+    reasons hold harder here: a 6-second window is roughly 190 KB, base64 would
+    inflate it by a third, and the caller writes to a tmpfs it already owns and
+    deletes in a finally block. Passing bytes would make this worker a second
+    place a window of someone's speech could linger.
+
+    ── Why float32 rather than handing the ints straight over ───────────────
+
+    faster-whisper expects samples in [-1, 1]. int16 divided by 32768 is that
+    conversion exactly, and doing it here rather than on the wire is what keeps
+    the wire at 32 KB/s instead of 64.
+
+    :param path: A file of raw s16le samples at 16 kHz, mono.
+    :returns: A numpy float32 array.
+    """
+    import numpy
+
+    with open(path, "rb") as handle:
+        raw = handle.read()
+
+    # An odd byte count cannot be whole samples. Truncating the stray byte is
+    # right: it is a torn write at the tail of a window, and losing 1/32000th
+    # of a second is preferable to refusing the whole partial.
+    if len(raw) % 2:
+        raw = raw[:-1]
+
+    samples = numpy.frombuffer(raw, dtype="<i2")
+    # Copy before scaling: frombuffer returns a read-only view over the bytes
+    # object, and astype gives us an owned, writable array to divide in place.
+    return samples.astype(numpy.float32) / 32768.0
+
+
 def _transcribe(state, request):
     """Transcribe one audio file.
 
@@ -245,6 +293,11 @@ def _transcribe(state, request):
 
     language = request.get("language") or None
 
+    # STREAM-WHISPER Section 4. A raw PCM window carries no container to
+    # describe itself, so the caller declares the format. Anything else is read
+    # by faster-whisper's own decoder exactly as before.
+    is_pcm = "s16le" == str(request.get("format") or "").lower()
+
     try:
         model = state.load(model_tier, request.get("model_dir") or "")
     except Exception as err:  # noqa: BLE001
@@ -253,11 +306,31 @@ def _transcribe(state, request):
 
     started = time.time()
     try:
+        # STREAM-WHISPER-v1.0.0 Section 4. Defaults reproduce the pre-streaming
+        # call exactly, so a request that omits them behaves as it always has.
+        beam_size = request.get("beam_size")
+        beam_size = 5 if not isinstance(beam_size, int) or beam_size < 1 else beam_size
+        condition = request.get("condition_on_previous_text")
+        condition = True if condition is None else bool(condition)
+
+        # A partial transcribes a rolling window that STARTS AND ENDS mid-speech.
+        # vad_filter would trim the leading and trailing fragments of words at
+        # those artificial boundaries, which is exactly the audio the overlap
+        # setting exists to preserve. Silence removal is also worth far less
+        # here: a 6-second window of live speech is mostly speech, whereas a
+        # whole uploaded segment often is not.
+        vad_filter = bool(request.get("vad_filter", True))
+
+        source = path
+        if is_pcm:
+            source = _pcm_to_audio(path)
+
         segments, info = model.transcribe(
-            path,
+            source,
             language=language,
-            beam_size=5,
-            vad_filter=True,      # drops silence, which cuts real-time factor
+            beam_size=beam_size,
+            condition_on_previous_text=condition,
+            vad_filter=vad_filter,
         )
 
         # segments is a generator; it must be drained before info is complete.

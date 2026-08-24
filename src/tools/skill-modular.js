@@ -43,6 +43,13 @@ import {
   moduleFrequencyRemote,
 } from './ti-tools-client.js';
 
+import {
+  cachedReadFile,
+  cachedReadJson,
+  cachedLineCount,
+  invalidateSkillFile,
+} from './skill-file-cache.js';
+
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
@@ -88,13 +95,16 @@ function ensureModularDirs(paths) {
   if (!existsSync(paths.archiveDir)) mkdirSync(paths.archiveDir, { recursive: true });
 }
 
+// v13.20.0. Reads go through an mtime-validated cache. compileSkill's
+// DECISIONS are untouched -- module selection is still computed from this
+// query, this context hint and this person prior on every call. What is reused
+// is the filesystem work that feeds it, which on a Railway bind mount is what
+// made /ti-skill-compile miss the gateway's 45 s timeout.
+//
+// See src/tools/skill-file-cache.js for why the compiled OUTPUT is deliberately
+// not cached.
 function readJsonFile(path, fallback) {
-  if (!existsSync(path)) return fallback;
-  try { return JSON.parse(readFileSync(path, 'utf8')); }
-  catch (err) {
-    log('warn', `skill-modular: failed to parse ${path}: ${err.message}`);
-    return fallback;
-  }
+  return cachedReadJson(path, fallback);
 }
 
 function countLines(content) {
@@ -598,7 +608,10 @@ export function hydrateLineCounts(manifest, paths) {
     const modulePath = paths.avaDir + m.path;
     if (existsSync(modulePath)) {
       try {
-        const count = countLines(readFileSync(modulePath, 'utf8'));
+        // The dominant cost before v13.20.0: a full read of EVERY module on
+        // every compile, before any module had been selected, purely to feed
+        // the budget. Now memoised per mtime.
+        const count = cachedLineCount(modulePath, countLines);
         if (count > 0) {
           m.line_count = count;
           measured += 1;
@@ -662,7 +675,7 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   }
 
   // Read CORE
-  const core = existsSync(paths.coreFile) ? readFileSync(paths.coreFile, 'utf8') : '';
+  const core = existsSync(paths.coreFile) ? cachedReadFile(paths.coreFile) : '';
 
   // Detect trigger conditions
   const conditions = detectTriggerConditions(query);
@@ -800,7 +813,7 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   // texture is active for every session. Placed before modules so personality context
   // frames how specialist knowledge is applied.
   const personalityContent = existsSync(paths.personalityFile)
-    ? readFileSync(paths.personalityFile, 'utf8').trim()
+    ? cachedReadFile(paths.personalityFile).trim()
     : '';
 
   const parts = personalityContent
@@ -813,7 +826,7 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
     if (!module) continue;
     const modulePath = paths.avaDir + module.path;
     if (existsSync(modulePath)) {
-      const content = readFileSync(modulePath, 'utf8');
+      const content = cachedReadFile(modulePath);
       parts.push('\n\n' + content);
     } else {
       log('warn', `skill-modular: module file not found: ${modulePath}`);
@@ -824,7 +837,7 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   if (moduleMap[selfCheckId]) {
     const selfCheckPath = paths.avaDir + moduleMap[selfCheckId].path;
     if (existsSync(selfCheckPath)) {
-      parts.push('\n\n' + readFileSync(selfCheckPath, 'utf8'));
+      parts.push('\n\n' + cachedReadFile(selfCheckPath));
     }
   }
 
@@ -1175,6 +1188,11 @@ export async function handlePersonalityWrite(args) {
   content = content.replace(/\*Last Section A update:.*\*/, `*Last Section A update: ${dateStr}*`);
 
   writeFileSync(paths.personalityFile, content, 'utf8');
+  // v13.20.0. mtime validation would catch this on the next compile anyway;
+  // invalidating explicitly removes the dependence on stat granularity, which
+  // matters most for the author who writes a module and immediately asks a
+  // question about it.
+  invalidateSkillFile(paths.personalityFile);
   log('info', `personality_write: wrote observation "${label}" (${mode})`);
 
   // Non-blocking: sync personality content to Railway gateway Postgres.
@@ -1272,6 +1290,7 @@ export async function handleDispatchRuleAdd(args) {
   }
 
   writeFileSync(paths.dispatchRulesFile, JSON.stringify(dispatchRules, null, 2), 'utf8');
+  invalidateSkillFile(paths.dispatchRulesFile);
   log('info', `dispatch_rule_add: ${existingIdx >= 0 ? 'updated' : 'added'} rule ${ruleId} -> ${moduleToAdd}`);
 
   return {
@@ -1489,6 +1508,7 @@ export async function handleModulesRestoreFromWp(body) {
 
     try {
       writeFileSync(fullPath, fileContent, 'utf8');
+      invalidateSkillFile(fullPath);
       // Post-write verification: confirm file is actually on disk
       const verified = existsSync(fullPath);
       const lines    = countLines(fileContent);

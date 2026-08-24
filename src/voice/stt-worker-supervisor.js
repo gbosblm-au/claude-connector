@@ -186,6 +186,77 @@ export async function transcribeViaWorker(opts) {
 }
 
 /**
+ * Transcribe one window of raw PCM through the resident worker.
+ *
+ * STREAM-WHISPER-v1.0.0 Section 4.
+ *
+ * ── Why streaming does NOT fall back to the per-request spawn ────────────
+ *
+ * transcribeViaWorker() resolves null when the worker cannot serve a request,
+ * and the caller spawns voice_stt.py instead. That is right for a single
+ * upload, where a two-second spawn is invisible beside the wait the user is
+ * already in.
+ *
+ * It is wrong here. A partial has a 400 ms budget and a lifetime shorter than
+ * the next one; paying a process start and a model load for it would blow the
+ * budget by an order of magnitude and deliver a hypothesis the user has
+ * already spoken past. So this REJECTS rather than falling back, and the
+ * session treats a failed partial as a skipped partial -- the next window is
+ * independent and may well succeed.
+ *
+ * The final transcription is the same call at beam 5 and the same reasoning
+ * applies to it: the session reports the failure and the client keeps the
+ * non-streaming path available behind the feature flag.
+ *
+ * @param {{path: string, model: string, modelDir: string, language?: string,
+ *          beam: number, condition: boolean, vadFilter?: boolean}} opts
+ * @returns {Promise<{text: string, language: string, duration_seconds: number,
+ *          segments: Array}>}
+ */
+export async function transcribeWindowViaWorker( opts ) {
+  const o = opts || {};
+  if ( ! sttWorkerEnabled() ) {
+    const err = new Error( 'The transcription worker is disabled.' );
+    err.code = 'stt_unavailable';
+    throw err;
+  }
+
+  const response = await worker.call( {
+    op: 'transcribe',
+    path: o.path,
+    // Section 4: the window is raw samples with no container to describe
+    // itself, so the format is declared rather than sniffed.
+    format: 's16le',
+    model: o.model,
+    model_dir: o.modelDir,
+    language: o.language || undefined,
+    beam_size: o.beam,
+    condition_on_previous_text: !! o.condition,
+    vad_filter: false !== o.vadFilter,
+  }, {
+    startArgs: ( sttWorkerResident() && o.model )
+      ? [ '--model', o.model, '--model-dir', o.modelDir || '' ]
+      : [],
+  } );
+
+  // null means the worker declined the request -- disabled, unstartable, or
+  // timed out. For a single upload that is a cue to spawn; here it is simply a
+  // failure, for the reasons in the header.
+  if ( ! response ) {
+    const err = new Error( 'The transcription worker is unavailable.' );
+    err.code = 'stt_unavailable';
+    throw err;
+  }
+
+  return {
+    text: String( response.text || '' ),
+    language: String( response.language || '' ),
+    duration_seconds: Number( response.duration_seconds ) || 0,
+    segments: Array.isArray( response.segments ) ? response.segments : [],
+  };
+}
+
+/**
  * Warm the worker at boot.
  *
  * Gated by the caller on voiceEnabled(), so the master switch still means no
@@ -234,5 +305,6 @@ export function resetSttWorker() {
 
 export default {
   sttWorkerEnabled, sttWorkerResident, transcribeViaWorker,
+  transcribeWindowViaWorker,
   prewarm, sttWorkerState, stopSttWorker, resetSttWorker,
 };

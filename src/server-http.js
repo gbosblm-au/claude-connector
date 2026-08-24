@@ -119,6 +119,9 @@ import {
   handleEscalationQueueRead,
 } from './tools/clientCheckin.js';
 import { createServer } from "http";
+// v13.19.0 -- STREAM-WHISPER-v1.0.0. Streaming transcription over WebSocket.
+import { attachVoiceStream } from "./voice/voice-stream-server.js";
+import { authenticateUpgrade } from "./voice/voice-stream-auth.js";
 // v12.28.0 (TNX-C-010): execSync invokes /bin/sh -c and was being handed an
 // interpolated, caller-controlled filename. Replaced throughout by
 // execFileSync, which passes an argument array directly to execve and never
@@ -4551,6 +4554,19 @@ const httpServer = createServer(app);
 // ECONNRESET -- exactly the symptom the gateway's own comments describe having
 // diagnosed and fixed on its side.
 applyServerTimeouts(httpServer, { log });
+
+// v13.19.0 -- STREAM-WHISPER-v1.0.0 Sections 3, 7 and 9.
+//
+// Attached BEFORE listen() so no upgrade can arrive before the handler exists.
+// A socket that upgraded in that gap would be handled by nothing and hang
+// until the client gave up.
+//
+// Section 9: with VOICE_STREAMING_ENABLED off (the default) attachVoiceStream
+// returns false having registered nothing, so an upgrade behaves exactly as it
+// did before this release. The await is intentional -- it resolves the
+// optional `ws` import -- and its failure is contained inside the function,
+// which reports and returns false rather than throwing into the boot path.
+await attachVoiceStream(httpServer, { authenticate: authenticateUpgrade });
 
 httpServer.listen(PORT, HOST, () => {
   log("info", `claude-connector v12.28.0 on http://${HOST}:${PORT}`);
