@@ -492,9 +492,33 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
       console.error( `[script_execute] download link warning: ${ w }` );
     }
 
+    // ── The output ceiling, and why it is not raised ────────────────────
+    //
+    // v13.21.1. 50 KB is roughly 12,500 tokens. This is a tool the assistant
+    // calls, so stdout normally lands in a model's context window -- the cap is
+    // a CONTEXT guard, not a transport limit, and raising it would let one
+    // script call consume a whole window and the budget with it.
+    //
+    // A caller that needs to move more than this should not be moving it on
+    // stdout at all: name the file in `return_files` and it travels as
+    // content_base64, which has no such ceiling because it never reaches a
+    // model unless the caller puts it there.
+    //
+    // What WAS wrong is that truncation was silent. A JSON payload cut at
+    // 50,000 bytes arrives unparseable, and the caller sees a malformed
+    // document rather than a truncated one -- which cost a real debugging
+    // session, surfacing three layers away as "this PDF has no text layer".
+    // The flags below make the ceiling visible at the point it bites.
+    const STDOUT_CAP = 50_000;
+
     return {
-      stdout:            stdout.slice( 0, 50_000 ),   // cap at 50KB
-      stderr:            stderr.slice( 0, 50_000 ),
+      stdout:            stdout.slice( 0, STDOUT_CAP ),
+      stderr:            stderr.slice( 0, STDOUT_CAP ),
+      stdout_truncated:  stdout.length > STDOUT_CAP ? true : undefined,
+      stderr_truncated:  stderr.length > STDOUT_CAP ? true : undefined,
+      // The full length, so a caller can see HOW far over it went. "Truncated"
+      // alone does not distinguish a few bytes lost from a book lost.
+      stdout_bytes:      stdout.length > STDOUT_CAP ? stdout.length : undefined,
       return_code:       exitCode,
       signal,
       execution_time_ms: elapsed,

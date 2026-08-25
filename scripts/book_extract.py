@@ -428,7 +428,35 @@ def run(args, out_stream):
     # \\u escapes, and while json.loads reverses them exactly, Section 5.2 asks
     # for UTF-8 end to end -- and an escaped stream is one careless consumer
     # away from being stored as literal backslash-u.
-    json.dump(result, out_stream, ensure_ascii=False)
+    # ── Why the payload goes to a FILE and not to stdout ─────────────────
+    #
+    # script_execute caps stdout at 50 KB. A novel's raw text alone is several
+    # hundred, so the JSON arrived truncated mid-string and parsed as nothing --
+    # which the gateway then reported as "no extractable text", pointing at the
+    # book when the book was fine.
+    #
+    # return_files carries content_base64 with no such cap, so the full payload
+    # travels there and stdout carries only the summary. Anything that must
+    # survive a 50 KB ceiling does not belong on stdout.
+    out_dir = os.environ.get("SCRIPT_OUTPUT_DIR", "")
+    if out_dir and os.path.isdir(out_dir):
+        payload_name = "book_extract.json"
+        with open(os.path.join(out_dir, payload_name), "w", encoding="utf-8") as handle:
+            json.dump(result, handle, ensure_ascii=False)
+
+        # The summary, deliberately without raw_text or chapter content: it is
+        # what a human reads in the log and what proves the run happened.
+        summary = {k: v for k, v in result.items()
+                   if k not in ("raw_text", "chapters")}
+        summary["payload_file"] = payload_name
+        summary["chapter_titles"] = [c.get("title") for c in chapters][:40]
+        json.dump(summary, out_stream, ensure_ascii=False)
+    else:
+        # No output directory: run directly from a shell rather than through
+        # script_execute. The whole payload goes to stdout, which is what a
+        # person invoking this by hand wants.
+        json.dump(result, out_stream, ensure_ascii=False)
+
     out_stream.write("\n")
     out_stream.flush()
 
