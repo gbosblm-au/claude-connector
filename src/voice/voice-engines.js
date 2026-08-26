@@ -71,6 +71,10 @@ import { normalizeForSpeech, isSpeakable } from './voice-text-normalize.js';
 // bare normaliser at the choke point: normalisation is stage one of its own
 // pipeline, so calling both would normalise twice (harmless, it is idempotent)
 // and skip stages two through five (not harmless -- that is the whole feature).
+// v13.22.0 -- SPEC-HET-002 §9. Heteronym resolution runs ONCE on the whole
+// reply, before segmentation. Not in prepareForKokoro: that is called per
+// phrase, and a fragment cannot show which sense a word carries.
+import { resolveHeteronyms } from './heteronym-resolver.js';
 import { prepareForKokoro }               from './voice-prosody-prep.js';
 // v12.53.0 -- the resident Piper worker (PIPER-PRELOAD-v1.1 Section 4).
 // SPAWNED, never imported: this is a path to a Python file, and the GPL
@@ -731,6 +735,44 @@ export function describeFailure(code, signal, stderrText) {
   return `Piper exited ${code} without writing anything to stderr.`;
 }
 
+/**
+ * Resolve heteronyms across a whole reply, or return it unchanged.
+ *
+ * SPEC-HET-002 §11 item 10: a resolver fault must synthesise the unmodified
+ * input, so the feature cannot make audio worse than the build before it.
+ * The resolver guards itself too; this is the outer catch the spec asks the
+ * CALLER to hold.
+ *
+ * @param {string} text The whole reply.
+ * @param {string} where Call site name, for the log line.
+ * @returns {string}
+ */
+function withHeteronyms(text, where) {
+  try {
+    const out = resolveHeteronyms(text, {
+      // Strategy B emits misaki [word](/ipa/) markup, which espeak would read
+      // aloud as brackets and letters. The same gate the lexicon and emphasis
+      // machinery already use.
+      markupSupported: 'misaki' === g2pMode(),
+    });
+    if (out && 'string' === typeof out.text) {
+      if (out.changed.length) {
+        log('info', `[heteronym] ${where}: resolved ${out.changed.length} `
+          + `(${out.changed.map(c => c.word).join(', ')})`);
+      }
+      if (out.suppressed.length) {
+        log('info', `[heteronym] ${where}: suppressed ${out.suppressed.length} `
+          + `(${out.suppressed.map(sup => sup.reason).join(', ')})`);
+      }
+      return out.text;
+    }
+    return text;
+  } catch (err) {
+    log('warn', `[heteronym] ${where}: ${err.message}; synthesising unmodified text`);
+    return text;
+  }
+}
+
 export async function synthesize(opts) {
   const o = opts || {};
   // v12.53.0. The body of this function moved to synthesizePcm() unchanged, so
@@ -747,8 +789,16 @@ export async function synthesize(opts) {
   // the same reply text, and byte-identity is only defensible if the argv is
   // identical -- Piper's output depends on nothing else. That equality is
   // asserted in src/tests/voice-prosody.test.js rather than left to review.
+  // v13.22.0 -- SPEC-HET-002 §9. The flat path's whole-reply text, resolved
+  // HERE and not inside synthesizePcm.
+  //
+  // synthesizePcm is the per-phrase unit: the prosody paths call it once per
+  // phrase, so a call placed there sees fragments and the marker that decides a
+  // pronunciation lands in a different invocation from the word it governs.
+  // §9 names this explicitly as the wrong hook, and the first version of this
+  // change put it there anyway.
   const pcm = await synthesizePcm({
-    text: o.text,
+    text: withHeteronyms(String(o.text || ''), 'synthesize'),
     voice: o.voice,
     lengthScale: (Number.isFinite(o.speed) && o.speed > 0) ? (1 / o.speed) : undefined,
     sampleRate: o.sampleRate,
@@ -1206,7 +1256,8 @@ export function speakablePhrases(phrases) {
  */
 export async function synthesizeProsody(opts) {
   const o = opts || {};
-  const text = String(o.text || '');
+  // §9: whole reply still intact, pre-segmentation.
+  const text = withHeteronyms(String(o.text || ''), 'synthesizeProsody');
   if (!text.trim()) {
     const err = new Error('No text to synthesise.');
     err.code = 'empty_text';
@@ -1314,7 +1365,8 @@ export async function synthesizeProsody(opts) {
  */
 export async function synthesizeProsodyStream(opts, onSegment) {
   const o = opts || {};
-  const text = String(o.text || '');
+  // §9: both prosody paths must agree, or streamed and buffered audio differ.
+  const text = withHeteronyms(String(o.text || ''), 'synthesizeProsodyStream');
   if (!text.trim()) {
     const err = new Error('No text to synthesise.');
     err.code = 'empty_text';
