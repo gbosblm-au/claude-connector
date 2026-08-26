@@ -100,6 +100,40 @@ function firstStringKey(args, ...keys) {
 // empty string is rejected to preserve module_write's original `!content`
 // behaviour and to keep the error message truthful.
 function requireContent(content) {
+  // v13.23.0. An upper bound, because there was none.
+  //
+  // A skill module is prose a person will read. The largest legitimate one on
+  // this volume is a few tens of kilobytes; anything approaching a megabyte is
+  // a mistake, a runaway generation, or a payload chosen to hurt. The write
+  // itself would survive it -- what does not is everything downstream that
+  // re-serialises the string: the manifest entry derivation, the fragment
+  // merge, and the WordPress backup body.
+  //
+  // Refusing with a number the caller can act on is better than accepting a
+  // payload whose processing cost nobody has measured. This is not the fix for
+  // the OOM -- the allocation site is still unidentified -- but an unbounded
+  // input on the path that crashed is not something to leave in place while
+  // looking for it.
+  const MAX_MODULE_CHARS = parseInt(process.env.MODULE_WRITE_MAX_CHARS || '524288', 10);
+  if (typeof content === 'string' && content.length > MAX_MODULE_CHARS) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          ok: false,
+          error: 'module_too_large',
+          chars: content.length,
+          limit: MAX_MODULE_CHARS,
+          message: `This module is ${content.length} characters; the limit is `
+            + `${MAX_MODULE_CHARS}. A skill module is prose meant to be read -- `
+            + 'if this is generated content, write it to references/ or '
+            + 'archive/ instead, which are not compiled into every session.',
+        }, null, 2),
+      }],
+      isError: true,
+    };
+  }
+
   if (content === undefined || content === null || typeof content !== 'string' || content.length === 0) {
     throw new ToolValidationError('content is required and must be a non-empty string');
   }
@@ -198,6 +232,25 @@ function validateContentPath(rawPath, allowedExtensions) {
 // up to the gateway request timeout and could itself surface as a 500/408. The
 // request is now bounded by WP_SKILL_TIMEOUT_MS (default 8000ms); on timeout it
 // returns a failed-but-non-fatal result and the write still completes.
+/**
+ * This connector's version, from package.json.
+ *
+ * v13.23.1. The User-Agent below carried a hardcoded release far enough back
+ * that WordPress's own logs of these backups have been attributing them to the
+ * wrong build. Two stale version literals were found this release; both now
+ * read the one source.
+ *
+ * @returns {string}
+ */
+function connectorVersion() {
+  try {
+    const pkg = new URL('../../package.json', import.meta.url);
+    return JSON.parse(readFileSync(pkg, 'utf8')).version || 'unknown';
+  } catch (err) {
+    return 'unknown';
+  }
+}
+
 function wpTimeoutMs() {
   const raw = Number(process.env.WP_SKILL_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 8000;
@@ -214,7 +267,7 @@ async function pushContentToWp(section, filePath, content, changeNote) {
       headers: {
         'Content-Type':    'application/json',
         'X-Ava-Skill-Key': wpSkillKey,
-        'User-Agent':      'claude-connector/11.5.0 (ava-skill-content-sync)',
+        'User-Agent':      `claude-connector/${connectorVersion()} (ava-skill-content-sync)`,
       },
       body: JSON.stringify({
         filename:    filePath,   // may include subdirectory path
@@ -644,7 +697,7 @@ export async function handleModuleWrite(args) {
     try {
       const res = await fetch(`${wpSkillUrl}/modules`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey, 'User-Agent': 'claude-connector/12.8.0 (ava-module-write)' },
+        headers: { 'Content-Type': 'application/json', 'X-Ava-Skill-Key': wpSkillKey, 'User-Agent': `claude-connector/${connectorVersion()} (ava-module-write)` },
         body: JSON.stringify({ file: cleanPath, content, change_note: change_note || '', timestamp: new Date().toISOString(), line_count: content.split('\n').length }),
         signal: AbortSignal.timeout(timeoutMs),
       });

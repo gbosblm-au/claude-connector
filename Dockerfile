@@ -359,4 +359,22 @@ ENV PORT=3000
 ENV HOST=0.0.0.0
 ENV SCHEDULE_STORE_PATH=/data/schedule_store.json
 
-CMD ["node", "src/server-http.js"]
+# v13.23.0 -- two flags, for two different jobs.
+#
+# --max-old-space-size bounds V8 explicitly instead of letting it default to
+#   roughly a quarter of visible host memory. On this container that default
+#   was ~4 GB, which is exactly the ceiling the process died at: V8 will grow
+#   to it, GC harder and harder, and abort. A stated limit means V8 collects
+#   aggressively well before the container's own limit and the guard in
+#   utils/heap-guard.js gets a chance to refuse calls first. Override with
+#   NODE_MAX_OLD_SPACE for a differently sized instance.
+#
+# --heapsnapshot-near-heap-limit=1 is the one that will actually find the bug.
+#   The crash output carried an EMPTY JS stack, so the log could not name the
+#   allocation site and reading the code did not either -- the module write,
+#   the fragment merge and the frontmatter parser are all bounded on
+#   inspection. This writes a .heapsnapshot the next time the heap approaches
+#   the limit, naming the retaining object directly. It costs nothing until
+#   that happens.
+ENV NODE_MAX_OLD_SPACE=1536
+CMD ["sh", "-c", "exec node --max-old-space-size=${NODE_MAX_OLD_SPACE} --heapsnapshot-near-heap-limit=1 src/server-http.js"]

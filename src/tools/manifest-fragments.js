@@ -454,13 +454,33 @@ function mineBodyContent(body) {
   }
 
   // --- Pattern 3: ## H2 headings as task class candidates ---
-  const h2Pattern = /^##\s+(.+)$/m;
+  //
+  // v13.23.2 -- THE module_write OOM. The flags were /m without /g.
+  //
+  // RegExp.exec only advances lastIndex on a GLOBAL regex. Without /g,
+  // lastIndex stays 0, every call re-matches the first heading, and the loop
+  // below never terminates -- pushing the same string into taskClasses until
+  // V8 aborts the process.
+  //
+  // It reproduced on the first write of a 14.6 KB module, which is why the
+  // 512 KB size cap could not have caught it and why 14.6 KB became 4.9 GB:
+  // the input size is irrelevant. Any module with at least one H2 hits this;
+  // the reason it had not brought the connector down sooner is that
+  // module_write is rare and the heap ceiling took ~95 seconds to reach.
+  //
+  // The heap guard added alongside this contains the class of failure. This is
+  // the bug.
+  const h2Pattern = /^##\s+(.+)$/gm;
   let h2Match;
   while ((h2Match = h2Pattern.exec(body)) !== null) {
     const h2 = h2Match[1].trim().toLowerCase();
     if (h2.length > 2 && h2.length < 60) {
       taskClasses.push(h2.replace(/[^a-z0-9\s-]/g, '').trim());
     }
+    // A zero-length match cannot advance lastIndex either, and would reproduce
+    // the same loop for a different reason. (.+) requires a character today,
+    // so this is belt to the /g braces rather than a live path.
+    if (h2Match.index === h2Pattern.lastIndex) h2Pattern.lastIndex += 1;
   }
 
   return {

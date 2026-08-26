@@ -67,6 +67,14 @@ const AUDITED = [
     expect: [ 'src/voice/voice-engines.js' ],
   },
   {
+    name: 'checkHeapBeforeTool',
+    definedIn: 'src/utils/heap-guard.js',
+    why: 'The containment for the module_write OOM. Unreached, an unbounded '
+      + 'allocation in any tool takes the whole process down and every caller '
+      + 'gets a bare 502 -- which is the incident, not a hypothetical.',
+    expect: [ 'src/server-http.js' ],
+  },
+  {
     name: 'transcribeWindowViaWorker',
     definedIn: 'src/voice/stt-worker-supervisor.js',
     why: 'Streaming transcription reaches the Whisper worker through this. '
@@ -132,6 +140,30 @@ function sourceFiles() {
 const FILES = sourceFiles();
 
 /**
+ * A file's code with its import statements removed.
+ *
+ * ── Why imports do not count as callers ──────────────────────────────────
+ *
+ * An import is not a use. The gateway's copy of this guard PASSED with its
+ * events router unmounted and its hub never started, because the import line
+ * still contained the name. That is the defect being hunted, one level up: a
+ * module imported and never called is as unreachable as one never imported,
+ * and the import makes it look wired.
+ *
+ * Found only by deliberately breaking the wiring to check the guard could fail.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function withoutImports( text ) {
+  return text
+    .replace( /^\s*import\s+[\s\S]*?from\s+['"][^'"]+['"];?/gm, '' )
+    .replace( /^\s*import\s+['"][^'"]+['"];?/gm, '' )
+    // Python's equivalent, since scripts/ is searched too.
+    .replace( /^\s*(from\s+\S+\s+)?import\s+.*$/gm, '' );
+}
+
+/**
  * Files mentioning a name, excluding the file that defines it.
  *
  * @param {string} name
@@ -141,7 +173,8 @@ const FILES = sourceFiles();
 function callersOf( name, definedIn ) {
   const pattern = new RegExp( `\\b${ name }\\b` );
   return FILES.filter( ( file ) => (
-    file !== definedIn && pattern.test( readFileSync( join( ROOT, file ), 'utf8' ) )
+    file !== definedIn
+      && pattern.test( withoutImports( readFileSync( join( ROOT, file ), 'utf8' ) ) )
   ) );
 }
 

@@ -119,6 +119,8 @@ import {
   handleEscalationQueueRead,
 } from './tools/clientCheckin.js';
 import { createServer } from "http";
+// v13.23.0 -- a tool call must not be able to take the process with it.
+import { checkHeapBeforeTool, heapRefusalResult, heapGuardHealth } from "./utils/heap-guard.js";
 // v13.19.0 -- STREAM-WHISPER-v1.0.0. Streaming transcription over WebSocket.
 import { attachVoiceStream } from "./voice/voice-stream-server.js";
 import { authenticateUpgrade } from "./voice/voice-stream-auth.js";
@@ -712,7 +714,7 @@ async function backupPersonalFileToGateway(fileKey, filePath) {
       method:  "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent":   "claude-connector/12.8.0 (TrueSource tenant mode)",
+        "User-Agent":   `claude-connector/${CONNECTOR_VERSION} (TrueSource tenant mode)`,
       },
       body:   JSON.stringify({ api_key: TENANT_API_KEY, file_key: fileKey, content }),
       signal: AbortSignal.timeout(10_000),
@@ -1148,6 +1150,21 @@ async function dispatchToolCall(name, args, context = null) {
 }
 
 async function dispatchToolCallCore(name, args, context = null) {
+  // v13.23.0. The single choke point every tool passes through, which is why
+  // the guard sits here rather than on one handler.
+  //
+  // A module_write force-overwrite ran the heap to 4.9 GB in 95 seconds and V8
+  // aborted the process; Railway restarted it, the caller retried, and it died
+  // again -- four crashes in six minutes, each surfacing to the caller as a
+  // bare 502. Refusing the call keeps the process alive, keeps every other
+  // request served, and gives the caller a reason it can act on instead of a
+  // dead socket.
+  //
+  // This does not fix whatever allocates. It stops any allocation bug, this one
+  // or the next, from becoming a crash loop.
+  const heap = checkHeapBeforeTool(name);
+  if (!heap.allow) return heapRefusalResult(name, heap);
+
       switch (name) {
         // ---------- TrueSource Client Gateway session init (v12.3.0) ----------
         case "ts_gateway_session_init": return await handleTsGatewaySessionInit(args);
@@ -4569,7 +4586,18 @@ applyServerTimeouts(httpServer, { log });
 await attachVoiceStream(httpServer, { authenticate: authenticateUpgrade });
 
 httpServer.listen(PORT, HOST, () => {
-  log("info", `claude-connector v12.28.0 on http://${HOST}:${PORT}`);
+  // v13.23.1. The banner hardcoded v12.28.0 while CONNECTOR_VERSION -- read from
+  // package.json a thousand lines above and used by /health and /version -- said
+  // something else entirely.
+  //
+  // This is not cosmetic. The startup banner is the line an operator reads to
+  // answer "what is actually deployed", and it was reporting a release from
+  // several versions back. During the module_write OOM it was taken as evidence
+  // that none of the recent work was on the box, which sent the diagnosis in the
+  // wrong direction before the log timestamps settled it.
+  //
+  // One source now, and a test asserts no literal version string returns here.
+  log("info", `claude-connector v${CONNECTOR_VERSION} on http://${HOST}:${PORT}`);
   log("info", `MCP: http://${HOST}:${PORT}/mcp (Authorization: Bearer <MCP_API_KEY> REQUIRED)`);
   log("info", `CORS: ${MCP_ALLOWED_ORIGINS.length ? MCP_ALLOWED_ORIGINS.join(", ") : "no origins configured (all cross-origin browser requests blocked)"}`);
   log("info", `LinkedIn OAuth: ${config.linkedinClientId ? "CONFIGURED" : "not configured"}`);
