@@ -56,11 +56,38 @@ from html import unescape
 CHAPTER_PATTERNS = [
     re.compile(r"^\s*(?:CHAPTER|Chapter)\s+([0-9]+|[IVXLCDM]+|[A-Za-z]+)\b\s*(.*)$"),
     re.compile(r"^\s*(?:PART|Part|BOOK|Book)\s+([0-9]+|[IVXLCDM]+|[A-Za-z]+)\b\s*(.*)$"),
+    # v13.21.3. "1. A Parade in Erhenrang" -- a number, a separator, and a
+    # title on the same line. The commonest chapter style in modern fiction,
+    # and the one that made the pilot book extract as a single chapter: it uses
+    # neither the word CHAPTER nor a number alone on a line, so nothing here
+    # matched and the fallback fired on a book with twenty real chapters.
+    #
+    # The title is required. Without it this collapses into the bare-number
+    # rule below and would match every page number in the book.
+    re.compile(r"^\s*([0-9]{1,3})\s*[.:\u2014-]\s+(\S.*)$"),
+    re.compile(r"^\s*([IVXLCDM]{1,7})\s*[.:\u2014-]\s+(\S.*)$"),
     # A bare number alone on a line. Common in fiction, and the loosest rule
     # here -- guarded by the plausibility check in choose_chapters().
     re.compile(r"^\s*([0-9]{1,3})\s*$"),
     re.compile(r"^\s*([IVXLCDM]{1,7})\s*$"),
 ]
+
+# Patterns 0-3 name a chapter EXPLICITLY: the word CHAPTER or PART, or a
+# numeral followed by a title. Patterns 4-5 match a bare numeral, which in a
+# printed book is far more often a page number than a chapter.
+#
+# v13.21.3. The two are ranked rather than pooled, and the pilot book is why.
+# The Left Hand of Darkness has nine headings of the form "1. A Parade in
+# Erhenrang" and a page number every few paragraphs. Pooled, that is nine real
+# marks against eighty-one spurious ones: the median section drops to about
+# 900 characters, the plausibility check refuses the split, and a book with
+# twenty chapters is stored as one.
+#
+# So when the explicit patterns find a book's worth of headings, the bare
+# numerals are ignored entirely. They remain as a last resort for books that
+# genuinely number chapters and nothing else -- which exist, and for which the
+# plausibility check is still the guard.
+STRONG_PATTERNS = 4
 
 # Below this, a "chapter" is a heading page, a dedication or a section break
 # caught by the bare-number rule -- not a chapter. Deliberately generous: a
@@ -119,6 +146,29 @@ def fail(code, message, **detail):
     sys.__stdout__.write("\n")
     sys.__stdout__.flush()
     sys.exit(0)  # A described failure is a successful run of this script.
+
+
+def strip_nul(text):
+    """Remove U+0000, and nothing else.
+
+    v13.21.6. The single exception to Section 5.2's rule that nothing may
+    discard characters, and it is narrow enough to state exactly.
+
+    PostgreSQL cannot store a NUL in a text or jsonb column. jsonb answers
+    "unsupported Unicode escape sequence" and text answers "invalid byte
+    sequence"; neither is a size limit or an encoding mismatch, and no retry
+    changes it. So a NUL anywhere in a book makes that book unstorable, and
+    makes any conversation quoting it unstorable too -- which is how one turned
+    up: a session snapshot that could never be persisted, failing on every
+    flush forever.
+
+    NUL is not a character anyone wrote. It arrives from malformed embedded
+    fonts and from padding in PDF and EPUB containers, nothing renders it, and
+    removing it changes no word, no punctuation mark and no accent.
+
+    Every other byte is left exactly as found.
+    """
+    return text.replace("\x00", "") if text else text
 
 
 def words_in(text):
@@ -198,7 +248,7 @@ def extract_pdf(path, max_pages=None):
              "a scan. OCR is deliberately out of scope for v1.",
              pages=total_pages, extracted_chars=len(body.strip()))
 
-    return body, {"pages": total_pages, "pages_read": limit}
+    return strip_nul(body), {"pages": total_pages, "pages_read": limit}
 
 
 def strip_html(markup):
@@ -275,7 +325,42 @@ def extract_epub(path):
              "No readable text was found in this EPUB.",
              documents=len(ordered))
 
-    return body, {"documents": len(ordered)}
+    # v13.21.5. The spine IS the chapter structure, declared by the publisher.
+    #
+    # Running the text heuristic over a concatenated EPUB throws that away and
+    # then tries to guess it back from headings -- which fails badly on books
+    # that have no headings to find. Discworld novels are the clearest case:
+    # most have no chapters at all, only scene breaks, so a heading search
+    # returns nothing and the whole novel becomes one chapter. The spine still
+    # knows where the sections are.
+    #
+    # Documents shorter than MIN_CHAPTER_CHARS are folded into the previous
+    # one, because a spine is full of cover pages, title pages, copyright
+    # notices and dedications, and each is its own document.
+    sections = []
+    for name, text in zip(ordered, parts):
+        if sections and len(text) < MIN_CHAPTER_CHARS:
+            sections[-1]["content"] += "\n\n" + text
+        else:
+            sections.append({"title": epub_title(text), "content": text})
+
+    for section in sections:
+        section["content"] = strip_nul(section["content"])
+    return strip_nul(body), {"documents": len(ordered), "spine_sections": sections}
+
+
+def epub_title(text):
+    """The first short line of a section, if it looks like a heading.
+
+    Not a guess at structure -- the spine already settled that. This only names
+    a section the reader can already see, and returns None rather than inventing
+    a title from the first sentence of prose.
+    """
+    for line in text.split("\n")[:5]:
+        stripped = line.strip()
+        if stripped and len(stripped) <= 80:
+            return stripped
+    return None
 
 
 def extract_txt(path):
@@ -297,7 +382,71 @@ def extract_txt(path):
         fail("no_extractable_text", "The file is empty or too short to be a book.",
              extracted_chars=len(body.strip()))
 
-    return body, {"bytes": len(raw)}
+    return strip_nul(body), {"bytes": len(raw)}
+
+
+def heading_report(body):
+    """Every candidate heading, and why the split was accepted or refused.
+
+    v13.21.3. Chapter detection is heuristic (Section 6.1), which means the
+    only way to tune it for a particular book is to see what it saw. Guessing
+    at a PDF's heading style from the outside is how the pilot book came back
+    as one chapter.
+
+    Prints to stderr, so it never disturbs the JSON contract on stdout.
+    """
+    lines = body.split("\n")
+    marks = []
+    for index, line in enumerate(lines):
+        if len(line) > 90:
+            continue
+        for number, pattern in enumerate(CHAPTER_PATTERNS):
+            if pattern.match(line):
+                marks.append((index, line.strip(), number))
+                break
+
+    strong_count = sum(1 for _, _, n in marks if n < STRONG_PATTERNS)
+    print("candidate headings: %d (%d explicit, %d bare numerals)"
+          % (len(marks), strong_count, len(marks) - strong_count), file=sys.stderr)
+    if strong_count >= 2:
+        print("  -> explicit headings win; bare numerals ignored", file=sys.stderr)
+        marks = [m for m in marks if m[2] < STRONG_PATTERNS]
+    for index, text, pattern_no in marks[:60]:
+        print("  line %-7d pattern %d  %s" % (index, pattern_no, text[:70]),
+              file=sys.stderr)
+    if len(marks) > 60:
+        print("  ... and %d more" % (len(marks) - 60), file=sys.stderr)
+
+    kept = []
+    for position, (line_no, heading, _) in enumerate(marks):
+        end = marks[position + 1][0] if position + 1 < len(marks) else len(lines)
+        content = "\n".join(lines[line_no + 1:end]).strip()
+        if len(content) >= MIN_CHAPTER_CHARS:
+            kept.append(len(content))
+
+    if kept:
+        lengths = sorted(kept)
+        median = lengths[len(lengths) // 2]
+        covered = sum(kept)
+        print("kept %d of %d (>= %d chars); median %d (need >= 2000); "
+              "coverage %.0f%% of %d (need >= 60%%)"
+              % (len(kept), len(marks), MIN_CHAPTER_CHARS, median,
+                 100.0 * covered / max(1, len(body)), len(body)),
+              file=sys.stderr)
+    else:
+        print("no candidate produced a section of at least %d chars"
+              % MIN_CHAPTER_CHARS, file=sys.stderr)
+
+    # The first 40 short lines, for a book whose headings match nothing at all.
+    # Seeing the actual lines is the only way to write a pattern for them.
+    if len(marks) < 2:
+        print("\nshort lines that matched NOTHING (first 40):", file=sys.stderr)
+        shown = 0
+        for line in lines:
+            stripped = line.strip()
+            if stripped and len(stripped) <= 60 and shown < 40:
+                print("  %s" % stripped[:70], file=sys.stderr)
+                shown += 1
 
 
 def choose_chapters(body):
@@ -315,16 +464,21 @@ def choose_chapters(body):
     permits and which is honest about what happened.
     """
     lines = body.split("\n")
-    marks = []
+    strong = []
+    weak = []
 
     for index, line in enumerate(lines):
         if len(line) > 90:
             continue  # A heading is short. This is a paragraph.
-        for pattern in CHAPTER_PATTERNS:
-            match = pattern.match(line)
-            if match:
-                marks.append((index, line.strip()))
+        for number, pattern in enumerate(CHAPTER_PATTERNS):
+            if pattern.match(line):
+                target = strong if number < STRONG_PATTERNS else weak
+                target.append((index, line.strip()))
                 break
+
+    # Explicit headings win outright when there are enough of them to be a
+    # book's structure rather than a stray numbered line in the front matter.
+    marks = strong if len(strong) >= 2 else sorted(strong + weak)
 
     chapters = []
     for position, (line_no, heading) in enumerate(marks):
@@ -358,6 +512,25 @@ def main():
     parser.add_argument("--stdin", action="store_true", help="Read text from stdin.")
     parser.add_argument("--format", choices=["pdf", "epub", "txt", "paste"])
     parser.add_argument("--max-pages", type=int, default=None)
+
+    # ── The two arguments script_execute always supplies ─────────────────
+    #
+    # v13.21.2. script_execute builds every command as
+    #     <script> [--input FILE] --output DIR [caller args...]
+    # unconditionally. A script that does not accept them exits 2 on argparse
+    # before running, which surfaces as "the extractor ran but returned no
+    # payload" -- the extractor had not run at all.
+    #
+    # This is the convention every script on the volume already follows. The
+    # first version of this one read SCRIPT_OUTPUT_DIR from the environment
+    # instead, which is also set, and never got far enough to use it.
+    parser.add_argument("--output", default=None,
+                        help="Directory for the result payload. Supplied by script_execute.")
+    parser.add_argument("--input", default=None,
+                        help="Input file. Supplied by script_execute when input_data is given.")
+    parser.add_argument("--headings", action="store_true",
+                        help="Report candidate chapter headings on stderr and exit. "
+                             "Use this to tune detection for a specific book.")
     parser.add_argument("--title", default=None)
     parser.add_argument("--author", default=None)
     args = parser.parse_args()
@@ -368,6 +541,11 @@ def main():
 
 def run(args, out_stream):
     """Extract and emit. Separated so protected_stdout() wraps the whole run."""
+    # --input is script_execute's channel for an uploaded file. Treated as the
+    # path when no --path was given, so both invocation styles work.
+    if not args.path and args.input:
+        args.path = args.input
+
     if args.stdin:
         body = sys.stdin.read()
         fmt, meta = "paste", {"bytes": len(body.encode("utf-8"))}
@@ -399,10 +577,55 @@ def run(args, out_stream):
         else:
             body, meta = extract_txt(args.path)
 
-    chapters, status = choose_chapters(body)
+    # An EPUB's spine is authoritative, so it is used in preference to the text
+    # heuristic. The heuristic remains for PDFs and plain text, which carry no
+    # structure at all.
+    spine = meta.pop("spine_sections", None) if isinstance(meta, dict) else None
+
+    if args.headings:
+        heading_report(body)
+        json.dump({"ok": True, "mode": "headings", "char_count": len(body),
+                   "word_count": words_in(body)}, out_stream, ensure_ascii=False)
+        out_stream.write("\n")
+        out_stream.flush()
+        return
+
+    if spine and len(spine) >= 2:
+        chapters = []
+        for ordinal, section in enumerate(spine, start=1):
+            chapters.append({"ordinal": ordinal,
+                             "title": section["title"],
+                             "content": section["content"].strip(),
+                             "is_fallback": False})
+        status = "ok"
+    else:
+        chapters, status = choose_chapters(body)
+
+    # v13.21.4. What the chapters do NOT contain.
+    #
+    # Splitting drops the heading lines themselves and everything before the
+    # first heading -- a title page, a copyright notice, sometimes an author's
+    # introduction. On the pilot book that is about 2,100 words, and the
+    # difference between the raw word count and the chapter word count is
+    # exactly it.
+    #
+    # Nothing is lost: raw_text holds all of it and §6.1 requires that it does.
+    # But an unexplained 2,000-word gap between two counts in the same summary
+    # invites the reader to assume truncation, so it is stated rather than left
+    # to be noticed.
+    chapter_words = sum(words_in(c.get("content", "")) for c in chapters)
+    unassigned = words_in(body) - chapter_words
 
     result = {
         "ok": True,
+        "chapter_word_count": chapter_words,
+        "unassigned_word_count": unassigned,
+        "unassigned_note": (
+            "Words in the raw text but not inside any chapter: the heading "
+            "lines, and any front matter before the first chapter. Preserved "
+            "in raw_text, which is stored in full."
+            if unassigned else None
+        ),
         "source_format": fmt,
         "title": args.title,
         "author": args.author,
@@ -438,7 +661,10 @@ def run(args, out_stream):
     # return_files carries content_base64 with no such cap, so the full payload
     # travels there and stdout carries only the summary. Anything that must
     # survive a 50 KB ceiling does not belong on stdout.
-    out_dir = os.environ.get("SCRIPT_OUTPUT_DIR", "")
+    # --output first, environment second. Both are set by script_execute; the
+    # flag is the documented channel and the one a script run by hand can also
+    # use, so it wins.
+    out_dir = args.output or os.environ.get("SCRIPT_OUTPUT_DIR", "")
     if out_dir and os.path.isdir(out_dir):
         payload_name = "book_extract.json"
         with open(os.path.join(out_dir, payload_name), "w", encoding="utf-8") as handle:
