@@ -756,19 +756,32 @@ function withHeteronyms(text, where) {
       markupSupported: 'misaki' === g2pMode(),
     });
     if (out && 'string' === typeof out.text) {
+      // v13.23.3. console.*, matching the rest of this file.
+      //
+      // These three lines called log(), which this module has never imported.
+      // Every one of them threw ReferenceError -- and because they sit inside
+      // the try, the catch swallowed it and returned the unmodified text with
+      // "[heteronym] ...: log is not defined" in the logs.
+      //
+      // The damage was not the log line. withHeteronyms is called from
+      // synthesize, synthesizeProsody and synthesizeProsodyStream, so the throw
+      // propagated into all three: tts_failed, tts_stream_error,
+      // tts_incremental_error and prosody fallback, all from one missing
+      // import. Voice "dropping out at random intervals" was voice failing
+      // whenever a reply happened to contain a heteronym.
       if (out.changed.length) {
-        log('info', `[heteronym] ${where}: resolved ${out.changed.length} `
+        console.log(`[heteronym] ${where}: resolved ${out.changed.length} `
           + `(${out.changed.map(c => c.word).join(', ')})`);
       }
       if (out.suppressed.length) {
-        log('info', `[heteronym] ${where}: suppressed ${out.suppressed.length} `
+        console.log(`[heteronym] ${where}: suppressed ${out.suppressed.length} `
           + `(${out.suppressed.map(sup => sup.reason).join(', ')})`);
       }
       return out.text;
     }
     return text;
   } catch (err) {
-    log('warn', `[heteronym] ${where}: ${err.message}; synthesising unmodified text`);
+    console.warn(`[heteronym] ${where}: ${err.message}; synthesising unmodified text`);
     return text;
   }
 }

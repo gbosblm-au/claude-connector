@@ -801,9 +801,29 @@ export async function handleSkillAudit(_args) {
     // and every file in the modules/ directory (recursive).
     // -------------------------------------------------------------------
     result.files.push(fileInfo(avaDir + 'CORE.md',              'CORE.md'));
-    result.files.push(fileInfo(avaDir + 'PERSONALITY.md',       'PERSONALITY.md'));
     result.files.push(fileInfo(avaDir + 'MANIFEST.json',        'MANIFEST.json'));
     result.files.push(fileInfo(avaDir + 'DISPATCH_RULES.json',  'DISPATCH_RULES.json'));
+
+    // v13.23.3. PERSONALITY.md is reported ONLY IF PRESENT.
+    //
+    // It used to be pushed unconditionally, so once personality moved to
+    // Postgres the audit reported a permanently missing file on every run --
+    // a standing fault for something that is working as designed. An audit
+    // that always shows one red line trains its reader to skip the list, which
+    // costs more than the check was ever worth.
+    //
+    // Conditional rather than deleted, because a deployment that predates the
+    // migration still has the file on its volume and should still see it
+    // audited. Absent means "not used here"; present means "still on disk, and
+    // here is its state". Neither is a fault.
+    //
+    // Not derived from MANIFEST either: personality is not a manifest module,
+    // so a manifest-driven list would drop it even where the file is live.
+    if (existsSync(avaDir + 'PERSONALITY.md')) {
+      result.files.push(fileInfo(avaDir + 'PERSONALITY.md', 'PERSONALITY.md'));
+    } else {
+      result.personality_source = 'postgres';
+    }
 
     // Walk the modules/ directory
     const modulesDir = avaDir + 'modules/';

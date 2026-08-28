@@ -244,6 +244,64 @@ test( 'AC3: the caller\'s string is not mutated', () => {
   assert.equal( input, before );
 } );
 
+test( 'the call site EXECUTES without throwing', () => {
+  // v13.23.3, and the reason voice was "dropping out at random intervals".
+  //
+  // withHeteronyms called log(), which voice-engines.js has never imported.
+  // Every branch that logged threw ReferenceError, the catch swallowed it, and
+  // synthesize / synthesizeProsody / synthesizeProsodyStream all failed --
+  // tts_failed, tts_stream_error, tts_incremental_error, prosody fallback --
+  // whenever a reply happened to contain a heteronym. Random-looking, entirely
+  // deterministic.
+  //
+  // Every other test in this file READS the call site. None ran it, which is
+  // exactly why a missing import survived them all. This one extracts the
+  // helper and executes it.
+  const src = readFileSync(
+    join( dirname( fileURLToPath( import.meta.url ) ), '..', 'voice',
+          'voice-engines.js' ), 'utf8' );
+
+  const body = src.slice( src.indexOf( 'function withHeteronyms' ),
+                          src.indexOf( 'export async function synthesize(' ) );
+  assert.ok( body.length > 200, 'withHeteronyms was not found' );
+
+  // eslint-disable-next-line no-new-func
+  const withHeteronyms = new Function( 'resolveHeteronyms', 'g2pMode',
+    `${ body }; return withHeteronyms;` )( resolveHeteronyms, () => 'espeak' );
+
+  // One input per branch: a resolved word, a suppressed one, and neither.
+  assert.equal( withHeteronyms( 'She read the book last night', 'synthesize' ),
+    'She red the book last night' );
+  assert.equal( withHeteronyms( 'tear up the letter', 'synthesizeProsody' ),
+    'tear up the letter' );
+  assert.equal( withHeteronyms( 'plain text', 'synthesizeProsodyStream' ),
+    'plain text' );
+} );
+
+test( 'the call site uses only identifiers its module actually has', () => {
+  // The general form. voice-engines.js logs with console.*; a bare log() there
+  // is an identifier from a different file's conventions, and it fails only on
+  // the branch that reaches it.
+  const src = readFileSync(
+    join( dirname( fileURLToPath( import.meta.url ) ), '..', 'voice',
+          'voice-engines.js' ), 'utf8' );
+
+  const code = src.split( '\n' )
+    .filter( ( l ) => {
+      const t = l.trim();
+      return ! t.startsWith( '//' ) && ! t.startsWith( '*' ) && ! t.startsWith( '/*' );
+    } )
+    .join( '\n' );
+
+  const importsLog = /import\s*\{[^}]*\blog\b[^}]*\}\s*from/.test( code );
+  const callsLog = /(?<![.\w])log\(/.test( code );
+
+  assert.ok( ! callsLog || importsLog,
+    'voice-engines.js calls log() without importing it. Every branch reaching '
+    + 'that call throws ReferenceError, and the surrounding catch turns it into '
+    + 'a synthesis failure.' );
+} );
+
 test( 'AC3: the resolved text is used only for synthesis', () => {
   // Asserted at the call site, because that is where the property lives: the
   // engines pass the resolved string onward and never write it back.
