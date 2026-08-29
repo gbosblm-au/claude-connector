@@ -1717,7 +1717,20 @@ app.use(compression({
 // the global parser has already rejected.
 // ---------------------------------------------------------------------------
 const SMALL_BODY_LIMIT = process.env.MCP_BODY_LIMIT       || "2mb";
-const LARGE_BODY_LIMIT = process.env.MCP_LARGE_BODY_LIMIT || "50mb";
+
+// v13.24.0: raised from 50mb to 72mb alongside MAX_UPLOAD_SIZE going to 50 MB.
+//
+// /data/upload receives the file as base64 inside a JSON envelope. Base64
+// inflates by roughly 4/3, so a 50 MB file arrives as about 67 MB of body, plus
+// the filename, mime type and TTL fields. At the old 50mb ceiling express would
+// have rejected every upload over ~36 MB before the route ran, and the handler's
+// own MAX_UPLOAD_SIZE check would never have been reached -- the operator would
+// see an opaque 413 from the parser rather than the handler's
+// error_kind: 'too_large' response that names the limit.
+//
+// 72mb leaves headroom above the 67 MB worst case so the ceiling that actually
+// refuses a file is MAX_UPLOAD_SIZE, in one place, with a useful message.
+const LARGE_BODY_LIMIT = process.env.MCP_LARGE_BODY_LIMIT || "72mb";
 
 /** Paths permitted to send a large request body. */
 const LARGE_BODY_PATHS = [
@@ -2450,7 +2463,21 @@ app.post("/upload/connections", async (req, res) => {
 // Returns: { success, filepath, filename, size, mime_type, expires_at }
 // -----------------------------------------------------------------------
 const USER_DATA_UPLOAD_DIR = process.env.USER_DATA_UPLOAD_DIR || '/data/uploads/';
-const MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '10485760', 10); // 10MB default
+
+// v13.24.0: default raised from 10 MB (10485760) to 50 MB.
+//
+// This value and the browser's window.TI_UPLOAD_MAX_BYTES are deliberately the
+// same number. When the client ceiling is the smaller of the pair the user gets
+// an immediate rejection naming the limit; when it is the larger, the bytes are
+// uploaded and refused here with a 413 the client can only report second-hand.
+// Keeping them equal means the first path is always the one taken.
+//
+// Raising this alone does NOT admit larger files. The request body is base64,
+// which inflates roughly 4/3, so a 50 MB file arrives as ~67 MB of JSON and is
+// rejected by express before this handler runs unless MCP_LARGE_BODY_LIMIT is
+// large enough to carry it. The two are changed together; see the body-parsing
+// section above.
+const MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || '52428800', 10); // 50MB default
 const DEFAULT_TTL_HOURS = 24;
 
 // ---------------------------------------------------------------------------
