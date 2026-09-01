@@ -223,6 +223,81 @@ function validateContentPath(rawPath, allowedExtensions) {
 }
 
 // ---------------------------------------------------------------------------
+// SPEC-FIX-MODULE-WRITE-001: module path normalisation.
+//
+// THE BUG
+// -------
+// module_write's base already resolves to /data/skill/ava/modules/, and then
+// join()ed whatever the caller passed onto it. So the two spellings a caller
+// might reasonably use resolved to DIFFERENT physical files:
+//
+//   'meta/x.md'          -> /data/skill/ava/modules/meta/x.md          (right)
+//   'modules/meta/x.md'  -> /data/skill/ava/modules/modules/meta/x.md  (wrong)
+//
+// Both reported success. That is what makes it dangerous rather than merely
+// wrong: nothing errored, a file was written, and the only signal was the
+// resolved-path field in a response that said the write had worked.
+//
+// A SECOND CONSEQUENCE, not in the original spec but found while fixing it:
+// the bad path also poisoned the MANIFEST ENTRY. deriveModuleEntry() takes
+// category from the first path segment and sets path to `modules/${cleanPath}`
+// (see manifest-fragments.js:511 and :552). With the 'modules/' prefix left on,
+// the registration came out as category 'modules' and path
+// 'modules/modules/meta/x.md' -- so the manifest pointed at the double-nested
+// copy and filed the module under a category that does not exist. Normalising
+// before deriveModuleEntry() is what repairs that, and is why the normalisation
+// belongs here rather than only at the join.
+//
+// THE FIX
+// -------
+// Make the base and the caller agree on who owns the 'modules/' segment: the
+// base does. Strip it from the input, then join the remainder.
+//
+// Repeated stripping, not a single pass. A single strip leaves
+// 'modules/modules/meta/x.md' as 'modules/meta/x.md', which joins back to the
+// double-nested path -- i.e. it would fail the exact acceptance criterion this
+// fix exists to satisfy. The trade-off is that a module category literally
+// named 'modules' becomes unaddressable. That is acceptable and deliberate: no
+// such category exists (the shipped tree has self-model/, and MANIFEST_APPEND
+// contains no 'modules' category), and a category by that name would be
+// ambiguous with the base directory by construction.
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalise a caller-supplied module path to a base-relative one.
+ *
+ * Idempotent: normaliseModulePath(normaliseModulePath(p)) === normaliseModulePath(p).
+ *
+ * @param {string} rawPath Caller-supplied path, with or without a modules/ prefix.
+ * @returns {string} The path relative to the modules/ base.
+ */
+export function normaliseModulePath(rawPath) {
+  if (!rawPath || typeof rawPath !== 'string') {
+    throw new ToolValidationError('file is required and must be a non-empty string');
+  }
+
+  let p = rawPath.trim().replace(/\\/g, '/');
+
+  // Collapse duplicate separators BEFORE the prefix strip, so 'modules//meta/x.md'
+  // -- one of the two stray copies the spec records on the volume -- normalises
+  // like every other spelling instead of being rejected by validateContentPath's
+  // double-slash rule. Collapsing empty segments cannot introduce traversal;
+  // '..' is still rejected by the validator below.
+  p = p.replace(/\/{2,}/g, '/');
+
+  // Strip leading './' and '/' and 'modules/', in any order and any number of
+  // repetitions, until the string is stable.
+  for (;;) {
+    const before = p;
+    p = p.replace(/^\.\//, '').replace(/^\/+/, '').replace(/^modules\//i, '');
+    if (p === before) break;
+  }
+
+  if (!p) throw new ToolValidationError(`file "${rawPath}" resolves to an empty module path`);
+  return p;
+}
+
+// ---------------------------------------------------------------------------
 // WordPress backup helper
 // ---------------------------------------------------------------------------
 
@@ -393,6 +468,10 @@ export const moduleWriteToolDefinition = {
     'Write or overwrite a module file on the Railway volume by its relative path within modules/ ' +
     '(e.g. "music-analysis/music-analysis-somatic.md" or "philosophy/new-topic.md"). ' +
     'Use this to directly edit or create modular skill files without leaving Claude. ' +
+    'PATH CONVENTION: pass the path WITHOUT a "modules/" prefix. The prefix is stripped ' +
+    'automatically if present, so "meta/x.md" and "modules/meta/x.md" both resolve to the same ' +
+    'canonical file /data/skill/ava/modules/meta/x.md; the unprefixed form is the convention. ' +
+    'The response reports resolved_path, which is the authoritative record of where the write landed. ' +
     'v12.21.0: writing a .md module AUTOMATICALLY registers it in a manifest fragment under ' +
     'references/manifest/ (per MANIFEST_DIRECTORY_PROTOCOL.md), so skill_compile, skill_recompile, ' +
     'skill_load_specialist, and brain_scan catalog it immediately — no manual MANIFEST.json edit and ' +
@@ -411,7 +490,7 @@ export const moduleWriteToolDefinition = {
   inputSchema: {
     type: 'object',
     properties: {
-      file:        { type: 'string', description: 'Relative path within modules/ directory, e.g. "music-analysis/music-analysis-somatic.md". Must be category/filename.md or filename.md. No leading slash.' },
+      file:        { type: 'string', description: 'Path relative to the modules/ directory, WITHOUT a "modules/" prefix — e.g. "meta/meta-deflection-watch.md" or "music-analysis/music-analysis-somatic.md". Must be category/filename.md or filename.md. No leading slash. A "modules/" prefix is stripped automatically if you include one, so both spellings write to the same canonical file, but the unprefixed form is the convention.' },
       content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change (used for WP backup metadata). Optional.' },
       force:       { type: 'boolean', description: 'Set to true to confirm overwrite of an EXISTING file. Only accepted after Brian has been notified and has explicitly confirmed the overwrite. Do NOT pass true speculatively. Default: false.' },
@@ -575,7 +654,13 @@ export async function handleModuleWrite(args) {
         };
       }
     }
-    cleanPath = validateContentPath(file, ['md', 'json']);
+    // SPEC-FIX-MODULE-WRITE-001 §4.1. Normalise BEFORE validation, so a
+    // 'modules/'-prefixed spelling and a bare one become the same string and
+    // therefore resolve to the same physical file. Everything downstream --
+    // the join below, the overwrite guard, the manifest entry, the WP backup
+    // and the log lines -- reads cleanPath, so normalising once here is what
+    // makes them all agree.
+    cleanPath = validateContentPath(normaliseModulePath(file), ['md', 'json']);
   } catch (err) {
     if (err instanceof ToolValidationError) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }], isError: true };
@@ -584,7 +669,56 @@ export async function handleModuleWrite(args) {
   }
 
   const paths      = getContentPaths();
-  const fullPath   = join(paths.modulesDir, cleanPath);
+
+  // SPEC-FIX-MODULE-WRITE-001 §4.1, containment half.
+  //
+  // resolveContained rather than a bare join(), for the same reason
+  // writeContentFile() uses it (v12.28.0, TNX-C-005): join() is lexical and
+  // will happily place a file through a symlinked intermediate directory. This
+  // handler was the one write path in this file still doing a bare join, so it
+  // was also the one without the guard its siblings have.
+  //
+  // It handles a not-yet-existing target -- the normal case for a create -- by
+  // walking to the deepest existing ancestor and verifying THAT is physically
+  // inside the base.
+  const fullPath = resolveContained(paths.modulesDir, cleanPath);
+  if (!fullPath) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: `Path escapes the modules directory, or resolves through a symbolic link: ${cleanPath}`,
+          code:  'validation_error',
+          requested_file: file ?? null,
+        }, null, 2),
+      }],
+      isError: true,
+    };
+  }
+
+  // §7, regression guard. The whole point of the normalisation is that this
+  // can never happen; asserting it at the write boundary means a future edit
+  // that reintroduces the double-nest fails loudly here instead of silently
+  // writing to the wrong place and reporting success, which is precisely how
+  // the original bug survived.
+  if (/(^|\/)modules\/modules(\/|$)/.test(fullPath.replace(/\\/g, '/'))) {
+    log('error', `[module_write] REFUSED double-nested path: ${fullPath} (from "${file}")`);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: 'Refused: the resolved path is double-nested under modules/modules/. '
+            + 'This is the SPEC-FIX-MODULE-WRITE-001 regression guard; the write was NOT performed.',
+          code:           'module_path_double_nested',
+          requested_file: file ?? null,
+          normalised_file: cleanPath,
+          resolved_path:  fullPath,
+        }, null, 2),
+      }],
+      isError: true,
+    };
+  }
+
   const dir        = dirname(fullPath);
   const wpSkillUrl = (process.env.WP_SKILL_URL || '').replace(/\/$/, '');
   const wpSkillKey = process.env.WP_SKILL_KEY || '';
@@ -625,6 +759,12 @@ export async function handleModuleWrite(args) {
           reason:       `File already exists at modules/${cleanPath} (${lineCount} lines, ${sizeKb}KB). Overwrite blocked by safety guardrail.`,
           existing_file: {
             path:          `modules/${cleanPath}`,
+            // SPEC-FIX-MODULE-WRITE-001 §4.2: the fully resolved physical path
+            // is the authoritative record of WHICH file is being reported on.
+            // The blocked branch needs it as much as the success branch does --
+            // "this file already exists" is only actionable if you know which
+            // file on disk it means.
+            resolved_path: fullPath,
             line_count:    lineCount,
             size_kb:       parseFloat(sizeKb) || 0,
             last_modified: lastModified,
@@ -635,7 +775,11 @@ export async function handleModuleWrite(args) {
             '3. Wait for Brian\'s explicit confirmation.',
             '4. Then call module_write again with force: true.',
           ],
-          diagnostics: { resolved_file: file ?? null, force_requested: force },
+          diagnostics: {
+            resolved_file:   file ?? null,
+            normalised_file: cleanPath,
+            force_requested: force,
+          },
           note: 'New files (non-existing paths) are created immediately without force: true.',
         }, null, 2),
       }],
@@ -718,6 +862,15 @@ export async function handleModuleWrite(args) {
         action:     isNew ? 'created' : 'overwritten',
         line_count: content.split('\n').length,
         path:       fullPath,
+        // SPEC-FIX-MODULE-WRITE-001 §4.2. `path` above already carried the
+        // resolved location, and it is what caught this bug in the first place
+        // -- but only because someone read it on a response that said success.
+        // These two make the normalisation legible instead of implicit: what
+        // was asked for, and what it became. When they differ, the caller can
+        // see the prefix was stripped rather than having to infer it.
+        requested_file:  file ?? null,
+        normalised_file: cleanPath,
+        resolved_path:   fullPath,
         manifest_registration: manifestResult,
         wp_backup:  formatWpResult(wpResult),
         note: manifestResult.registered
