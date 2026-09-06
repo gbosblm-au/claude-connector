@@ -347,6 +347,18 @@ export async function handleWpMemoryGetSessionContext(rawArgs) {
   const result = await wpFetch(`/session-context?${params.toString()}`);
 
   // Return the response in the exact shape the connector's callers expect.
+  //
+  // SPEC-2026-09-06 Section 3.5. This is an explicit field whitelist, not a
+  // spread, so a field added upstream is DROPPED here rather than forwarded.
+  // The gateway's new `tiered` array would therefore have been assembled,
+  // serialised, sent, and then discarded one function short of the model --
+  // the retrieval would have looked correct in every gateway log and changed
+  // nothing the model could see.
+  //
+  // `tiered` is defaulted to an empty array rather than left undefined so that
+  // a gateway running a pre-tiering build (or the WordPress memory router,
+  // which has not been ported yet) yields a readable empty result instead of
+  // an absent key that a caller would have to guard.
   return {
     context:             result.context,
     assembled_at:        result.assembled_at,
@@ -356,6 +368,7 @@ export async function handleWpMemoryGetSessionContext(rawArgs) {
     conversations_tiers: result.conversations_tiers ?? {
       exact: 0, related: 0, associative: 0, recency: 0,
     },
+    tiered:              Array.isArray( result.tiered ) ? result.tiered : [],
   };
 }
 
