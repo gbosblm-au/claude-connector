@@ -275,3 +275,90 @@ Expect `char_count` ≈ 243,978 while your read stays at `max_chars`, and
 `WEB_SOURCE_INGEST_TIMEOUT_MS` aside and instead watch for
 `[web-source-auto] REFUSED stream-truncated page` in the gateway log; no row
 should appear.
+
+---
+
+## Addendum — pre-ship probes
+
+Four probes were run against the shipped artifacts before release.
+
+### 1. The forward never blocks the turn
+
+Measured, not asserted. Against a gateway deliberately stalling 5000 ms,
+`handleWebFetchPage` returned in **1154 ms** with the full clipped payload
+intact. The call is not awaited; the promise floats.
+
+Against a gateway on a closed port (ECONNREFUSED), the fetch returned in 838 ms,
+the failure was logged at WARN, and **zero unhandled rejections** were raised —
+the whole forwarder body is inside one try/catch, so it cannot reject.
+
+This holds for pages that will be refused as much as for pages that will be
+stored: the connector does not know which is which, and neither costs the turn
+any latency.
+
+### 2. Body limits, proven over real HTTP
+
+The decisive check sends an **identical 3 MB payload** to both routes:
+
+```
+ingest        2,000,000 chars  -> 200
+profile-write 2,000,000 chars  -> 413 entity.too.large
+ingest        9,000,000 chars  -> 413 entity.too.large  (over the 8 MB parser)
+```
+
+**Terminology correction:** the route is on `LARGE_BODY_PATTERNS`, **not**
+`LARGE_BODY_PREFIXES`. That is deliberate and load-bearing. A `/ti-tools` prefix
+would have widened `profile-write` too, and the pair above is the proof that it
+did not.
+
+**A defect was found in `verify-gateway-body-limits.mjs` while confirming this,
+and fixed.** That script's header promises its lists are "re-derived from the
+shipped source... A drift between this test and server.js therefore fails the
+test rather than passing silently". True for `LARGE_BODY_PREFIXES`. **Not true
+for `LARGE_BODY_PATTERNS`, which was a hardcoded literal copy** holding only the
+chef-photo pattern. It disagreed with `server.js` the moment a pattern was
+added, and would have reported a correct route as misrouted.
+
+It now derives the list from source, with comments stripped before evaluation.
+Twelve new checks were added to that script rather than leaving a throwaway
+probe. `CHAT_BODY_PATTERNS` remains partially hardcoded — **reported, not
+changed**, as it is outside this release.
+
+**Reuse Audit miss, recorded.** `verify-gateway-body-limits.mjs` already existed
+and does exactly this job. It was not found in the original audit, and a
+standalone probe was written that duplicated it. The probe was discarded and its
+checks folded into the existing script.
+
+### 3. http/https duplication — parked, with a name attached
+
+Not theoretical, but narrower than it looks. Most sites redirect, so `finalUrl`
+lands on https and no duplicate occurs:
+
+```
+http://kubernetes.io/docs/home/                 -> https://kubernetes.io/docs/home/
+http://www.postgresql.org/docs/.../sql-insert   -> https://www.postgresql.org/...
+http://nodejs.org/api/fs.html                   -> http://nodejs.org/api/fs.html
+```
+
+**`nodejs.org` does not redirect.** It is a live high-authority example that
+would store twice, once per scheme. Parked deliberately: collapsing the schemes
+asserts a plain HTTP page and its TLS counterpart are provably the same
+document, which is not always true. The change belongs in `canonicaliseUrl` with
+its own tests. A test pins the current behaviour so the decision stays visible.
+
+### 4. Four-marker version check
+
+| Marker | Gateway | Connector |
+|---|---|---|
+| Archive | `ts-gateway-v2.181.0-…` ✓ | `claude-connector-v13.26.0-…` ✓ |
+| CHANGELOG | `CHANGELOG-v2.181.0.md` ✓ | `CHANGELOG-v13.26.0.md` ✓ |
+| Code marker | 8 refs, all v2.181.0 ✓ | 9 refs, all v13.26.0 ✓ |
+| package.json | 2.181.0 ✓ | 13.26.0 ✓ |
+
+The check confirmed the collision caught earlier was real: `CHANGELOG-v12.30.0.md`
+**already exists** in the connector, so the original v12.30.0 label would have
+overwritten shipped history.
+
+`CHANGELOG-v2.180.0.md` gained a **SUPERSEDED** banner: it describes a hook that
+no longer exists, and read standalone it would mislead. Kept as history because
+the v2.180.1 build-failure post-mortem is still the record of that incident.
