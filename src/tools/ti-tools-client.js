@@ -18,7 +18,12 @@ import { getCurrentUser } from "../tools-self-model/sessionContext.js";
 
 const GATEWAY_URL = (process.env.GATEWAY_URL || process.env.TS_TENANT_GATEWAY_URL || "").replace(/\/$/, "");
 const ADMIN_KEY   = (process.env.GATEWAY_ADMIN_KEY || "").trim();
+// Default per-call budget. v13.26.0 made it overridable per call rather than
+// raising it globally: the profile endpoints are small and fast and should keep
+// failing quickly, while a full-page ingest carries megabytes and a Postgres
+// transaction. All four pre-existing callers are unaffected.
 const TIMEOUT_MS  = 5000;
+const INGEST_TIMEOUT_MS = parseInt(process.env.WEB_SOURCE_INGEST_TIMEOUT_MS || "20000", 10);
 
 /** True when the connector is configured to reach the gateway ti-tools API. */
 export function gatewayConfigured() {
@@ -52,7 +57,7 @@ export function resolveSessionIdentity(context = null, args = null) {
   return { tenantId, userId };
 }
 
-async function callGateway(method, path, { body = null, query = null } = {}) {
+async function callGateway(method, path, { body = null, query = null, timeoutMs = TIMEOUT_MS } = {}) {
   if (!gatewayConfigured()) {
     const err = new Error("gateway_not_configured");
     err.code = "gateway_not_configured";
@@ -67,7 +72,7 @@ async function callGateway(method, path, { body = null, query = null } = {}) {
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetch(url, {
       method,
@@ -153,4 +158,36 @@ export async function assistantNameRemote(tenantId, userId) {
     throw err;
   }
   return json || { assistant_name: "Ava", source: "default" };
+}
+
+/**
+ * Forward a fetched page's FULL text to the gateway for passive ingestion.
+ * v13.26.0.
+ *
+ * Sends the page and nothing else. There is deliberately no tenant_id, no
+ * user_id, no session and no query in this body: the stored artefact is the
+ * public page, and the gateway attaches no identity to it either (it never
+ * passes confirmedBy, so web_sources.confirmed_by stays NULL by construction).
+ *
+ * The gateway answers 200 with `ingested: false` for a page its authority gate
+ * declines. That is a normal outcome, NOT an error, and is why this returns the
+ * body rather than throwing on a refusal -- the connector holds no authority
+ * model and must not infer one from status codes.
+ *
+ * @param {{url: string, text: string, title?: string|null,
+ *          stream_truncated?: boolean}} payload
+ * @returns {Promise<object>} The gateway's decision.
+ * @throws on network failure, timeout, or a non-2xx response.
+ */
+export async function webSourceIngestRemote(payload) {
+  const { status, ok, json } = await callGateway("POST", "/ti-tools/web-source-ingest", {
+    body: payload,
+    timeoutMs: INGEST_TIMEOUT_MS,
+  });
+  if (!ok) {
+    const err = new Error(`web-source-ingest failed: HTTP ${status}`);
+    err.status = status;
+    throw err;
+  }
+  return json || { ingested: false, reason: "no_response_body" };
 }

@@ -21,10 +21,37 @@ import { log } from "../utils/logger.js";
 import { truncate } from "../utils/helpers.js";
 import * as cheerio from "cheerio";
 import { safeFetch } from "../utils/safeFetch.js";
+import { forwardFetchedPage } from "./webSourceForward.js";
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_MAX_CHARS = 50000;
 const ABSOLUTE_MAX_CHARS = 200000;
+
+// v13.26.0 -- response byte cap for the underlying fetch.
+//
+// This WAS `ABSOLUTE_MAX_CHARS * 4` (800 KB), derived from a UTF-8 worst case
+// for the MODEL-FACING char cap. That derivation was wrong in kind: the cap
+// applies to the raw HTML, and HTML is far larger than the text extracted from
+// it. Measured against real high-authority pages the HTML-to-text ratio ran
+// 2.2 to 8.2 for text-rich documents (postgresql.org 2.2, docs.python.org 4.1,
+// nodejs.org 4.5, developer.mozilla.org 6.2, en.wikipedia.org 8.2).
+//
+// At 800 KB the cap was ALREADY being hit by ordinary documentation:
+// nodejs.org/api/fs.html is ~1.1 MB of HTML. safeFetch does not throw on it --
+// it stops reading and returns the partial body (`truncated = true;
+// res.destroy()`) -- so that page was being cut mid-stream, parsed by cheerio
+// as though complete, and reported as complete.
+//
+// Derivation of 8 MB: the binding case is a text-rich page at the worst
+// observed ratio, 8.2. To fetch whole any page extracting to ABSOLUTE_MAX_CHARS
+// needs 200,000 * 8.2 = 1.63 MB; a 4x headroom multiple gives ~6.5 MB, rounded
+// to 8 MB. That is 40x the text ceiling in bytes, so for any ratio below 40 the
+// TEXT ceiling is reached before the byte cap and the page is extracted whole.
+// Above ratio 40 a page is text-poor and nothing meaningful is lost.
+//
+// 8 MB also sits BELOW safeFetch's own DEFAULT_MAX_BYTES of 10 MB, so this is
+// not an escalation past what that module already treats as safe to buffer.
+const FETCH_MAX_BYTES = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -55,7 +82,7 @@ async function fetchWithTimeout(url, timeoutMs) {
     // The total budget covers every redirect hop, not just the first request,
     // so a redirect chain cannot be used to exceed the caller's timeout.
     timeoutMs,
-    maxBytes: ABSOLUTE_MAX_CHARS * 4,   // UTF-8 worst case for the char cap below
+    maxBytes: FETCH_MAX_BYTES,   // see the derivation at FETCH_MAX_BYTES
   });
 }
 
@@ -256,8 +283,32 @@ export async function handleWebFetchPage(args) {
   const headings = includeHeadings ? extractHeadings($) : [];
   const links = includeLinks ? extractLinks($, finalUrl) : [];
 
-  // Extract main text AFTER cheerio has been manipulated for headings/links
-  let mainText = extractMainText($);
+  // Extract main text AFTER cheerio has been manipulated for headings/links.
+  //
+  // v13.26.0 -- the FULL extraction is retained. It used to be destroyed by
+  // reassignment on the next line, so the complete body existed for one
+  // statement and was then unrecoverable. It is now kept, because storage and
+  // reading are decoupled: the store holds the whole page, the model reads a
+  // clipped view. THE CLIP GOVERNS ONLY WHAT IS READ, NEVER WHAT IS REMEMBERED.
+  const fullText = extractMainText($);
+
+  // v13.26.0 -- safeFetch's stream cut, surfaced at last.
+  //
+  // safeFetch stops reading at its maxBytes cap and returns the PARTIAL body
+  // rather than throwing (safeFetch.js: `truncated = true; res.destroy()`). It
+  // reports this on the response object, and this file never read it. The
+  // consequence was that an oversized page was parsed by cheerio as though
+  // complete and handed to the model as complete, with `truncated: false`
+  // whenever the extracted fragment happened to fit under max_chars.
+  //
+  // This is a DIFFERENT failure from the char clip below and the two must not
+  // be conflated. The clip means "the page was fetched whole, your view is
+  // short". The stream cut means "the HTML itself is incomplete, what you are
+  // reading is a prefix of the page and the rest is missing".
+  const streamTruncated = resp.truncated === true;
+
+  // The model-facing view. Clipped for reading only.
+  let mainText = fullText;
   let truncated = false;
   if (mainText.length > maxChars) {
     mainText = mainText.slice(0, maxChars);
@@ -279,7 +330,23 @@ export async function handleWebFetchPage(args) {
     meta_description: metaDescription || null,
     headings: includeHeadings ? headings : undefined,
     text_length: mainText.length,
+    // v13.26.0: how much text the page actually yielded, so a clipped read is
+    // legible as "you got 50,000 of 244,000" rather than just "clipped".
+    full_text_length: fullText.length,
     truncated,
+    // v13.26.0: the stream cut. See streamTruncated above. Always present so
+    // its ABSENCE can never be read as "complete" by a consumer that predates
+    // the field -- a false value is an assertion, a missing key is not.
+    stream_truncated: streamTruncated,
+    // Stated in prose as well as a flag, because a boolean in a JSON blob is
+    // easy to skim past and reading a prefix as though it were the page is
+    // exactly the error this is here to prevent.
+    note: streamTruncated
+      ? "INCOMPLETE PAGE. The HTTP response exceeded the fetch byte cap and was " +
+        "cut mid-body, so the HTML parsed here is a fragment and the text below " +
+        "is a prefix of the page, not the whole of it. Do not treat absence of " +
+        "content as evidence the page does not contain it."
+      : undefined,
     max_chars: maxChars,
     links: includeLinks ? links : undefined,
     text: mainText,
@@ -289,6 +356,26 @@ export async function handleWebFetchPage(args) {
   const clean = Object.fromEntries(
     Object.entries(out).filter(([, v]) => v !== undefined)
   );
+
+  // v13.26.0 -- fetch-triggered passive ingestion.
+  //
+  // Forwards the FULL extracted text to the gateway, which gates it on
+  // authority and stores it. Deliberately NOT part of `clean`: this result is
+  // returned verbatim to the model, and putting the full body in it would
+  // defeat max_chars and flood the context window. Storage and reading are
+  // decoupled, and this is the line where they part.
+  //
+  // Fire-and-forget and never throws: a store that is down must not cost the
+  // caller the page it asked for. NO authority decision is made here -- the
+  // connector has no authority model and must not grow one. It forwards
+  // unconditionally and the gateway's ingestionDecision remains sole
+  // authority, so there is exactly one gate to keep correct.
+  forwardFetchedPage({
+    url: finalUrl,
+    title: pageTitle,
+    text: fullText,
+    streamTruncated,
+  });
 
   return { content: [{ type: "text", text: JSON.stringify(clean, null, 2) }] };
 }
