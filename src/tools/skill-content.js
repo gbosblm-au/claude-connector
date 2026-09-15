@@ -38,11 +38,21 @@ import {
   existsSync,
   readdirSync,
   statSync,
+  // v13.27.0: the module index walk needs lstat, not stat. statSync follows a
+  // symbolic link, so a symlinked directory inside modules/ would be descended
+  // into, defeating the containment property resolveContained enforces on the
+  // read path and risking a cycle. lstatSync reports the link itself.
+  lstatSync,
 } from 'node:fs';
 // v12.28.0: `resolve` and `sep` were imported for the inline FIX 8 traversal
 // guard. That guard now delegates to resolveContained, so both are orphaned
 // and are removed rather than left as dead imports.
 import { join, basename, dirname } from 'node:path';
+// v13.27.0 (SPEC-SOCIAL-003 §3, §14). module_resolve reports a content hash per
+// entry so a caller can tell a shadow copy from the intended file by something
+// stronger than a byte count, and so the gateway can stamp a bundle version
+// derived from what it actually read rather than from what it asked for.
+import { createHash } from 'node:crypto';
 // v12.28.0 (TNX-C-005): shared boundary-correct containment helper. See
 // src/utils/pathContainment.js for why String.prototype.startsWith is not a
 // directory boundary test and why symlink refusal is a separate, necessary
@@ -1093,3 +1103,549 @@ function buildRestoreHandler(sectionLabel, getDirFn, validateFn) {
 export const handleArchiveRestoreFromWp   = buildRestoreHandler('archive',    p => p.archiveDir,    validateFilename);
 export const handleReferenceRestoreFromWp = buildRestoreHandler('references', p => p.referencesDir, p => validateContentPath(p, ['md', 'txt', 'json']));
 export const handleScriptRestoreFromWp    = buildRestoreHandler('scripts',    p => p.scriptsDir,    p => validateContentPath(p, ['py', 'sh', 'js', 'mjs', 'cjs', 'ts', 'txt', 'md', 'json']));
+
+// ===========================================================================
+// v13.27.0 — module_read and module_resolve   (SPEC-SOCIAL-003 v1.1 §3, §14)
+// ===========================================================================
+//
+// WHY THESE EXIST
+// ---------------
+// Until now the only way to obtain a module's CONTENT was skill_load_specialist,
+// which takes a bare module_id and resolves it through MANIFEST.json. That is
+// correct for session dispatch and wrong for a closed allowlist, because a bare
+// id resolves through whatever the loader finds first and the failure is
+// silent: the load succeeds, and a different file shaped the output.
+//
+// The risk is not hypothetical on this volume. The modules tree carries
+// divergent duplicates, including modules/modules/philosophy/phil-identity-parfit.md
+// and modules/modules/meta/meta-deflection-watch.md, both of which shadow
+// modules the Response Studio bundle names by path. The double-nested tree is
+// the residue of the module_write bug that SPEC-FIX-MODULE-WRITE-001 fixed; the
+// fix stopped new ones being created and did not remove the ones already there.
+//
+// So: module_read addresses a file by path and reads exactly that file, and
+// module_resolve reports whether the path resolves and what else on the tree
+// carries the same basename. The second is the diagnostic that makes a shadow
+// visible without reading the server.
+//
+// NEITHER TOOL WRITES. They are absent from SYSTEM_WRITE_TOOLS deliberately, so
+// a non-owner tenant can read the modules that shape its own session while
+// still being unable to modify them.
+
+/**
+ * Maximum files one module_read call may return.
+ *
+ * The Response Studio bundle is about twenty entries, and a compose call needs
+ * all of them. Twenty HTTP round trips to the connector at the gateway's 30 s
+ * per-call ceiling is not a viable shape, so the read batches. The cap is a
+ * little above the largest legitimate bundle rather than unbounded, because an
+ * unbounded batch is a whole-tree fetch wearing a different name.
+ *
+ * @returns {number}
+ */
+function moduleReadMaxFiles() {
+  const raw = parseInt(process.env.MODULE_READ_MAX_FILES || '40', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 40;
+}
+
+/**
+ * Maximum total characters one module_read call may return.
+ *
+ * A second, independent ceiling. The file cap alone does not bound the response
+ * because file sizes vary by two orders of magnitude across this tree, and the
+ * consumer of this payload is a model context window.
+ *
+ * @returns {number}
+ */
+function moduleReadMaxTotalChars() {
+  const raw = parseInt(process.env.MODULE_READ_MAX_TOTAL_CHARS || '1048576', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1048576;
+}
+
+/**
+ * Maximum files the shadow index will walk before giving up.
+ *
+ * The modules tree holds a few hundred files. A cap exists so that a
+ * misconfigured SKILL_FILE_PATH pointing at, say, a node_modules tree degrades
+ * into a reported partial index rather than a request that never returns.
+ *
+ * @returns {number}
+ */
+function moduleIndexMaxFiles() {
+  const raw = parseInt(process.env.MODULE_INDEX_MAX_FILES || '5000', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 5000;
+}
+
+/**
+ * SHA-256 of a string, hex encoded.
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+function sha256(content) {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+/**
+ * Walk the modules tree once and index every file by basename.
+ *
+ * Returns base-relative paths with forward slashes on every platform, because
+ * the caller compares them against bundle entries, which are written with
+ * forward slashes.
+ *
+ * Directory symlinks are not followed. statSync would resolve one and the walk
+ * would descend through it, which both breaks the containment property the read
+ * path enforces and risks a cycle. lstatSync reports the link itself, so a
+ * symlinked directory is simply skipped.
+ *
+ * @param {string} modulesDir Absolute path to the modules root.
+ * @returns {{ index: Map<string, string[]>, fileCount: number, truncated: boolean }}
+ */
+function buildModuleIndex(modulesDir) {
+  const index = new Map();
+  const limit = moduleIndexMaxFiles();
+  let fileCount = 0;
+  let truncated = false;
+
+  /**
+   * @param {string} dir     Absolute directory to read.
+   * @param {string} relBase Base-relative prefix for entries in that directory.
+   * @returns {void}
+   */
+  function walk(dir, relBase) {
+    if (truncated) return;
+    let entries;
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      // An unreadable directory is reported by omission rather than by throwing.
+      // A permissions fault on one subtree must not fail a resolve for entries
+      // that live elsewhere.
+      return;
+    }
+    for (const entry of entries) {
+      if (truncated) return;
+      const full = join(dir, entry);
+      const rel = relBase ? `${relBase}/${entry}` : entry;
+      let st;
+      try {
+        st = lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) {
+        walk(full, rel);
+        continue;
+      }
+      if (!st.isFile()) continue;
+      fileCount += 1;
+      if (fileCount > limit) {
+        truncated = true;
+        log('warn', `[module_resolve] module index truncated at ${limit} files under ${modulesDir}`);
+        return;
+      }
+      const key = basename(entry);
+      const list = index.get(key);
+      if (list) list.push(rel);
+      else index.set(key, [rel]);
+    }
+  }
+
+  if (existsSync(modulesDir)) walk(modulesDir, '');
+  return { index, fileCount, truncated };
+}
+
+/**
+ * Collect the caller's requested paths from either the single or the batch key.
+ *
+ * Accepts `file`, `filename` or `path` for one entry (matching module_write's
+ * argument aliasing, since the same callers address both tools), or `files` /
+ * `paths` for a batch. Mixing the two is accepted and the results are unioned,
+ * because rejecting it would be a validation failure with no safety value.
+ *
+ * @param {object} args
+ * @returns {string[]} Raw, un-normalised paths in caller order, de-duplicated.
+ * @throws {ToolValidationError} When no usable path was supplied.
+ */
+function collectRequestedModulePaths(args) {
+  const raw = [];
+  const single = firstStringKey(args, 'file', 'filename', 'path');
+  if (single) raw.push(single);
+
+  for (const key of ['files', 'paths']) {
+    const list = args && args[key];
+    if (list === undefined || list === null) continue;
+    if (!Array.isArray(list)) {
+      throw new ToolValidationError(`${key} must be an array of strings`);
+    }
+    for (const item of list) {
+      if (typeof item !== 'string' || item.trim() === '') {
+        throw new ToolValidationError(`${key} must contain only non-empty strings`);
+      }
+      raw.push(item.trim());
+    }
+  }
+
+  if (!raw.length) {
+    throw new ToolValidationError(
+      'A module path is required. Supply `file` for one module, or `files` for several, '
+      + 'each relative to the modules root (e.g. "voice/voice-reply-shapes.md").'
+    );
+  }
+
+  // De-duplicate on the NORMALISED form, so 'modules/voice/x.md' and
+  // 'voice/x.md' are recognised as the same request and the file is read once.
+  const seen = new Set();
+  const out = [];
+  for (const candidate of raw) {
+    let key;
+    try {
+      key = normaliseModulePath(candidate);
+    } catch {
+      // Leave an invalid path in the list so the per-entry error path reports it
+      // by its original spelling rather than silently dropping it here.
+      key = `\u0000invalid:${candidate}`;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
+}
+
+/**
+ * Resolve one caller-supplied module path to a contained absolute path.
+ *
+ * Normalisation runs BEFORE validation for the same reason module_write does it
+ * in that order: a 'modules/'-prefixed spelling and a bare one must become the
+ * same string, or the two spellings address two different physical files.
+ *
+ * @param {string} modulesDir Absolute modules root.
+ * @param {string} rawPath    Caller-supplied path.
+ * @returns {{ normalised: string, fullPath: string }}
+ * @throws {ToolValidationError} On an invalid, traversing or symlinked path.
+ */
+function resolveModulePath(modulesDir, rawPath) {
+  const normalised = validateContentPath(normaliseModulePath(rawPath), ['md', 'json']);
+  const fullPath = resolveContained(modulesDir, normalised);
+  if (!fullPath) {
+    throw new ToolValidationError(
+      `Path escapes the modules directory, or resolves through a symbolic link: ${normalised}`
+    );
+  }
+  return { normalised, fullPath };
+}
+
+export const moduleReadToolDefinition = {
+  name: 'module_read',
+  description:
+    'Read one or more skill module files from the Railway volume BY PATH, relative to the modules root '
+    + '(e.g. "voice/voice-reply-shapes.md" or "philosophy/phil-identity-parfit.md"). Unlike '
+    + 'skill_load_specialist, which resolves a bare module id through MANIFEST.json and can silently load '
+    + 'a shadow copy when the tree contains duplicates, this reads exactly the file named. Use it when the '
+    + 'exact file matters: a versioned module allowlist, an audit, or a diff against a duplicate. '
+    + 'Pass `file` for one module or `files` for several in one call. Read-only.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      file: {
+        type: 'string',
+        description: 'One module path relative to the modules root, e.g. "humour/humour-aside-register.md". A leading "modules/" is accepted and stripped.',
+      },
+      files: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Several module paths, read in one call. Order is preserved. Duplicates are collapsed.',
+      },
+    },
+    required: [],
+  },
+};
+
+export const moduleResolveToolDefinition = {
+  name: 'module_resolve',
+  description:
+    'Report whether each supplied module path resolves to a file on the Railway volume, and name any other '
+    + 'file in the modules tree carrying the same basename. Returns path, existence, match_count, size, line '
+    + 'count and SHA-256 per entry, plus a `shadows` list of same-named files elsewhere in the tree. Use it '
+    + 'to verify a module allowlist before relying on it, or to find which copy of a duplicated module is '
+    + 'actually being loaded. Returns metadata only, never file content. Read-only.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      file: {
+        type: 'string',
+        description: 'One module path relative to the modules root.',
+      },
+      files: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Several module paths to resolve in one call.',
+      },
+    },
+    required: [],
+  },
+};
+
+/**
+ * module_read. Read module files by path.
+ *
+ * A per-entry failure is reported in `errors` and does NOT fail the call, so a
+ * caller reading a twenty-entry bundle learns about all of its bad entries in
+ * one round trip rather than one per redeploy. The call is marked isError only
+ * when the ARGUMENTS are unusable or when nothing at all could be read, because
+ * those are the two cases where the caller has no partial result to work with.
+ *
+ * A caller that requires every entry (the Response Studio compose path does)
+ * must check `errors.length === 0`, not merely the absence of isError. The
+ * response states the requested and returned counts so that check is trivial.
+ *
+ * @param {object} args
+ * @returns {{content: Array<{type: string, text: string}>, isError?: boolean}}
+ */
+export function handleModuleRead(args) {
+  let requested;
+  try {
+    requested = collectRequestedModulePaths(args);
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }],
+        isError: true,
+      };
+    }
+    throw err;
+  }
+
+  const maxFiles = moduleReadMaxFiles();
+  const maxChars = moduleReadMaxTotalChars();
+  const paths = getContentPaths();
+
+  const accepted = requested.slice(0, maxFiles);
+  const refusedForCount = requested.slice(maxFiles);
+
+  const files = [];
+  const errors = [];
+  let totalChars = 0;
+  let charCapHit = false;
+
+  for (const rawPath of accepted) {
+    if (charCapHit) {
+      errors.push({
+        file: rawPath,
+        error: `Not read: the ${maxChars}-character response ceiling was reached by an earlier entry in this batch.`,
+        code: 'module_read_total_chars_exceeded',
+      });
+      continue;
+    }
+
+    let resolved;
+    try {
+      resolved = resolveModulePath(paths.modulesDir, rawPath);
+    } catch (err) {
+      if (err instanceof ToolValidationError) {
+        errors.push({ file: rawPath, error: err.message, code: err.code });
+        continue;
+      }
+      throw err;
+    }
+
+    if (!existsSync(resolved.fullPath)) {
+      errors.push({
+        file: rawPath,
+        normalised: resolved.normalised,
+        error: `File not found: modules/${resolved.normalised}`,
+        code: 'module_not_found',
+      });
+      continue;
+    }
+
+    let content;
+    try {
+      content = readFileSync(resolved.fullPath, 'utf8');
+    } catch (err) {
+      errors.push({
+        file: rawPath,
+        normalised: resolved.normalised,
+        error: `Could not read modules/${resolved.normalised}: ${err.message}`,
+        code: 'module_unreadable',
+      });
+      continue;
+    }
+
+    if (totalChars + content.length > maxChars) {
+      charCapHit = true;
+      errors.push({
+        file: rawPath,
+        normalised: resolved.normalised,
+        error: `Not read: including this file would exceed the ${maxChars}-character response ceiling.`,
+        code: 'module_read_total_chars_exceeded',
+      });
+      continue;
+    }
+
+    totalChars += content.length;
+    files.push({
+      file: `modules/${resolved.normalised}`,
+      normalised: resolved.normalised,
+      resolved_path: resolved.fullPath,
+      line_count: content.split('\n').length,
+      size_bytes: Buffer.byteLength(content, 'utf8'),
+      sha256: sha256(content),
+      content,
+    });
+  }
+
+  for (const rawPath of refusedForCount) {
+    errors.push({
+      file: rawPath,
+      error: `Not read: this call already requested ${maxFiles} files, which is the per-call ceiling.`,
+      code: 'module_read_max_files_exceeded',
+    });
+  }
+
+  const payload = {
+    section: 'modules',
+    modules_dir: paths.modulesDir,
+    requested: requested.length,
+    returned: files.length,
+    total_chars: totalChars,
+    complete: errors.length === 0,
+    files,
+    errors,
+  };
+
+  // Nothing readable at all. The caller has no partial result, so this is a
+  // failed call rather than a successful one carrying bad news.
+  if (!files.length) {
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true };
+  }
+  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}
+
+/**
+ * module_resolve. Report resolution and shadowing for module paths.
+ *
+ * `match_count` is 0 or 1 by construction, because the path is exact. That is
+ * the point: the whole reason the bundle carries paths rather than ids is that
+ * a path cannot resolve to more than one file. The field exists so a caller can
+ * assert the property rather than assume it.
+ *
+ * `shadows` is the separate and more interesting number. It lists every OTHER
+ * file in the modules tree with the same basename, which is what makes a
+ * duplicate tree visible. A shadow is not an error here: which copy is correct
+ * is a judgement about content, not about paths, and this tool reports rather
+ * than decides.
+ *
+ * @param {object} args
+ * @returns {{content: Array<{type: string, text: string}>, isError?: boolean}}
+ */
+export function handleModuleResolve(args) {
+  let requested;
+  try {
+    requested = collectRequestedModulePaths(args);
+  } catch (err) {
+    if (err instanceof ToolValidationError) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: err.message, code: err.code }, null, 2) }],
+        isError: true,
+      };
+    }
+    throw err;
+  }
+
+  const paths = getContentPaths();
+  const { index, fileCount, truncated } = buildModuleIndex(paths.modulesDir);
+
+  const entries = [];
+  let resolvedCount = 0;
+  let shadowedCount = 0;
+
+  for (const rawPath of requested) {
+    let resolved;
+    try {
+      resolved = resolveModulePath(paths.modulesDir, rawPath);
+    } catch (err) {
+      if (err instanceof ToolValidationError) {
+        entries.push({
+          file: rawPath,
+          normalised: null,
+          exists: false,
+          match_count: 0,
+          error: err.message,
+          code: err.code,
+          shadows: [],
+        });
+        continue;
+      }
+      throw err;
+    }
+
+    const exists = existsSync(resolved.fullPath);
+    const entry = {
+      file: `modules/${resolved.normalised}`,
+      normalised: resolved.normalised,
+      exists,
+      match_count: exists ? 1 : 0,
+      resolved_path: resolved.fullPath,
+      size_bytes: null,
+      line_count: null,
+      sha256: null,
+      shadows: [],
+    };
+
+    if (exists) {
+      resolvedCount += 1;
+      try {
+        const content = readFileSync(resolved.fullPath, 'utf8');
+        entry.size_bytes = Buffer.byteLength(content, 'utf8');
+        entry.line_count = content.split('\n').length;
+        entry.sha256 = sha256(content);
+      } catch (err) {
+        // Existence is established; the stats are not. Report the entry as
+        // resolved with null stats rather than as missing, because reporting it
+        // missing would send a reader looking for a file that is right there.
+        entry.stat_error = err.message;
+      }
+    } else {
+      entry.error = `File not found: modules/${resolved.normalised}`;
+      entry.code = 'module_not_found';
+    }
+
+    const siblings = index.get(basename(resolved.normalised)) || [];
+    for (const rel of siblings) {
+      if (rel === resolved.normalised) continue;
+      const shadow = { path: `modules/${rel}`, size_bytes: null, line_count: null, sha256: null };
+      try {
+        const full = join(paths.modulesDir, rel);
+        const content = readFileSync(full, 'utf8');
+        shadow.size_bytes = Buffer.byteLength(content, 'utf8');
+        shadow.line_count = content.split('\n').length;
+        shadow.sha256 = sha256(content);
+        shadow.identical = entry.sha256 !== null && shadow.sha256 === entry.sha256;
+      } catch {
+        // A shadow that cannot be read is still a shadow worth naming.
+      }
+      entry.shadows.push(shadow);
+    }
+    if (entry.shadows.length) shadowedCount += 1;
+
+    entries.push(entry);
+  }
+
+  const payload = {
+    section: 'modules',
+    modules_dir: paths.modulesDir,
+    indexed_files: fileCount,
+    index_truncated: truncated,
+    requested: requested.length,
+    resolved: resolvedCount,
+    unresolved: requested.length - resolvedCount,
+    shadowed: shadowedCount,
+    all_resolved: resolvedCount === requested.length,
+    entries,
+  };
+
+  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}

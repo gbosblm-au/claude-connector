@@ -523,6 +523,9 @@ import {
 } from "./tools/avaMemorySync.js";
 import {
   moduleWriteToolDefinition,
+  // v13.27.0 (SPEC-SOCIAL-003 §3, §14): path-addressed reads for modules/.
+  moduleReadToolDefinition,
+  moduleResolveToolDefinition,
   archiveListToolDefinition,
   archiveReadToolDefinition,
   archiveWriteToolDefinition,
@@ -533,6 +536,8 @@ import {
   scriptReadToolDefinition,
   scriptWriteToolDefinition,
   handleModuleWrite,
+  handleModuleRead,
+  handleModuleResolve,
   handleArchiveList,
   handleArchiveRead,
   handleArchiveWrite,
@@ -1100,6 +1105,8 @@ function buildEffectiveToolList() {
     personalityWriteToolDefinition,
     dispatchRuleAddToolDefinition,
     moduleWriteToolDefinition,
+    moduleReadToolDefinition,
+    moduleResolveToolDefinition,
   ];
 
   const byName = new Map();
@@ -1343,6 +1350,11 @@ async function dispatchToolCallCore(name, args, context = null) {
           return _dispatchResult;
         }
         case "module_write":            return await handleModuleWrite(args);
+        // v13.27.0. Read-only, so deliberately NOT in SYSTEM_WRITE_TOOLS: a
+        // tenant may read the modules shaping its own session without being
+        // able to change them.
+        case "module_read":             return handleModuleRead(args);
+        case "module_resolve":          return handleModuleResolve(args);
         case "books_read":             return await handleBooksRead(args);
         case "books_log_write":        return await handleBooksLogWrite(args);
         // ---------- Content Sections: Archive / References / Scripts (v11.5.0) ----------
@@ -1473,6 +1485,7 @@ function createMcpServer(tenantContext) {
     // the modular section with a live isModularEnabled() check.
     const MODULAR_TOOL_NAMES = new Set([
       "skill_compile", "skill_load_specialist", "skill_recompile", "personality_write", "dispatch_rule_add", "module_write",
+      "module_read", "module_resolve",
     ]);
     const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
     const modularTools = isModularEnabled()
@@ -1483,6 +1496,8 @@ function createMcpServer(tenantContext) {
           personalityWriteToolDefinition,
           dispatchRuleAddToolDefinition,
           moduleWriteToolDefinition,
+          moduleReadToolDefinition,
+          moduleResolveToolDefinition,
         ]
       : [];
     const allTools = [...baseTools, ...modularTools];
@@ -3320,6 +3335,7 @@ app.get("/tools", (req, res) => {
   const MODULAR_TOOL_NAMES = new Set([
     "skill_compile", "skill_load_specialist", "skill_recompile",
     "personality_write", "dispatch_rule_add", "module_write",
+    "module_read", "module_resolve",
   ]);
   const baseTools    = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
   const modularTools = isModularEnabled()
@@ -3330,6 +3346,8 @@ app.get("/tools", (req, res) => {
         personalityWriteToolDefinition,
         dispatchRuleAddToolDefinition,
         moduleWriteToolDefinition,
+        moduleReadToolDefinition,
+        moduleResolveToolDefinition,
       ]
     : [];
 
