@@ -689,7 +689,7 @@ export const skillAuditToolDefinition = {
     'Audit all Ava skill files on the Railway persistent volume. ' +
     'Identifies whether modular or canonical skill mode is active, and returns ' +
     'file names, line counts, and last-modified dates for all relevant skill files. ' +
-    'Canonical mode returns: SKILL.md, PROFILES.md, PERSONALITY.md, BOOKS_READ.md. ' +
+    'Canonical mode returns: SKILL.md, PROFILES.md, PERSONALITY.md. ' +
     'Modular mode returns: CORE.md, PERSONALITY.md, MANIFEST.json, DISPATCH_RULES.json, ' +
     'and every specialist module file in the modules/ directory. ' +
     'Use to verify the health and completeness of skill files after any deployment, push, ' +
@@ -856,17 +856,17 @@ export async function handleSkillAudit(_args) {
     }
   } else {
     // -------------------------------------------------------------------
-    // Canonical mode: SKILL.md, PROFILES.md, PERSONALITY.md, BOOKS_READ.md
+    // Canonical mode: SKILL.md, PROFILES.md, PERSONALITY.md
+    // BOOKS_READ.md is not listed from v13.28.0: the reading record is in
+    // Postgres and the file is no longer authoritative (s6.4).
     // -------------------------------------------------------------------
     const profilesPath    = process.env.PROFILES_FILE_PATH
       || skillPath.replace(/SKILL\.md$/, 'PROFILES.md');
     const personalityPath = avaDir + 'PERSONALITY.md';
-    const booksPath       = skillPath.replace(/SKILL\.md$/, 'BOOKS_READ.md');
 
     result.files.push(fileInfo(skillPath,       'SKILL.md'));
     result.files.push(fileInfo(profilesPath,    'PROFILES.md'));
     result.files.push(fileInfo(personalityPath, 'PERSONALITY.md'));
-    result.files.push(fileInfo(booksPath,       'BOOKS_READ.md'));
   }
 
   // Build summary

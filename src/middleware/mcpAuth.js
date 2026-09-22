@@ -144,7 +144,8 @@ const SELF_AUTHENTICATED_ROUTES = [
   // Skill and content restore targets used by the plugin's provisioning and
   // Disaster Recovery pushes.
   { exact: '/restore-skill' },
-  { exact: '/restore-books' },
+  // /restore-books removed in v13.28.0: the route no longer exists, so it no
+  // longer needs an exemption (BOOKS-READ AUTHORITY CUTOVER s6.3).
   { exact: '/restore-profiles' },
   { exact: '/restore-modules' },
   { exact: '/restore-personality' },

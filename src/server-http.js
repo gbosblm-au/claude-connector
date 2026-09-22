@@ -491,7 +491,6 @@ import {
   booksLogWriteToolDefinition,
   handleBooksRead,
   handleBooksLogWrite,
-  handleBooksRestoreFromWp,
 } from "./tools/books.js";
 import {
   profileReadToolDefinition,
@@ -1355,8 +1354,11 @@ async function dispatchToolCallCore(name, args, context = null) {
         // able to change them.
         case "module_read":             return handleModuleRead(args);
         case "module_resolve":          return handleModuleResolve(args);
-        case "books_read":             return await handleBooksRead(args);
-        case "books_log_write":        return await handleBooksLogWrite(args);
+        // v13.28.0 BOOKS-READ AUTHORITY CUTOVER: the reading record is per
+        // account in Postgres, so both tools take the per-call context the
+        // gateway supplies (and refuse when no account resolves).
+        case "books_read":             return await handleBooksRead(args, context);
+        case "books_log_write":        return await handleBooksLogWrite(args, context);
         // ---------- Content Sections: Archive / References / Scripts (v11.5.0) ----------
         case "archive_list":            return handleArchiveList(args);
         case "archive_read":            return handleArchiveRead(args);
@@ -3042,57 +3044,9 @@ app.post("/restore-skill", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------
-// POST /restore-books
-// Receives a BOOKS_READ.md push from the WordPress admin "Push to Railway"
-// button (ts-ava-skill plugin v1.5.0+). Validates X-Railway-Restore-Token,
-// then writes the content directly to BOOKS_READ.md on the Railway volume.
-// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
-// -----------------------------------------------------------------------
-app.post("/restore-books", async (req, res) => {
-  if (!SKILL_ENABLED) {
-    res.status(503).json({ error: "Skill Volume not configured. Set SKILL_FILE_PATH in Railway Variables." });
-    return;
-  }
-
-  if (!RAILWAY_RESTORE_TOKEN) {
-    res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
-    return;
-  }
-
-  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
-
-  if (!providedToken) {
-    res.status(401).json({ error: "Missing X-Railway-Restore-Token header." });
-    return;
-  }
-
-  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
-    res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
-    return;
-  }
-
-  const body = req.body || {};
-
-  if (!body.content || typeof body.content !== "string" || !body.content.trim()) {
-    res.status(400).json({ error: "content is required and must not be empty." });
-    return;
-  }
-
-  try {
-    const result = await handleBooksRestoreFromWp(body);
-    if (result.success) {
-      log("info", `restore-books: ${result.entry_count} entries from ${body.source || "wordpress-push"}`);
-      res.json(result);
-    } else {
-      log("error", `restore-books failed: ${result.error}`);
-      res.status(500).json(result);
-    }
-  } catch (err) {
-    log("error", `restore-books exception: ${err.message}`);
-    res.status(500).json({ error: err.message });
-  }
-});
+// POST /restore-books was removed in v13.28.0 (BOOKS-READ AUTHORITY CUTOVER
+// s6.3). The reading record is in Postgres, and an inbound POST carrying
+// non-empty content must not be able to overwrite the source of truth.
 
 // -----------------------------------------------------------------------
 // POST /restore-profiles
@@ -4519,7 +4473,6 @@ app.use((_req, res) => {
       volumeRestore:         "POST /volume-restore (X-Railway-Restore-Token required)",
       volumeSnapshotStatus:  "GET /volume-snapshot/status (X-Railway-Restore-Token required)",
       restoreSkill:          "POST /restore-skill (X-Railway-Restore-Token required)",
-      restoreBooks:          "POST /restore-books (X-Railway-Restore-Token required)",
       restoreProfiles:       "POST /restore-profiles (X-Railway-Restore-Token required)",
       restoreModules:        "POST /restore-modules (X-Railway-Restore-Token required)",
       restorePersonality:    "POST /restore-personality (X-Railway-Restore-Token required)",
@@ -4668,7 +4621,7 @@ httpServer.listen(PORT, HOST, () => {
     `Skill Volume: ${SKILL_ENABLED ? `ENABLED (${process.env.SKILL_FILE_PATH}) — skill_read, skill_write, skill_write_addition, skill_merge_additions, skill_history, skill_rollback, skill_audit` : "disabled (set SKILL_FILE_PATH to enable)"}`,
   );
   log("info", `Skill restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-skill)" : SKILL_ENABLED ? "disabled (set RAILWAY_RESTORE_TOKEN)" : "disabled (SKILL_FILE_PATH not set)"}`);
-  log("info", `Books restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-books)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
+  log("info", "Books: reading record in Postgres via the gateway (books_read, books_log_write); POST /restore-books removed in v13.28.0");
   log("info", `Profiles: ${PROFILES_ENABLED ? "ENABLED (profile_read, profile_write_person)" : "disabled (set SKILL_FILE_PATH or PROFILES_FILE_PATH to enable)"}`);
   log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
     logTenantModeStatus();

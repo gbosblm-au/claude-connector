@@ -191,3 +191,58 @@ export async function webSourceIngestRemote(payload) {
   }
   return json || { ingested: false, reason: "no_response_body" };
 }
+
+/**
+ * Build the error thrown for a non-2xx books response. The gateway answers a
+ * refusal with { error: <code>, message, detail }, and the code is what the
+ * tool reports, so it is carried rather than flattened into the message.
+ * @param {string} label
+ * @param {number} status
+ * @param {object|null} json
+ * @returns {Error}
+ */
+function booksError(label, status, json) {
+  const err = new Error((json && json.message) || `${label} failed: HTTP ${status}`);
+  err.status = status;
+  err.code = (json && typeof json.error === "string") ? json.error : `http_${status}`;
+  err.detail = (json && json.detail) || null;
+  return err;
+}
+
+/**
+ * One account's reading list from Postgres. v13.28.0, BOOKS-READ AUTHORITY
+ * CUTOVER s6.1. reading_log is the source of truth; BOOKS_READ.md is not read.
+ *
+ * @param {string} tenantId
+ * @param {string|number} userId  ti_users.id
+ * @returns {Promise<{entries: Array<object>, last_updated: string|null}>}
+ * @throws on network failure, timeout, or a non-2xx response (err.code carries
+ *   the gateway's named error, e.g. account_not_found).
+ */
+export async function booksReadRemote(tenantId, userId) {
+  const { status, ok, json } = await callGateway("POST", "/ti-tools/books-read", {
+    body: { tenant_id: tenantId, user_id: userId },
+  });
+  if (!ok) throw booksError("books-read", status, json);
+  return {
+    entries: Array.isArray(json?.entries) ? json.entries : [],
+    last_updated: json?.last_updated || null,
+  };
+}
+
+/**
+ * Record a completed reading in Postgres. v13.28.0, s6.2. The gateway refuses a
+ * book the vault does not hold with the named error book_not_in_vault.
+ *
+ * @param {{tenantId: string, userId: string|number, title: string, author: string,
+ *          dateRead: string, genre: string, note: string}} args
+ * @returns {Promise<object>} The written entry, with the vault's stored title and author.
+ * @throws on network failure, timeout, or a non-2xx response.
+ */
+export async function booksLogWriteRemote({ tenantId, userId, title, author, dateRead, genre, note }) {
+  const { status, ok, json } = await callGateway("POST", "/ti-tools/books-log-write", {
+    body: { tenant_id: tenantId, user_id: userId, title, author, date_read: dateRead, genre, note },
+  });
+  if (!ok) throw booksError("books-log-write", status, json);
+  return json?.entry || {};
+}
