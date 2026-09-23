@@ -34,98 +34,14 @@
 
 'use strict';
 
-import { inflateRawSync } from 'node:zlib';
-
-/** Zip signatures, little-endian. */
-const EOCD_SIG = 0x06054b50;
-const CD_SIG   = 0x02014b50;
-const LFH_SIG  = 0x04034b50;
+// v13.29.0: the central-directory walk that lived here is now the connector's
+// shared zip reader, src/bundles/zip-archive.js (SPEC-SOURCE-BUNDLE-001 s6),
+// so there is one zip reader rather than two. readNamedEntry keeps this file's
+// contract: the entry's bytes, or null for any failure.
+import { readNamedEntry } from '../bundles/zip-archive.js';
 
 /** The part of a .docx that holds the body text. */
 const DOCUMENT_PART = 'word/document.xml';
-
-/**
- * Locate the End of Central Directory record.
- *
- * Scanned BACKWARDS from the end because the EOCD is last, and it carries a
- * variable-length comment, so its offset cannot be computed. The 22-byte
- * minimum plus a 64 KB maximum comment bounds the search; anything further back
- * is not an EOCD and the file is not a zip.
- *
- * @param {Buffer} buf
- * @returns {number} Offset, or -1.
- */
-function findEocd( buf ) {
-  const minimum = 22;
-  if ( buf.length < minimum ) return -1;
-
-  const earliest = Math.max( 0, buf.length - minimum - 0xFFFF );
-  for ( let i = buf.length - minimum; i >= earliest; i -= 1 ) {
-    if ( buf.readUInt32LE( i ) === EOCD_SIG ) return i;
-  }
-  return -1;
-}
-
-/**
- * Read one file out of a zip buffer.
- *
- * Walks the central directory rather than scanning for local headers. The
- * central directory is authoritative: a local header's size fields can be zeroed
- * when the entry was written with a streaming data descriptor, which Word does
- * for some parts. Trusting the local header there yields an empty document and
- * no error at all.
- *
- * @param {Buffer} buf
- * @param {string} wanted Exact entry name.
- * @returns {Buffer|null}
- */
-function readZipEntry( buf, wanted ) {
-  const eocd = findEocd( buf );
-  if ( eocd < 0 ) return null;
-
-  const entries = buf.readUInt16LE( eocd + 10 );
-  let offset = buf.readUInt32LE( eocd + 16 );
-
-  for ( let i = 0; i < entries; i += 1 ) {
-    if ( offset + 46 > buf.length ) return null;
-    if ( buf.readUInt32LE( offset ) !== CD_SIG ) return null;
-
-    const method     = buf.readUInt16LE( offset + 10 );
-    const compressed = buf.readUInt32LE( offset + 20 );
-    const nameLen    = buf.readUInt16LE( offset + 28 );
-    const extraLen   = buf.readUInt16LE( offset + 30 );
-    const commentLen = buf.readUInt16LE( offset + 32 );
-    const localAt    = buf.readUInt32LE( offset + 42 );
-
-    const name = buf.toString( 'utf8', offset + 46, offset + 46 + nameLen );
-
-    if ( name === wanted ) {
-      if ( localAt + 30 > buf.length ) return null;
-      if ( buf.readUInt32LE( localAt ) !== LFH_SIG ) return null;
-
-      // The local header's OWN name and extra lengths, which differ from the
-      // central directory's: zip writers routinely pad the local extra field
-      // for alignment. Using the central values here reads from the wrong
-      // offset and inflates garbage.
-      const localNameLen  = buf.readUInt16LE( localAt + 26 );
-      const localExtraLen = buf.readUInt16LE( localAt + 28 );
-      const dataAt = localAt + 30 + localNameLen + localExtraLen;
-
-      const data = buf.subarray( dataAt, dataAt + compressed );
-
-      if ( 0 === method ) return Buffer.from( data );   // stored
-      if ( 8 === method ) {
-        try { return inflateRawSync( data ); }
-        catch ( err ) { return null; }
-      }
-      return null;   // an encrypted or exotically compressed part
-    }
-
-    offset += 46 + nameLen + extraLen + commentLen;
-  }
-
-  return null;
-}
 
 /**
  * Decode the five XML entities plus numeric references.
@@ -276,7 +192,7 @@ export function docxToText( buffer ) {
 
   let xml;
   try {
-    xml = readZipEntry( buffer, DOCUMENT_PART );
+    xml = readNamedEntry( buffer, DOCUMENT_PART );
   } catch ( err ) {
     return { ok: false, reason: 'corrupt_archive' };
   }

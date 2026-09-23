@@ -902,7 +902,7 @@ describe( 'Auth gate: every self-authenticated route is exempt from the MCP key'
 
     const required = [
       '/volume-restore', '/volume-snapshot', '/volume-snapshot/status',
-      '/restore-skill', '/restore-books', '/restore-profiles', '/restore-modules',
+      '/restore-skill', '/restore-profiles', '/restore-modules',
       '/restore-personality', '/restore-dispatch-rules', '/restore-archive',
       '/restore-references', '/restore-scripts',
       '/brain-scan', '/brain-data', '/skill-export',

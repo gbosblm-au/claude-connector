@@ -1,35 +1,52 @@
-// src/tools/books.js  v10.8.0
-// Two tools for Ava BOOKS_READ.md management on Railway persistent volume.
+// src/tools/books.js  v13.28.1
+// Ava's reading record: books_read and books_log_write.
 //
-// books_read      - Read the full BOOKS_READ.md file on demand. Not loaded at session start.
-//                   Call only when a book is being read or discussed.
-// books_log_write - Prepend a new formatted entry to BOOKS_READ.md immediately after a
-//                   reading session, then push the updated file to the WordPress Books tab.
+// ── BOOKS-READ AUTHORITY CUTOVER (v13.28.0) ─────────────────────────────────
 //
-// File location on Railway volume:
-//   Same directory as SKILL.md. Path derived by replacing SKILL.md with BOOKS_READ.md
-//   in the SKILL_FILE_PATH environment variable.
-//   Default: /data/skill/BOOKS_READ.md
+// The reading record lives in Postgres (gateway table reading_log), scoped to
+// the owning account. BOOKS_READ.md on the Railway volume is no longer read or
+// written by either tool. Tool names, input schemas and JSON response shapes
+// are unchanged; only storage moved.
 //
-// File format:
-//   # Ava Books Read
-//   <header paragraph>
+//   books_read      - POST /ti-tools/books-read, rendered here with the same
+//                     formatEntry the file always used, into the same
+//                     { content, entry_count, last_updated } shape.
+//   books_log_write - POST /ti-tools/books-log-write. Refuses a book the vault
+//                     does not hold (book_not_in_vault). Then re-renders the
+//                     list from Postgres and pushes it to the WordPress Books
+//                     Read tab, so that tab is now rendered from reading_log.
 //
-//   - *Title* - Author (YYYY-MM-DD) | genre | one-line note
-//   - *Title* - Author (YYYY-MM-DD) | genre | one-line note
-//   ...
+// ── No fallback (directive s1.4) ────────────────────────────────────────────
 //
-// Design decisions (confirmed 2026-05-26):
-//   - No versioning. Single file, direct overwrites on every new entry.
-//   - On-demand read only. Not included in session-start skill_read response.
-//   - WordPress backup: non-blocking push to POST /books after every books_log_write.
-//   - Entry format is structured (title, author, date_read, genre, note fields) and
-//     formatted internally to the canonical line format before writing.
-//   - New entries are prepended (inserted before the first existing "- " line)
-//     so the list remains most-recent-first.
+// When the calling account cannot be resolved, or the gateway is not
+// configured, both tools refuse with a named error. Falling back to the file
+// would recreate a second source of truth one request at a time.
+//
+// The account comes ONLY from the gateway's per-call context (v13.28.1). The
+// connector session context is not used: it is process-global and can name
+// another account. Tool ARGS are never consulted either, so a model-supplied
+// user_id cannot redirect a read or a write. Direct MCP calls, which carry no
+// per-call context, are refused with account_unresolved.
+//
+// ── Reconciliation (directive s7.1) ─────────────────────────────────────────
+//
+// BOOKS_READ.md stays on the volume, frozen at cutover, until the
+// reconciliation shows every entry it holds is present in reading_log. That
+// comparison runs on every call to either tool, not once, and is logged. It
+// never changes a tool response. reconcileBooksFile is the pure comparison.
+//
+// The inbound POST /restore-books route and handleBooksRestoreFromWp were
+// removed in v13.28.0 (s6.3): a request body must not be able to overwrite the
+// source of truth.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { log } from '../utils/logger.js';
+import {
+  resolveSessionIdentity,
+  gatewayConfigured,
+  booksReadRemote,
+  booksLogWriteRemote,
+} from './ti-tools-client.js';
 
 // ---------------------------------------------------------------------------
 // Path helper
@@ -43,41 +60,42 @@ function getBooksPaths() {
   return { booksPath, wpUrl, wpKey };
 }
 
-function ensureDir(filePath) {
-  const dir = filePath.replace(/[/\\][^/\\]+$/, '');
-  if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true });
-}
-
 // ---------------------------------------------------------------------------
-// BOOKS_READ.md initialisation content
-// Used when the file does not yet exist on the Railway volume.
+// Rendering. The header and line format are unchanged from the file era, so
+// the rendered content is what the file would have held.
 // ---------------------------------------------------------------------------
 
-const BOOKS_READ_HEADER = `# Ava Books Read
+export const BOOKS_READ_HEADER = `# Ava Books Read
 
 All books Ava has read in IFA sessions, most recent first. Memory holds the full reading response and context for each entry (search by title). New entries added via \`books_log_write\` after each reading session.
 
 `;
 
-// ---------------------------------------------------------------------------
-// Entry count helper
-// ---------------------------------------------------------------------------
-
-function countEntries(content) {
+export function countEntries(content) {
   return (content.match(/^- \*/gm) || []).length;
 }
 
-// ---------------------------------------------------------------------------
-// Format one entry line from structured fields
-// ---------------------------------------------------------------------------
-
-function formatEntry(title, author, dateRead, genre, note) {
+export function formatEntry(title, author, dateRead, genre, note) {
   return `- *${title.trim()}* - ${author.trim()} (${dateRead.trim()}) | ${genre.trim()} | ${note.trim()}`;
+}
+
+/**
+ * Render gateway entries into BOOKS_READ.md-format content.
+ * @param {Array<{title?:string, author?:string|null, date_read?:string,
+ *                genre?:string|null, note?:string|null}>} entries  Most recent first.
+ * @returns {string}
+ */
+export function renderBooksContent(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) return BOOKS_READ_HEADER;
+  const s = (v) => (v === null || v === undefined ? '' : String(v));
+  const lines = list.map((e) => formatEntry(s(e.title), s(e.author), s(e.date_read), s(e.genre), s(e.note)));
+  return BOOKS_READ_HEADER + lines.join('\n') + '\n';
 }
 
 // ---------------------------------------------------------------------------
 // WordPress backup (non-blocking)
-// Pushes the full updated BOOKS_READ.md content to POST /wp-json/ava-skill/v1/books
+// Pushes the content rendered from reading_log to POST /wp-json/ava-skill/v1/books
 // ---------------------------------------------------------------------------
 
 async function pushBooksToWordPress(content, wpUrl, wpKey) {
@@ -88,7 +106,7 @@ async function pushBooksToWordPress(content, wpUrl, wpKey) {
       headers: {
         'Content-Type':   'application/json',
         'X-Ava-Skill-Key': wpKey,
-        'User-Agent':     'claude-connector/10.7.0 (ava-books-sync)',
+        'User-Agent':     'claude-connector/13.28.1 (ava-books-sync)',
       },
       body: JSON.stringify({
         content,
@@ -113,17 +131,157 @@ function formatWpResult(r) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions
+// Reconciliation (s7.1)
+// ---------------------------------------------------------------------------
+
+const ENTRY_LINE = /^- \*(.+?)\* - (.*?) \((\d{4}-\d{2}-\d{2})\) \| (.*?) \| (.*)$/;
+
+function norm(v) {
+  return String(v === null || v === undefined ? '' : v).trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Compare BOOKS_READ.md, entry by entry, against the entries rendered from
+ * reading_log. Pure: no I/O.
+ *
+ * Entries are matched on title and date read (case- and whitespace-
+ * insensitive), as a multiset, so the same book read twice on different days
+ * is two entries. Author, genre and note are then compared on each matched
+ * pair and reported as field mismatches, because the vault's stored author can
+ * legitimately be fuller than what the file recorded.
+ *
+ * The direction that matters is file_only: an entry the file holds and
+ * Postgres does not. The file can only be deleted safely when that list and
+ * the unparseable list are both empty. db_only entries are expected after
+ * cutover, because new readings are no longer written to the file.
+ *
+ * @param {string} fileContent
+ * @param {Array<object>} dbEntries
+ * @returns {{file_entries:number, db_entries:number, matched:number,
+ *            file_only:Array<object>, db_only:Array<object>,
+ *            field_mismatches:Array<object>, unparseable:string[],
+ *            safe_to_delete_file:boolean}}
+ */
+export function reconcileBooksFile(fileContent, dbEntries) {
+  const fileRows = [];
+  const unparseable = [];
+  for (const line of String(fileContent || '').split('\n')) {
+    if (!line.startsWith('- ')) continue;
+    const m = ENTRY_LINE.exec(line.replace(/\r$/, ''));
+    if (!m) { unparseable.push(line); continue; }
+    fileRows.push({ title: m[1], author: m[2], date_read: m[3], genre: m[4], note: m[5] });
+  }
+
+  const buckets = new Map();
+  const db = Array.isArray(dbEntries) ? dbEntries : [];
+  for (const e of db) {
+    const k = `${norm(e.title)}|${norm(e.date_read)}`;
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(e);
+  }
+
+  const fileOnly = [];
+  const mismatches = [];
+  let matched = 0;
+  for (const f of fileRows) {
+    const k = `${norm(f.title)}|${norm(f.date_read)}`;
+    const bucket = buckets.get(k);
+    if (!bucket || !bucket.length) { fileOnly.push(f); continue; }
+    const d = bucket.shift();
+    matched += 1;
+    const diffs = ['author', 'genre', 'note'].filter((field) => norm(f[field]) !== norm(d[field]));
+    if (diffs.length) {
+      mismatches.push({ title: f.title, date_read: f.date_read, fields: diffs,
+        file: Object.fromEntries(diffs.map((x) => [x, f[x]])),
+        db: Object.fromEntries(diffs.map((x) => [x, d[x] ?? null])) });
+    }
+  }
+  const dbOnly = [...buckets.values()].flat().map((d) => ({ title: d.title, date_read: d.date_read }));
+
+  return {
+    file_entries: fileRows.length,
+    db_entries: db.length,
+    matched,
+    file_only: fileOnly,
+    db_only: dbOnly,
+    field_mismatches: mismatches,
+    unparseable,
+    safe_to_delete_file: fileOnly.length === 0 && unparseable.length === 0,
+  };
+}
+
+/**
+ * Run the reconciliation against the volume file, if it is still there, and
+ * log the outcome. Never throws and never alters a tool response.
+ * @param {Array<object>} dbEntries
+ * @returns {object|null} The reconciliation, or null when no file exists.
+ */
+export function reconcileAgainstVolume(dbEntries) {
+  try {
+    const { booksPath } = getBooksPaths();
+    if (!existsSync(booksPath)) return null;
+    const r = reconcileBooksFile(readFileSync(booksPath, 'utf8'), dbEntries);
+    const summary = `books reconcile: file=${r.file_entries} db=${r.db_entries} matched=${r.matched} ` +
+      `file_only=${r.file_only.length} db_only=${r.db_only.length} mismatched=${r.field_mismatches.length} ` +
+      `unparseable=${r.unparseable.length} safe_to_delete_file=${r.safe_to_delete_file}`;
+    if (r.safe_to_delete_file) {
+      log('info', summary);
+    } else {
+      log('warn', `${summary}; file-only: ${r.file_only.map((f) => `${f.title} (${f.date_read})`).join('; ').slice(0, 800)}`);
+    }
+    return r;
+  } catch (err) {
+    log('warn', `books reconcile could not run: ${err.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Account resolution (s1.4: no fallback)
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object|null} context  Per-call { tenant_id, user_id } from the gateway.
+ * @returns {{ok:true, tenantId:string, userId:string}|{ok:false, code:string, message:string}}
+ */
+function resolveBooksAccount(context) {
+  if (!gatewayConfigured()) {
+    return { ok: false, code: 'gateway_not_configured',
+      message: 'The reading record is stored in the gateway, and GATEWAY_URL / GATEWAY_ADMIN_KEY are not set. Refusing rather than using BOOKS_READ.md.' };
+  }
+  // v13.28.1: the per-call context is REQUIRED. The session context is one
+  // process-global value, set by whichever account last ran
+  // ts_gateway_session_init, so on a connector serving more than one account it
+  // can name the wrong reader. Both fields must come from the call itself; a
+  // context with a user but no tenant would otherwise take TS_TENANT_ID.
+  const present = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+  if (!context || !present(context.tenant_id ?? context.tenantId) || !present(context.user_id ?? context.userId)) {
+    return { ok: false, code: 'account_unresolved',
+      message: 'The reading record is per account and this call carries no account. ' +
+               'Direct MCP calls are refused: start a gateway session and call books_read / books_log_write through the gateway, which supplies the account on every call.' };
+  }
+  // With both fields present they win resolveSessionIdentity's first priority,
+  // so this only applies its normalisation; no fallback is reachable.
+  const { tenantId, userId } = resolveSessionIdentity(context, null);
+  return { ok: true, tenantId, userId };
+}
+
+function errorResult(payload) {
+  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true };
+}
+
+// ---------------------------------------------------------------------------
+// Tool definitions (names and input schemas unchanged)
 // ---------------------------------------------------------------------------
 
 export const booksReadToolDefinition = {
   name: 'books_read',
   description:
-    'Read the full BOOKS_READ.md file from the Railway persistent volume. ' +
-    'Returns all book entries Ava has read, most recent first. ' +
-    'Call on demand only — when a book is being read or discussed. ' +
+    'Read the full reading log for this account, rendered as the BOOKS_READ list. ' +
+    'Returns every book this account has read, most recent first. ' +
+    'Call on demand only, when a book is being read or discussed. ' +
     'Not loaded at session start. Complement to the Ava skill: the skill holds ' +
-    'the reading directives and any earned skill additions; this file holds the log.',
+    'the reading directives and any earned skill additions; this holds the log.',
   inputSchema: {
     type: 'object',
     properties: {},
@@ -134,12 +292,15 @@ export const booksReadToolDefinition = {
 export const booksLogWriteToolDefinition = {
   name: 'books_log_write',
   description:
-    'Prepend a new entry to BOOKS_READ.md on the Railway persistent volume and push ' +
-    'the updated file to the WordPress Books Read tab. ' +
+    'Record a completed reading in this account\'s reading log and push the updated ' +
+    'list to the WordPress Books Read tab. ' +
     'Call immediately after completing a reading session. ' +
-    'The entry is formatted internally from the structured fields provided — ' +
-    'do not pre-format the entry string. ' +
-    'New entries are inserted at the top of the list (most-recent-first order).',
+    'The book must already be in the reading vault under this title and author; ' +
+    'if it is not, the call is refused with book_not_in_vault and lists any held ' +
+    'books with the same title. ' +
+    'The entry is formatted internally from the structured fields provided, ' +
+    'so do not pre-format the entry string. ' +
+    'The list is returned most recent first.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -157,34 +318,28 @@ export const booksLogWriteToolDefinition = {
 // Handlers
 // ---------------------------------------------------------------------------
 
-export async function handleBooksRead(_args) {
-  const { booksPath } = getBooksPaths();
-  ensureDir(booksPath);
+/**
+ * books_read. Response shape unchanged: { content, entry_count, last_updated }.
+ * @param {object} _args
+ * @param {object|null} [context]
+ */
+export async function handleBooksRead(_args, context = null) {
+  const account = resolveBooksAccount(context);
+  if (!account.ok) return errorResult({ error: account.message, code: account.code });
 
-  if (!existsSync(booksPath)) {
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          content:     '',
-          entry_count: 0,
-          note:        'BOOKS_READ.md does not exist on the Railway volume. ' +
-                       'Seed it by calling books_log_write with the first (or most recent) book entry, ' +
-                       'or run the migrate-books.js migration script to transfer the existing list from SKILL.md.',
-        }, null, 2),
-      }],
-    };
+  let remote;
+  try {
+    remote = await booksReadRemote(account.tenantId, account.userId);
+  } catch (err) {
+    log('warn', `books_read: gateway read failed: ${err.message}`);
+    return errorResult({ error: `Reading log unavailable: ${err.message}`, code: err.code || 'gateway_error' });
   }
 
-  const content     = readFileSync(booksPath, 'utf8');
-  const entryCount  = countEntries(content);
-  let lastUpdated = null;
-  try {
-    const { mtimeMs } = statSync(booksPath);
-    lastUpdated = new Date(mtimeMs).toISOString();
-  } catch { /* non-critical — last_updated omitted if stat fails */ }
+  const content = renderBooksContent(remote.entries);
+  const entryCount = countEntries(content);
+  reconcileAgainstVolume(remote.entries);
 
-  log('info', `books_read: returned ${entryCount} entries`);
+  log('info', `books_read: returned ${entryCount} entries for tenant=${account.tenantId} user=${account.userId}`);
 
   return {
     content: [{
@@ -192,95 +347,80 @@ export async function handleBooksRead(_args) {
       text: JSON.stringify({
         content,
         entry_count:  entryCount,
-        last_updated: lastUpdated,
+        last_updated: remote.last_updated,
       }, null, 2),
     }],
   };
 }
 
-// ---------------------------------------------------------------------------
-// WordPress restore handler (called by POST /restore-books in server-http.js)
-// Accepts a parsed request body from the WordPress admin "Push to Railway" action
-// for the Books Read tab. Validates content and writes directly to BOOKS_READ.md
-// on the Railway Volume. Returns a plain result object.
-// ---------------------------------------------------------------------------
+/**
+ * books_log_write. Same five-field validation and the same success object.
+ * @param {object} args
+ * @param {object|null} [context]
+ */
+export async function handleBooksLogWrite(args, context = null) {
+  const { wpUrl, wpKey } = getBooksPaths();
+  const a = args || {};
 
-export async function handleBooksRestoreFromWp(body) {
-  const { booksPath } = getBooksPaths();
-  const content       = typeof body.content        === 'string' ? body.content        : '';
-  const changeSummary = typeof body.change_summary === 'string' ? body.change_summary : 'WordPress admin books restore push';
+  const title    = (a.title    || '').trim();
+  const author   = (a.author   || '').trim();
+  const dateRead = (a.date_read || '').trim();
+  const genre    = (a.genre    || '').trim();
+  const note     = (a.note     || '').trim();
 
-  if (!content.trim()) {
-    return { success: false, error: 'content is required and must not be empty.' };
-  }
+  if (!title)    return errorResult({ error: 'title is required.' });
+  if (!author)   return errorResult({ error: 'author is required.' });
+  if (!dateRead) return errorResult({ error: 'date_read is required.' });
+  if (!genre)    return errorResult({ error: 'genre is required.' });
+  if (!note)     return errorResult({ error: 'note is required.' });
 
-  ensureDir(booksPath);
-
-  try {
-    writeFileSync(booksPath, content, 'utf8');
-    const entryCount = countEntries(content);
-    log('info', `restore-books: wrote ${content.split('\n').length} lines, ${entryCount} entries from WordPress push`);
-    return { success: true, entry_count: entryCount, change_summary: changeSummary };
-  } catch (err) {
-    log('error', `restore-books write failed: ${err.message}`);
-    return { success: false, error: err.message };
-  }
-}
-
-export async function handleBooksLogWrite(args) {
-  const { booksPath, wpUrl, wpKey } = getBooksPaths();
-  ensureDir(booksPath);
-
-  const title    = (args.title    || '').trim();
-  const author   = (args.author   || '').trim();
-  const dateRead = (args.date_read || '').trim();
-  const genre    = (args.genre    || '').trim();
-  const note     = (args.note     || '').trim();
-
-  if (!title)    return { content: [{ type: 'text', text: JSON.stringify({ error: 'title is required.' }, null, 2) }], isError: true };
-  if (!author)   return { content: [{ type: 'text', text: JSON.stringify({ error: 'author is required.' }, null, 2) }], isError: true };
-  if (!dateRead) return { content: [{ type: 'text', text: JSON.stringify({ error: 'date_read is required.' }, null, 2) }], isError: true };
-  if (!genre)    return { content: [{ type: 'text', text: JSON.stringify({ error: 'genre is required.' }, null, 2) }], isError: true };
-  if (!note)     return { content: [{ type: 'text', text: JSON.stringify({ error: 'note is required.' }, null, 2) }], isError: true };
-
-  // Validate date format
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateRead)) {
-    return { content: [{ type: 'text', text: JSON.stringify({ error: `date_read must be in YYYY-MM-DD format. Received: "${dateRead}"` }, null, 2) }], isError: true };
+    return errorResult({ error: `date_read must be in YYYY-MM-DD format. Received: "${dateRead}"` });
   }
 
-  const newEntry = formatEntry(title, author, dateRead, genre, note);
+  const account = resolveBooksAccount(context);
+  if (!account.ok) return errorResult({ error: account.message, code: account.code });
 
-  // Read existing file or initialise with header
-  const existing = existsSync(booksPath) ? readFileSync(booksPath, 'utf8') : BOOKS_READ_HEADER;
-
-  // Find insertion point: before the first "- " list line
-  const lines   = existing.split('\n');
-  let insertIdx = lines.findIndex(l => l.startsWith('- '));
-
-  let updatedContent;
-  if (insertIdx === -1) {
-    // No existing entries yet — append after the header block
-    const trimmed = existing.trimEnd();
-    updatedContent = trimmed + '\n\n' + newEntry + '\n';
-  } else {
-    lines.splice(insertIdx, 0, newEntry);
-    updatedContent = lines.join('\n');
+  let written;
+  try {
+    written = await booksLogWriteRemote({
+      tenantId: account.tenantId, userId: account.userId,
+      title, author, dateRead, genre, note,
+    });
+  } catch (err) {
+    log('warn', `books_log_write: gateway write refused or failed: ${err.code || ''} ${err.message}`);
+    return errorResult({
+      error: err.message,
+      code: err.code || 'gateway_error',
+      ...(err.detail && err.detail.same_title_held ? { same_title_held: err.detail.same_title_held } : {}),
+    });
   }
 
-  writeFileSync(booksPath, updatedContent, 'utf8');
+  const newEntry = formatEntry(
+    String(written.title || title), String(written.author || author),
+    String(written.date_read || dateRead), String(written.genre || genre), String(written.note || note));
 
-  const newEntryCount = countEntries(updatedContent);
-
-  log('info', `books_log_write: prepended entry for "${title}" (total entries: ${newEntryCount})`);
-
-  // Non-blocking WordPress push
+  // The written row is committed. Re-reading the list is for the total and the
+  // WordPress render; a failure here is reported, never turned into a failed write.
+  let entryCountTotal = null;
   let wpResult = { skipped: true };
   try {
-    wpResult = await pushBooksToWordPress(updatedContent, wpUrl, wpKey);
+    const remote = await booksReadRemote(account.tenantId, account.userId);
+    const content = renderBooksContent(remote.entries);
+    entryCountTotal = countEntries(content);
+    reconcileAgainstVolume(remote.entries);
+    try {
+      wpResult = await pushBooksToWordPress(content, wpUrl, wpKey);
+    } catch (err) {
+      wpResult = { ok: false, error: err.message };
+    }
   } catch (err) {
-    wpResult = { ok: false, error: err.message };
-    log('warn', `books_log_write: WP push failed: ${err.message}`);
+    wpResult = { ok: false, error: `list re-read failed: ${err.message}` };
+    log('warn', `books_log_write: post-write list read failed: ${err.message}`);
   }
+  if (wpResult.ok === false) log('warn', `books_log_write: WP push failed: ${wpResult.error}`);
+
+  log('info', `books_log_write: recorded "${title}" for tenant=${account.tenantId} user=${account.userId} (total entries: ${entryCountTotal})`);
 
   return {
     content: [{
@@ -288,9 +428,9 @@ export async function handleBooksLogWrite(args) {
       text: JSON.stringify({
         success:           true,
         entry:             newEntry,
-        entry_count_total: newEntryCount,
+        entry_count_total: entryCountTotal,
         wordpress_backup:  formatWpResult(wpResult),
-        note:              'Entry prepended to BOOKS_READ.md. Most-recent-first order maintained.',
+        note:              'Entry recorded in the reading log (Postgres). Most-recent-first order maintained.',
       }, null, 2),
     }],
   };
