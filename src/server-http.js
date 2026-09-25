@@ -491,8 +491,20 @@ import {
   booksLogWriteToolDefinition,
   handleBooksRead,
   handleBooksLogWrite,
-  handleBooksRestoreFromWp,
 } from "./tools/books.js";
+// v13.29.0 SPEC-SOURCE-BUNDLE-001: source bundles (archives read as trees).
+import {
+  bundleToolDefinitions,
+  handleBundleIngest,
+  handleBundleList,
+  handleBundleManifest,
+  handleBundleRead,
+  handleBundleSearch,
+} from "./tools/bundle-tools.js";
+import { classifyEntry } from "./bundles/classify.js";
+// v13.30.0: ingestBundle is NOT imported here. Ingest is an authenticated
+// operation (the bundle_ingest tool); this route only classifies and stores.
+import { sweepExpiredBundles } from "./bundles/bundle-store.js";
 import {
   profileReadToolDefinition,
   profileWritePersonToolDefinition,
@@ -961,6 +973,10 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {}, required: [] },
   },
 
+  // ---------- Source bundles (v13.29.0, SPEC-SOURCE-BUNDLE-001) ----------
+  // Not gated on SKILL_ENABLED: a bundle lives in its own store on the volume.
+  ...bundleToolDefinitions,
+
   // ---------- Ava Skill Volume (v10.7.0) ----------
   // Only advertised when SKILL_FILE_PATH is configured so Claude does not
   // see tools that will always error in a non-provisioned environment.
@@ -1355,8 +1371,16 @@ async function dispatchToolCallCore(name, args, context = null) {
         // able to change them.
         case "module_read":             return handleModuleRead(args);
         case "module_resolve":          return handleModuleResolve(args);
-        case "books_read":             return await handleBooksRead(args);
-        case "books_log_write":        return await handleBooksLogWrite(args);
+        // v13.28.0 BOOKS-READ AUTHORITY CUTOVER: the reading record is per
+        // account in Postgres, so both tools take the per-call context the
+        // gateway supplies (and refuse when no account resolves).
+        case "bundle_ingest":          return await handleBundleIngest(args);
+        case "bundle_list":            return await handleBundleList(args);
+        case "bundle_manifest":        return await handleBundleManifest(args);
+        case "bundle_read":            return await handleBundleRead(args);
+        case "bundle_search":          return await handleBundleSearch(args);
+        case "books_read":             return await handleBooksRead(args, context);
+        case "books_log_write":        return await handleBooksLogWrite(args, context);
         // ---------- Content Sections: Archive / References / Scripts (v11.5.0) ----------
         case "archive_list":            return handleArchiveList(args);
         case "archive_read":            return handleArchiveRead(args);
@@ -2575,16 +2599,18 @@ const UPLOAD_DENIED_EXTS = new Set([
  * @return {{ ok: boolean, reason?: string }}
  */
 function uploadExtensionAllowed(ext) {
-  if (!ext) {
-    return { ok: false, reason: 'Files must have an extension.' };
-  }
-  if (UPLOAD_DENIED_EXTS.has(ext)) {
+  // v13.29.0 SPEC-SOURCE-BUNDLE-001 s1, s5. The type of a file is decided by
+  // its content (classifyEntry), not its name, so this gate no longer refuses
+  // an empty or unfamiliar extension. It refused both before: Dockerfile,
+  // .dockerfile, Makefile, LICENSE and Procfile have no extension at all on
+  // Node's extname, and Dockerfile.prod, .env.example and Cargo.lock have ones
+  // no hand-listed set anticipated. The denylist of executable formats stays:
+  // it is the security control. UPLOAD_ALLOWED_EXTS remains as the record of
+  // known types and is reported, not enforced.
+  if (ext && UPLOAD_DENIED_EXTS.has(ext)) {
     return { ok: false, reason: `Extension '${ext}' is not accepted (executable content).` };
   }
-  if (!UPLOAD_ALLOWED_EXTS.has(ext)) {
-    return { ok: false, reason: `Extension '${ext}' is not supported.` };
-  }
-  return { ok: true };
+  return { ok: true, known: !ext || UPLOAD_ALLOWED_EXTS.has(ext) };
 }
 
 function ensureUploadDir() {
@@ -2859,6 +2885,15 @@ function sweepExpiredDownloads() {
 function sweepAllRetention() {
   sweepExpiredUploads();
   sweepExpiredDownloads();
+  // v13.29.0: bundles expire like uploads (SPEC-SOURCE-BUNDLE-001 D1).
+  try {
+    const r = sweepExpiredBundles();
+    if (r.bundles_removed || r.blobs_removed) {
+      log('info', `retention: removed ${r.bundles_removed} expired bundle(s), ${r.blobs_removed} unreferenced blob(s)`);
+    }
+  } catch (err) {
+    log('warn', `bundle retention sweep failed: ${err.message}`);
+  }
 }
 
 if (UPLOAD_SWEEP_ENABLED) {
@@ -2940,6 +2975,24 @@ app.post('/data/upload', async (req, res) => {
     writeFileSync(filepath + '.meta.json', JSON.stringify(meta, null, 2));
 
     log('info', `upload: ${filename} -> ${filepath} (${buffer.length} bytes)`);
+
+    // v13.30.0 SPEC-SOURCE-BUNDLE-001. The connector's one classifier decides
+    // what the file is, and the browser acts on the answer instead of guessing
+    // from the name.
+    //
+    // v13.29.0 also ingested an archive here when the body carried
+    // bundle: true. That is REMOVED. This route is unauthenticated by design
+    // (the browser cannot hold MCP_API_KEY), and ingestBundle keys a bundle on
+    // its name and replaces any live manifest at that id. An unauthenticated
+    // request naming an existing bundle could therefore substitute its content,
+    // and every MCP-authenticated read afterwards would serve the substituted
+    // tree into a session with a full tool surface. Ingest now happens only
+    // through the authenticated bundle_ingest tool, against the stored file.
+    //
+    // The bundle field is still ACCEPTED and ignored, so an older plugin build
+    // posting it keeps working; it simply gets no bundle object back.
+    const classification = classifyEntry(filename, buffer);
+
     res.json({
       success: true,
       filepath,
@@ -2947,6 +3000,7 @@ app.post('/data/upload', async (req, res) => {
       size: buffer.length,
       mime_type: mime_type || 'application/octet-stream',
       expires_at: meta.expires_at,
+      classification: { class: classification.class, encoding: classification.encoding },
     });
   } catch (err) {
     log('error', `upload error: ${err.message}`);
@@ -3042,57 +3096,9 @@ app.post("/restore-skill", async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------
-// POST /restore-books
-// Receives a BOOKS_READ.md push from the WordPress admin "Push to Railway"
-// button (ts-ava-skill plugin v1.5.0+). Validates X-Railway-Restore-Token,
-// then writes the content directly to BOOKS_READ.md on the Railway volume.
-// Requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN in Railway Variables.
-// -----------------------------------------------------------------------
-app.post("/restore-books", async (req, res) => {
-  if (!SKILL_ENABLED) {
-    res.status(503).json({ error: "Skill Volume not configured. Set SKILL_FILE_PATH in Railway Variables." });
-    return;
-  }
-
-  if (!RAILWAY_RESTORE_TOKEN) {
-    res.status(503).json({ error: "RAILWAY_RESTORE_TOKEN not set in Railway Variables." });
-    return;
-  }
-
-  const providedToken = (req.headers["x-railway-restore-token"] || "").trim();
-
-  if (!providedToken) {
-    res.status(401).json({ error: "Missing X-Railway-Restore-Token header." });
-    return;
-  }
-
-  if (!constantTimeEquals(providedToken, RAILWAY_RESTORE_TOKEN)) {
-    res.status(403).json({ error: "Invalid X-Railway-Restore-Token." });
-    return;
-  }
-
-  const body = req.body || {};
-
-  if (!body.content || typeof body.content !== "string" || !body.content.trim()) {
-    res.status(400).json({ error: "content is required and must not be empty." });
-    return;
-  }
-
-  try {
-    const result = await handleBooksRestoreFromWp(body);
-    if (result.success) {
-      log("info", `restore-books: ${result.entry_count} entries from ${body.source || "wordpress-push"}`);
-      res.json(result);
-    } else {
-      log("error", `restore-books failed: ${result.error}`);
-      res.status(500).json(result);
-    }
-  } catch (err) {
-    log("error", `restore-books exception: ${err.message}`);
-    res.status(500).json({ error: err.message });
-  }
-});
+// POST /restore-books was removed in v13.28.0 (BOOKS-READ AUTHORITY CUTOVER
+// s6.3). The reading record is in Postgres, and an inbound POST carrying
+// non-empty content must not be able to overwrite the source of truth.
 
 // -----------------------------------------------------------------------
 // POST /restore-profiles
@@ -4519,7 +4525,6 @@ app.use((_req, res) => {
       volumeRestore:         "POST /volume-restore (X-Railway-Restore-Token required)",
       volumeSnapshotStatus:  "GET /volume-snapshot/status (X-Railway-Restore-Token required)",
       restoreSkill:          "POST /restore-skill (X-Railway-Restore-Token required)",
-      restoreBooks:          "POST /restore-books (X-Railway-Restore-Token required)",
       restoreProfiles:       "POST /restore-profiles (X-Railway-Restore-Token required)",
       restoreModules:        "POST /restore-modules (X-Railway-Restore-Token required)",
       restorePersonality:    "POST /restore-personality (X-Railway-Restore-Token required)",
@@ -4668,7 +4673,7 @@ httpServer.listen(PORT, HOST, () => {
     `Skill Volume: ${SKILL_ENABLED ? `ENABLED (${process.env.SKILL_FILE_PATH}) — skill_read, skill_write, skill_write_addition, skill_merge_additions, skill_history, skill_rollback, skill_audit` : "disabled (set SKILL_FILE_PATH to enable)"}`,
   );
   log("info", `Skill restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-skill)" : SKILL_ENABLED ? "disabled (set RAILWAY_RESTORE_TOKEN)" : "disabled (SKILL_FILE_PATH not set)"}`);
-  log("info", `Books restore endpoint: ${SKILL_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-books)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
+  log("info", "Books: reading record in Postgres via the gateway (books_read, books_log_write); POST /restore-books removed in v13.28.0");
   log("info", `Profiles: ${PROFILES_ENABLED ? "ENABLED (profile_read, profile_write_person)" : "disabled (set SKILL_FILE_PATH or PROFILES_FILE_PATH to enable)"}`);
   log("info", `Profiles restore endpoint: ${PROFILES_ENABLED && RAILWAY_RESTORE_TOKEN ? "ENABLED (POST /restore-profiles)" : "disabled (requires SKILL_FILE_PATH + RAILWAY_RESTORE_TOKEN)"}`);
     logTenantModeStatus();

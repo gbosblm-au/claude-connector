@@ -280,6 +280,19 @@ test( 'the shared gateway client stays backwards compatible', () => {
   assert.match( code, /timeoutMs = TIMEOUT_MS\s*\}\s*=\s*\{\}\s*\)/ );
   assert.match( code, /const TIMEOUT_MS\s*=\s*5000;/ );
 
-  const calls = code.match( /callGateway\("(?:POST|GET)", "[^"]+"/g ) || [];
-  assert.equal( calls.length, 5, 'four pre-existing callers plus the new one' );
+  // v13.28.0: named rather than counted. The books cutover added two callers,
+  // and a bare count would pass if one caller were swapped for another.
+  const calls = ( code.match( /callGateway\("(?:POST|GET)", "[^"]+"/g ) || [] )
+    .map( ( c ) => c.replace( /^callGateway\(/, '' ) ).sort();
+  assert.deepEqual( calls, [
+    '"GET", "/ti-tools/assistant-name"',
+    '"POST", "/ti-tools/books-log-write"',
+    '"POST", "/ti-tools/books-read"',
+    '"POST", "/ti-tools/module-frequency"',
+    '"POST", "/ti-tools/profile-read"',
+    '"POST", "/ti-tools/profile-write"',
+    '"POST", "/ti-tools/web-source-ingest"',
+  ] );
+  // Only the ingest caller overrides the default budget.
+  assert.equal( ( code.match( /timeoutMs:/g ) || [] ).length, 1 );
 } );

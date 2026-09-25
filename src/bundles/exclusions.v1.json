@@ -1,0 +1,26 @@
+{
+  "revision": "tenax-exclusions-v1",
+  "note": "One file, one revision, two consumers. Recorded BESIDE a tree hash, never inside the preimage: baking the revision into the preimage would invalidate every historical hash on a list edit and make hashes incomparable across the change, which is worse than the divergence it fixes.",
+  "semantics": {
+    "directories": "excluded when ANY path segment matches, so a nested node_modules is caught",
+    "files": "excluded when the BASENAME matches, at any depth"
+  },
+  "directories": [
+    { "name": "node_modules", "reason": "dependencies" },
+    { "name": "vendor", "reason": "dependencies (PHP)" },
+    { "name": ".venv", "reason": "dependencies (Python virtualenv)" },
+    { "name": ".git", "reason": "version control metadata" },
+    { "name": ".svn", "reason": "version control metadata" },
+    { "name": ".hg", "reason": "version control metadata" },
+    { "name": "dist", "reason": "generated output" },
+    { "name": "build", "reason": "generated output" },
+    { "name": ".next", "reason": "generated output" },
+    { "name": "coverage", "reason": "generated output" },
+    { "name": "__pycache__", "reason": "interpreter cache" }
+  ],
+  "files": [
+    { "name": ".DS_Store", "reason": "operating system metadata" },
+    { "name": "Thumbs.db", "reason": "operating system metadata" }
+  ],
+  "caveat": "Generated output is excluded; this list is that rule's current instance. A project whose released artefact IS dist would hash nothing under it, so the reason column is what keeps the next edit honest."
+}

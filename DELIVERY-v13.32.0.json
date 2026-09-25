@@ -1,0 +1,23 @@
+{
+  "version": "13.32.0",
+  "previous": "13.31.1",
+  "work_order": "tenax work order 1 (D2, D3, D4), delivered per work order 2 R1",
+  "changed_files": [
+    "src/bundles/exclusions.v1.json (new)",
+    "src/bundles/bundle-ingest.js",
+    "src/bundles/zip-archive.js",
+    "src/bundles/bundle-store.js",
+    "src/tests/bundle-ingest.test.js",
+    "package.json",
+    "CHANGELOG-v13.32.0.md (new)"
+  ],
+  "deployment": {
+    "mode": "in-place",
+    "volume_migration": "none (no schema change)",
+    "row_effect": "stored bundle tree hashes change VALUE; bundle_id unchanged; first re-ingest reports status rehashed",
+    "variables_added": [],
+    "variables_changed": [],
+    "variables_removed": [],
+    "rollback_target": "13.31.1"
+  }
+}
