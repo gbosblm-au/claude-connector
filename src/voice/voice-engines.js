@@ -95,6 +95,13 @@ import { outputSampleRate, DEFAULT_VOICE,
 import { transcribeViaWorker, sttWorkerState, sttWorkerEnabled,
          sttWorkerResident,
          prewarm as prewarmSttWorker } from './stt-worker-supervisor.js';
+// v13.34.0 -- SPEC-AUDIO-003 Section 5.5. The per-user ElevenLabs engine. An
+// outbound HTTPS client and nothing else: it spawns nothing, so the process
+// boundary above is untouched. Reached only when a request carries a validated
+// ElevenLabs configuration, so a user without one never executes it (D7).
+import { synthesizeElevenLabsPcm, stripMisakiMarkup, severerReason,
+         elevenLabsConcurrency, elevenLabsSegmentChars,
+         elevenLabsOutputFormat, elevenLabsReplyBudgetMs } from './elevenlabs.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -230,6 +237,358 @@ const TTS_CONCURRENCY = intEnv('VOICE_TTS_CONCURRENCY', 1);
 function intEnv(name, fallback) {
   const n = parseInt(process.env[name] || '', 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * An integer environment variable held inside a sane range.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003. Out-of-range values fall back to the default
+ * rather than being clamped, matching prosody.js: a typo in a segmentation bound
+ * must not quietly become a bound nobody chose.
+ *
+ * @param {string} name
+ * @param {number} fallback
+ * @param {number} min Inclusive.
+ * @param {number} max Inclusive.
+ * @returns {number}
+ */
+function boundedIntEnv(name, fallback, min, max) {
+  const raw = String(process.env[name] || '').trim();
+  if (!raw) return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= min && n <= max ? n : fallback;
+}
+
+/* ---------------------------------------------------------------------------
+ * v13.34.0 -- SPEC-AUDIO-003 W1. Segmenting as a base function.
+ * ---------------------------------------------------------------------------
+ *
+ * THE DROP THIS CLOSES, VERIFIED IN THE PINNED DEPENDENCY. kokoro-onnx 0.4.9
+ * (requirements-kokoro.txt) splits a phoneme string only at . , ! ? ; and then,
+ * in Kokoro._create_audio, cuts any batch longer than MAX_PHONEME_LENGTH (510)
+ * with nothing but a log.warning, and returns success. A stretch of text with
+ * none of those five characters in it (a markdown bullet list, a long
+ * unpunctuated clause, a run of words joined by dashes) therefore came back as
+ * a complete-looking utterance with its tail missing. That is the silent
+ * truncation SPEC-AUDIO-003 D1 names as the failure class under repair.
+ *
+ * Two bounds, read per call so a change needs no restart:
+ *
+ *   VOICE_TTS_MAX_RUN_CHARS   (default 350, range 80..480) The longest stretch
+ *       of prepared text between Kokoro's own split characters that is handed to
+ *       the engine in one piece. English IPA runs at roughly 1.1 to 1.4 phoneme
+ *       characters per text character, so 350 stays under 510 phonemes with
+ *       margin. A longer stretch is cut at whitespace and rendered as separate
+ *       engine calls, so it can never reach the truncating branch.
+ *
+ *   VOICE_TTS_SEGMENT_CHARS   (default 5000, range 200..20000) The longest text
+ *       handed to one engine call. 5000 is the old route ceiling, so every input
+ *       the baseline accepted keeps its exact single-call shape unless it holds a
+ *       run long enough to be truncated (S4). Longer replies, which the baseline
+ *       refused outright, are split at sentence boundaries so no single call can
+ *       outrun the worker's timeout.
+ */
+function segmentLimits() {
+  return {
+    maxRunChars: boundedIntEnv('VOICE_TTS_MAX_RUN_CHARS', 350, 80, 480),
+    maxSegmentChars: boundedIntEnv('VOICE_TTS_SEGMENT_CHARS', 5000, 200, 20000),
+  };
+}
+
+/* v13.34.0 -- SPEC-AUDIO-003 W1, the short-render check.
+ *
+ *   VOICE_SHORT_RENDER_MAX_CPS    (default 40, range 10..200) The fastest
+ *       plausible delivery, in letters and digits per second at length_scale 1.
+ *       Kokoro speaks English at roughly 12 to 16 letters a second, so 40 is a
+ *       floor of about a third of real speech: generous enough never to fire on
+ *       a fast voice, tight enough that a rendering missing most of its text is
+ *       caught.
+ *   VOICE_SHORT_RENDER_MIN_CHARS  (default 60, range 1..10000) Below this many
+ *       letters the check does not run. A two-word phrase has too little text
+ *       for a duration floor to mean anything. */
+function shortRenderLimits() {
+  return {
+    maxCps: boundedIntEnv('VOICE_SHORT_RENDER_MAX_CPS', 40, 10, 200),
+    minChars: boundedIntEnv('VOICE_SHORT_RENDER_MIN_CHARS', 60, 1, 10000),
+  };
+}
+
+/** The five characters kokoro-onnx 0.4.9 splits a phoneme string at. */
+const KOKORO_SPLIT_CHARS = /[.,!?;]/u;
+
+/**
+ * Misaki markup the prosody pipeline may emit: `[label](/ipa/)` or
+ * `[label](+2)`. Never cut inside one of these, because half of a markup span
+ * is read aloud as brackets and slashes.
+ */
+const MARKUP_SPAN = /\[[^\]\n]*\]\([^)\n]*\)/gu;
+
+/**
+ * The [start, end) ranges of markup spans in a string.
+ *
+ * @param {string} text
+ * @returns {Array<[number, number]>}
+ */
+function markupSpans(text) {
+  const spans = [];
+  MARKUP_SPAN.lastIndex = 0;
+  let m;
+  while ((m = MARKUP_SPAN.exec(text))) spans.push([m.index, m.index + m[0].length]);
+  return spans;
+}
+
+/**
+ * Would a cut between position-1 and position fall inside a markup span?
+ *
+ * @param {Array<[number, number]>} spans
+ * @param {number} position
+ * @returns {boolean}
+ */
+function cutsMarkup(spans, position) {
+  for (const [start, end] of spans) {
+    if (position > start && position < end) return true;
+  }
+  return false;
+}
+
+/**
+ * The longest stretch of text between two of Kokoro's split characters.
+ *
+ * @param {string} text
+ * @returns {number}
+ */
+function longestRun(text) {
+  let longest = 0;
+  for (const part of String(text || '').split(KOKORO_SPLIT_CHARS)) {
+    const len = part.trim().length;
+    if (len > longest) longest = len;
+  }
+  return longest;
+}
+
+/**
+ * Split a string after every match of `pattern` that does not fall inside a
+ * markup span. Pieces are trimmed and empty pieces dropped.
+ *
+ * @param {string} text
+ * @param {RegExp} pattern Must carry the global flag.
+ * @returns {string[]}
+ */
+function cutAfter(text, pattern) {
+  const spans = markupSpans(text);
+  const pieces = [];
+  let last = 0;
+  pattern.lastIndex = 0;
+  let m;
+  while ((m = pattern.exec(text))) {
+    const cut = m.index + m[0].length;
+    if (0 === m[0].length) { pattern.lastIndex += 1; continue; }
+    if (cutsMarkup(spans, cut)) continue;
+    const piece = text.slice(last, cut).trim();
+    if (piece) pieces.push(piece);
+    last = cut;
+  }
+  const tail = text.slice(last).trim();
+  if (tail) pieces.push(tail);
+  return pieces;
+}
+
+/**
+ * Cut one over-long stretch into pieces no longer than `limit`, at whitespace.
+ *
+ * A single token longer than the limit (a long URL that survived flattening, a
+ * hash) is cut hard at the limit, never inside a markup span. Speaking a token
+ * in two halves is a degraded rendering; truncating it is a lost one.
+ *
+ * @param {string} text
+ * @param {number} limit
+ * @returns {string[]}
+ */
+function chunkAtWhitespace(text, limit) {
+  const spans = markupSpans(text);
+  const words = [];
+  let start = 0;
+  for (let i = 0; i <= text.length; i += 1) {
+    const atEnd = i === text.length;
+    if (atEnd || (/\s/u.test(text[i]) && !cutsMarkup(spans, i))) {
+      const word = text.slice(start, i);
+      if (word.trim()) words.push(word.trim());
+      start = i + 1;
+    }
+  }
+
+  const out = [];
+  let current = '';
+  for (const word of words) {
+    if (word.length > limit) {
+      if (current) { out.push(current); current = ''; }
+      const wordSpans = markupSpans(word);
+      let from = 0;
+      while (from < word.length) {
+        let to = Math.min(word.length, from + limit);
+        // Never end a hard cut inside markup; extend to the span's end instead.
+        for (const [s, e] of wordSpans) {
+          if (to > s && to < e) to = e;
+        }
+        out.push(word.slice(from, to));
+        from = to;
+      }
+      continue;
+    }
+    const joined = current ? `${current} ${word}` : word;
+    if (current && joined.length > limit) {
+      out.push(current);
+      current = word;
+    } else {
+      current = joined;
+    }
+  }
+  if (current) out.push(current);
+  return out;
+}
+
+/**
+ * Split prepared text into the pieces handed to the engine, one call each.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 W1 (D1, S1, S4).
+ *
+ * Returns the input unchanged, as a one-element array, whenever it is no longer
+ * than the segment bound and holds no stretch long enough to be truncated. That
+ * is every input the pre-change build rendered correctly, so their output is
+ * byte-identical to the baseline.
+ *
+ * Otherwise:
+ *   1. split at sentence ends and line breaks;
+ *   2. any sentence still holding an over-long stretch is split at commas, and
+ *      any clause still too long is cut at whitespace into SEALED pieces;
+ *   3. unsealed pieces are packed back together up to the segment bound.
+ *
+ * Sealed pieces are never packed with a neighbour. They were cut from one
+ * unpunctuated stretch, so re-joining two of them would rebuild the very run
+ * that kokoro-onnx truncates.
+ *
+ * Every non-whitespace character of the input appears in the output, in order.
+ * Only whitespace at the cut points is dropped. Asserted in
+ * src/tests/voice-segmenting.test.js.
+ *
+ * @param {string} text Prepared text (after prepareForKokoro).
+ * @param {{maxRunChars?: number, maxSegmentChars?: number}} [limits]
+ * @returns {string[]}
+ */
+export function segmentForSynthesis(text, limits) {
+  const s = String(text || '');
+  const defaults = segmentLimits();
+  const l = limits || {};
+  const maxRun = Number.isFinite(l.maxRunChars) && l.maxRunChars > 0
+    ? l.maxRunChars : defaults.maxRunChars;
+  const maxSegment = Number.isFinite(l.maxSegmentChars) && l.maxSegmentChars > 0
+    ? Math.max(l.maxSegmentChars, maxRun) : Math.max(defaults.maxSegmentChars, maxRun);
+
+  if (!s.trim()) return [s];
+  if (s.length <= maxSegment && longestRun(s) <= maxRun) return [s];
+
+  const atoms = [];
+  for (const sentence of cutAfter(s, /[.!?;]+["'”’)\]]*\s+|\n+/gu)) {
+    if (sentence.length <= maxSegment && longestRun(sentence) <= maxRun) {
+      atoms.push({ text: sentence, sealed: false });
+      continue;
+    }
+    for (const clause of cutAfter(sentence, /,\s+/gu)) {
+      if (clause.length <= maxSegment && longestRun(clause) <= maxRun) {
+        atoms.push({ text: clause, sealed: false });
+        continue;
+      }
+      for (const piece of chunkAtWhitespace(clause, maxRun)) {
+        atoms.push({ text: piece, sealed: true });
+      }
+    }
+  }
+
+  const out = [];
+  let current = '';
+  for (const atom of atoms) {
+    if (atom.sealed) {
+      if (current) { out.push(current); current = ''; }
+      out.push(atom.text);
+      continue;
+    }
+    const joined = current ? `${current} ${atom.text}` : atom.text;
+    // Both bounds are re-checked on the JOINED text, not only the length. A
+    // line break ends an atom without a Kokoro split character, so two
+    // unpunctuated lines (a markdown bullet list) packed together form one
+    // longer run, which is the very stretch kokoro-onnx truncates.
+    if (current && (joined.length > maxSegment || longestRun(joined) > maxRun)) {
+      out.push(current);
+      current = atom.text;
+    } else {
+      current = joined;
+    }
+  }
+  if (current) out.push(current);
+  return out.length ? out : [s];
+}
+
+/**
+ * Letters and digits that will be spoken, with misaki payloads removed.
+ *
+ * `[Kokoro](/kˈOkəɹO/)` is spoken as one word; counting the IPA as well would
+ * double that word's weight in the duration floor.
+ *
+ * @param {string} text
+ * @returns {number}
+ */
+export function speakableCharCount(text) {
+  return String(text || '')
+    .replace(/\]\([^)\n]*\)/gu, ']')
+    .replace(/[^\p{L}\p{N}]/gu, '')
+    .length;
+}
+
+/**
+ * Refuse a rendering that returned success with far less audio than its text.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 W1 (S2). "A short segment raises and names its
+ * index; silence is never emitted in place of an error."
+ *
+ * The floor is deliberately loose (see shortRenderLimits): it is a backstop for
+ * the class of failure segmentForSynthesis prevents by construction, and a check
+ * that fired on a fast but complete rendering would replace a working reply
+ * with an error. Below VOICE_SHORT_RENDER_MIN_CHARS it does not run at all.
+ *
+ * Never puts the text in the error. Section 10: the words being spoken are not
+ * logged, and an error message is a log line.
+ *
+ * @param {{pcm: Buffer, sampleRate: number, text: string, lengthScale?: number,
+ *          index: number, total: number}} o
+ * @returns {void}
+ * @throws {Error} code `tts_short_render`, with segmentIndex and segmentTotal.
+ */
+export function assertFullRender(o) {
+  const letters = speakableCharCount(o.text);
+  const { maxCps, minChars } = shortRenderLimits();
+  if (letters < minChars) return;
+
+  const rawScale = Number(o.lengthScale);
+  const scale = Number.isFinite(rawScale) && rawScale > 0
+    ? Math.min(2, Math.max(0.5, rawScale)) : 1;
+  const minSeconds = (letters / maxCps) * scale;
+  const rate = Number.isFinite(o.sampleRate) && o.sampleRate > 0 ? o.sampleRate : NATIVE_SAMPLE_RATE;
+  const bytes = Buffer.isBuffer(o.pcm) ? o.pcm.length : 0;
+  const seconds = (bytes / 2) / rate;
+  if (seconds >= minSeconds) return;
+
+  const index = Number.isInteger(o.index) && o.index >= 0 ? o.index : 0;
+  const total = Number.isInteger(o.total) && o.total > 0 ? o.total : 1;
+  const err = new Error(
+    `Segment ${index + 1} of ${total} rendered ${seconds.toFixed(2)} s of audio for `
+    + `${letters} speakable characters; at least ${minSeconds.toFixed(2)} s was expected. `
+    + 'The rendering was refused rather than returned incomplete.');
+  err.code = 'tts_short_render';
+  err.segmentIndex = index;
+  err.segmentTotal = total;
+  err.renderedSeconds = Number(seconds.toFixed(3));
+  err.expectedMinSeconds = Number(minSeconds.toFixed(3));
+  throw err;
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +1266,71 @@ export async function synthesizePcm(opts) {
   const voice = o.voice;
   const sampleRate = ttsOutputRate(o.sampleRate);
 
+  // v13.34.0 -- SPEC-AUDIO-003 W1. SEGMENTING AS A BASE FUNCTION.
+  //
+  // Placed here, after preparation and before either engine tier, for the same
+  // reason normalisation is: this is the one function every synthesis path
+  // reaches, so a stretch the engine would truncate cannot get past it on any
+  // route. The prepared text is cut, not the raw text, because preparation is
+  // what decides the characters the engine actually receives.
+  //
+  // One piece is the overwhelmingly common case and takes exactly the pre-change
+  // path: one engine call with the same arguments, so its bytes are unchanged
+  // (S4). Each rendering is then duration-checked (S2).
+  const pieces = segmentForSynthesis(text);
+  if (1 === pieces.length) {
+    const whole = await renderPreparedPcm({
+      text, voice, lengthScale: o.lengthScale, sampleRate,
+    });
+    assertFullRender({ pcm: whole.pcm, sampleRate: whole.sampleRate, text,
+                       lengthScale: o.lengthScale, index: 0, total: 1 });
+    return whole.pcm;
+  }
+
+  // Several pieces. Rendered one after another rather than through the phrase
+  // pool: this function is itself called from inside that pool, so fanning out
+  // again here would multiply the engine concurrency the pool exists to bound.
+  const rendered = [];
+  let pieceRate = 0;
+  for (let i = 0; i < pieces.length; i += 1) {
+    const part = await renderPreparedPcm({
+      text: pieces[i], voice, lengthScale: o.lengthScale, sampleRate,
+    });
+    assertFullRender({ pcm: part.pcm, sampleRate: part.sampleRate, text: pieces[i],
+                       lengthScale: o.lengthScale, index: i, total: pieces.length });
+    if (pieceRate && part.sampleRate && part.sampleRate !== pieceRate) {
+      // Joining two rates would play half the reply at the wrong pitch. The
+      // engine has never done this, so it is a fault, and a named one.
+      const err = new Error(`Segment ${i + 1} of ${pieces.length} came back at `
+        + `${part.sampleRate} Hz after earlier segments at ${pieceRate} Hz.`);
+      err.code = 'tts_failed';
+      throw err;
+    }
+    pieceRate = part.sampleRate || pieceRate;
+    rendered.push({ pcm: part.pcm, pauseAfterMs: 0 });
+  }
+  // The same edge fades the phrase joins use (non-negotiable 7), so a cut in
+  // the middle of an unpunctuated stretch does not click. No pause is inserted:
+  // kokoro-onnx joins its own batches with none, and these cuts are not
+  // sentence boundaries the analysis chose.
+  return concatPhrasePcm(rendered, pieceRate || sampleRate, prosodyConfig().joinFadeMs);
+}
+
+/**
+ * Render already-prepared text through the resident worker, falling back to a
+ * one-shot process.
+ *
+ * v13.34.0. The body of the pre-change synthesizePcm from this point on, moved
+ * unchanged into its own function so a segmented reply can call it once per
+ * piece. It returns the rate alongside the samples because the duration check
+ * needs the rate the bytes were ACTUALLY produced at, not the one requested.
+ *
+ * @param {{text: string, voice: string, lengthScale?: number, sampleRate: number}} o
+ * @returns {Promise<{pcm: Buffer, sampleRate: number}>}
+ */
+async function renderPreparedPcm(o) {
+  const { text, voice, sampleRate } = o;
+
   // v12.53.0 -- PIPER-PRELOAD-v1.1 Section 4. THE RESIDENT PATH FIRST.
   //
   // The worker holds the model loaded, so this returns without paying the 1 to
@@ -941,7 +1365,7 @@ export async function synthesizePcm(opts) {
     if (viaWorker.degraded && viaWorker.degraded.length) {
       console.warn(`[voice] kokoro degraded: ${viaWorker.degraded.join(', ')}`);
     }
-    return viaWorker.pcm;
+    return { pcm: viaWorker.pcm, sampleRate: reportedRate(viaWorker.sampleRate, sampleRate) };
   }
 
   // ---- CLI fallback (the v12.52.0 path, unchanged) ----------------------
@@ -976,10 +1400,23 @@ export async function synthesizePcm(opts) {
     if (once.sampleRate >= 8000 && once.sampleRate <= 48000) {
       _sampleRates.set(voice, once.sampleRate);
     }
-    return once.pcm;
+    return { pcm: once.pcm, sampleRate: reportedRate(once.sampleRate, sampleRate) };
   } finally {
     releaseTts();
   }
+}
+
+/**
+ * The rate an engine reported for its bytes, when it is a plausible one;
+ * otherwise the rate that was asked for. Same acceptance window the sample-rate
+ * cache above has always used.
+ *
+ * @param {number} reported
+ * @param {number} requested
+ * @returns {number}
+ */
+function reportedRate(reported, requested) {
+  return (reported >= 8000 && reported <= 48000) ? reported : requested;
 }
 
 
@@ -1321,18 +1758,25 @@ export async function synthesizeProsody(opts) {
 
   const rendered = await mapWithLimit(
     speakable, TTS_PHRASE_CONCURRENCY,
-    async (phrase, index) => ({
-      pcm: await synthesizePcm({
-        text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
-        sampleRate: sampleRate,
-        // v13.1.0 -- Section 6.1 rule 2. Only the LAST phrase gets a falling
-        // close; the rest get a continuation rise. Giving every phrase terminal
-        // punctuation would make one sentence audibly break into several, which
-        // is worse than the flatness it was meant to fix.
-        position: (index === speakable.length - 1) ? 'final' : 'continuation',
-      }),
-      pauseAfterMs: phrase.pauseAfterMs,
-    })
+    async (phrase, index) => {
+      try {
+        return {
+          pcm: await synthesizePcm({
+            text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
+            sampleRate: sampleRate,
+            // v13.1.0 -- Section 6.1 rule 2. Only the LAST phrase gets a falling
+            // close; the rest get a continuation rise. Giving every phrase terminal
+            // punctuation would make one sentence audibly break into several, which
+            // is worse than the flatness it was meant to fix.
+            position: (index === speakable.length - 1) ? 'final' : 'continuation',
+          }),
+          pauseAfterMs: phrase.pauseAfterMs,
+        };
+      } catch (err) {
+        // v13.34.0 -- SPEC-AUDIO-003 S2: a short render names the phrase.
+        throw namePhraseFailure(err, index, speakable.length);
+      }
+    }
   );
 
   const pcm = concatPhrasePcm(rendered, sampleRate, cfg.joinFadeMs);
@@ -1430,6 +1874,14 @@ export async function synthesizeProsodyStream(opts, onSegment) {
   let emitted = 0;
   let bytes = 0;
 
+  // v13.34.0 -- SPEC-AUDIO-003 Section 5.3. Null for every request that does
+  // not carry an ElevenLabs configuration, which leaves every branch below
+  // exactly as it was (D7, S4).
+  const el = o.elevenlabs
+    ? createElevenLabsPhraseRenderer({ config: o.elevenlabs, phrases, sampleRate, closesReply })
+    : null;
+  let fallbackAnnounced = false;
+
   /* Results arrive out of order from the pool and must LEAVE in order, so
    * completed-but-not-yet-emitted phrases are parked here until their turn.
    * Bounded by the pool width, so this cannot grow with reply length. */
@@ -1441,24 +1893,102 @@ export async function synthesizeProsodyStream(opts, onSegment) {
       pending.delete(emitted);
       emitted++;
       bytes += segment.pcm.length;
+      // v13.34.0. The first Kokoro phrase after an ElevenLabs failure is
+      // preceded by one announcement, so the listener's voice change is
+      // explained in the stream itself. Called WITHOUT an await before
+      // onSegment so both writes are issued in this tick, in order: a
+      // concurrent drain cannot slip a later phrase between them.
+      let announced = null;
+      if (el && !fallbackAnnounced && 'kokoro' === segment.engine && el.reason
+          && 'function' === typeof o.onEngineFallback) {
+        fallbackAnnounced = true;
+        announced = o.onEngineFallback({ reason: el.reason, index: segment.index });
+      }
       await onSegment(segment);
+      if (announced) await announced;
+    }
+  }
+
+  /**
+   * Re-render with Kokoro any parked ElevenLabs phrase that now sits at or
+   * after the first ElevenLabs failure.
+   *
+   * Reached only when a failure lands while a LATER phrase has already
+   * finished on ElevenLabs. Emitting it as it stands would switch the voice
+   * back, and Section 5.3 allows the voice to change once. It cannot have been
+   * emitted yet, because emission is in order and the failing phrase is not
+   * parked until this has run.
+   *
+   * @returns {Promise<void>}
+   */
+  async function demoteParked() {
+    for (const [i, seg] of [...pending]) {
+      if ('elevenlabs' !== seg.engine || 'kokoro' !== el.engineFor(i)) continue;
+      if (pending.get(i) !== seg) continue;   // another runner is already on it
+      pending.delete(i);
+      const pcm = await kokoroPhrase(phrases[i], i);
+      pending.set(i, { ...seg, pcm: applyEdgeFades(pcm, cfg.joinFadeMs, sampleRate),
+                       engine: 'kokoro' });
+    }
+  }
+
+  /**
+   * The Kokoro rendering of one phrase. v13.34.0: extracted so a phrase the
+   * ElevenLabs path could not render is rendered here with exactly the
+   * arguments a Kokoro-only reply would have used.
+   *
+   * @param {object} phrase
+   * @param {number} index
+   * @returns {Promise<Buffer>}
+   */
+  async function kokoroPhrase(phrase, index) {
+    try {
+      return await synthesizePcm({
+        text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
+        sampleRate: sampleRate,
+        // v13.1.0. Same rule as the buffered path. The two MUST agree: a reply
+        // that streamed and one that fell back would otherwise be phrased
+        // differently, which sounds like the assistant changing its mind.
+        //
+        // v13.4.0. `closesReply` is what makes an incremental BATCH different
+        // from a whole reply: the last phrase of a mid-reply batch is not the
+        // last phrase of the reply, and giving it a closing contour would make
+        // the reply land on a full stop several times before it ends.
+        position: (closesReply && index === phrases.length - 1) ? 'final' : 'continuation',
+      });
+    } catch (err) {
+      // v13.34.0 -- SPEC-AUDIO-003 S2: a short render names the phrase.
+      throw namePhraseFailure(err, index, total);
     }
   }
 
   await mapWithLimit(phrases, TTS_PHRASE_CONCURRENCY, async (phrase, index) => {
-    const pcm = await synthesizePcm({
-      text: phrase.text, voice: o.voice, lengthScale: phrase.lengthScale,
-      sampleRate: sampleRate,
-      // v13.1.0. Same rule as the buffered path. The two MUST agree: a reply
-      // that streamed and one that fell back would otherwise be phrased
-      // differently, which sounds like the assistant changing its mind.
-      //
-      // v13.4.0. `closesReply` is what makes an incremental BATCH different
-      // from a whole reply: the last phrase of a mid-reply batch is not the
-      // last phrase of the reply, and giving it a closing contour would make
-      // the reply land on a full stop several times before it ends.
-      position: (closesReply && index === phrases.length - 1) ? 'final' : 'continuation',
-    });
+    // v13.34.0 -- SPEC-AUDIO-003 Section 5.3. With ElevenLabs configured the
+    // phrase is offered to that engine first. `engineFor` answers Kokoro for
+    // every phrase at or after the first ElevenLabs failure, so the voice
+    // changes at most once in a reply and never back.
+    let pcm = null;
+    let engine = 'kokoro';
+    if (el && 'elevenlabs' === el.engineFor(index)) {
+      pcm = await el.render(phrase, index);
+      if (pcm) engine = 'elevenlabs';
+      // An EARLIER phrase may have failed while this one was rendering. This
+      // phrase then belongs to Kokoro too, or the voice would switch back.
+      if (pcm && 'kokoro' === el.engineFor(index)) { pcm = null; engine = 'kokoro'; }
+    }
+    if (!pcm) pcm = await kokoroPhrase(phrase, index);
+    if (el && el.reason) {
+      await demoteParked();
+      // An earlier phrase may ALSO have failed during the await above. Its
+      // runner's demotion could not see this phrase (not parked yet), so this
+      // phrase checks itself once more. No await separates this check from
+      // pending.set below, so nothing can fail in between.
+      if ('elevenlabs' === engine && 'kokoro' === el.engineFor(index)) {
+        pcm = await kokoroPhrase(phrase, index);
+        engine = 'kokoro';
+      }
+    }
+
     pending.set(index, {
       index, total,
       pcm: applyEdgeFades(pcm, cfg.joinFadeMs, sampleRate),
@@ -1466,6 +1996,7 @@ export async function synthesizeProsodyStream(opts, onSegment) {
       profile: phrase.profile,
       lengthScale: phrase.lengthScale,
       sampleRate,
+      engine,
     });
     await drain();
   });
@@ -1474,7 +2005,212 @@ export async function synthesizeProsodyStream(opts, onSegment) {
   // phrase completes before an earlier one it was waiting on.
   await drain();
 
-  return { phrases: total, bytes, sampleRate };
+  // v13.34.0. The engine summary is added only when ElevenLabs was offered, so
+  // a Kokoro-only caller receives the same three fields it always has.
+  if (!el) return { phrases: total, bytes, sampleRate };
+  return {
+    phrases: total, bytes, sampleRate,
+    engine: el.reason ? 'kokoro' : 'elevenlabs',
+    engineFallback: el.reason
+      ? { reason: el.reason, index: Number.isFinite(el.fallbackFrom) ? el.fallbackFrom : 0 }
+      : null,
+  };
+}
+
+/**
+ * Name the phrase a short render came from.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 S2. synthesizePcm knows only its own segment
+ * index; the prosody paths know which phrase of the reply it was. Both are
+ * kept, and the message names the phrase without carrying any of its text.
+ *
+ * @param {Error} err
+ * @param {number} index
+ * @param {number} total
+ * @returns {Error} The same error, annotated.
+ */
+function namePhraseFailure(err, index, total) {
+  if (err && 'tts_short_render' === err.code && undefined === err.phraseIndex) {
+    err.phraseIndex = index;
+    err.phraseTotal = total;
+    err.message = `Phrase ${index + 1} of ${total}: ${err.message}`;
+  }
+  return err;
+}
+
+/**
+ * The text ElevenLabs receives for one phrase.
+ *
+ * Kokoro's misaki markup is removed (it would be read aloud), and the text runs
+ * through the same preparation pipeline in its markup-free espeak mode, so
+ * markdown and link syntax are flattened exactly as they are for Kokoro.
+ *
+ * @param {string} text
+ * @param {boolean} closing Whether this phrase ends the reply.
+ * @returns {string}
+ */
+function elevenLabsText(text, closing) {
+  const prepared = prepareForKokoro(stripMisakiMarkup(text), {
+    g2p: 'espeak', emphasis: false, lexicon: {},
+    position: closing ? 'final' : 'continuation',
+  });
+  return prepared.text;
+}
+
+/**
+ * Per-reply ElevenLabs state for the phrase-by-phrase paths.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 Section 5.3. "The first ElevenLabs failure in a
+ * reply moves the whole reply to Kokoro (a voice that changes once is
+ * acceptable; a voice that changes per segment mid-reply is not)."
+ *
+ * `fallbackFrom` is the lowest phrase index that has failed. Every phrase at or
+ * after it is Kokoro's, including phrases that finished on ElevenLabs before
+ * the failure landed (the stream path re-renders those before they are
+ * emitted). `reason` is the most severe failure seen, so a dead key is never
+ * reported as a mere error.
+ *
+ * @param {{config: object, phrases: Array<object>, sampleRate: number, closesReply: boolean}} o
+ * @returns {{engineFor: Function, render: Function, reason: string|null, fallbackFrom: number}}
+ */
+function createElevenLabsPhraseRenderer(o) {
+  const last = o.phrases.length - 1;
+  const texts = o.phrases.map((p, i) => elevenLabsText(p.text, o.closesReply && i === last));
+  const state = { reason: null, fallbackFrom: Infinity };
+
+  return {
+    get reason() { return state.reason; },
+    get fallbackFrom() { return state.fallbackFrom; },
+
+    /** @param {number} index @returns {'elevenlabs'|'kokoro'} */
+    engineFor(index) {
+      return index >= state.fallbackFrom ? 'kokoro' : 'elevenlabs';
+    },
+
+    /**
+     * Render one phrase with ElevenLabs. Resolves to PCM, or to null after
+     * recording the failure; never rejects, because the caller's answer to a
+     * failure is always the same (render it with Kokoro).
+     *
+     * @param {object} phrase
+     * @param {number} index
+     * @returns {Promise<Buffer|null>}
+     */
+    async render(phrase, index) {
+      const text = texts[index];
+      // Nothing left to say once markup and markdown are gone. Speaking it as
+      // silence keeps the voice on ElevenLabs; handing it to Kokoro would switch
+      // the voice for a phrase with no words in it.
+      if (!text || !isSpeakable(text)) return Buffer.alloc(0);
+      try {
+        const out = await synthesizeElevenLabsPcm({
+          config: o.config, text,
+          previousText: index > 0 ? texts[index - 1] : '',
+          nextText: index < last ? texts[index + 1] : '',
+          sampleRate: o.sampleRate,
+        });
+        if (out.sampleRate !== o.sampleRate) {
+          const err = new Error(`ElevenLabs cannot produce ${o.sampleRate} Hz PCM.`);
+          err.reason = 'error';
+          throw err;
+        }
+        assertFullRender({ pcm: out.pcm, sampleRate: out.sampleRate, text,
+                           lengthScale: 1, index, total: o.phrases.length });
+        return out.pcm;
+      } catch (err) {
+        const reason = (err && err.reason) || 'error';
+        state.reason = severerReason(state.reason, reason);
+        if (index < state.fallbackFrom) state.fallbackFrom = index;
+        // Reason and status only. The adapter's errors never carry the key,
+        // and this line does not print the error message regardless.
+        console.warn(`[voice] elevenlabs phrase ${index + 1}/${o.phrases.length} failed `
+          + `(${reason}${err && err.status ? ` ${err.status}` : ''}); `
+          + 'the rest of the reply is rendered by Kokoro');
+        return null;
+      }
+    },
+  };
+}
+
+/**
+ * Render a whole reply with the user's ElevenLabs voice, for the buffered route.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 Sections 5.3 and 5.5.
+ *
+ * ALL OR NOTHING. Any failure rejects, and the route renders the WHOLE reply
+ * with Kokoro instead: nothing has been sent yet, so the listener hears one
+ * voice throughout. The rejection carries `reason` (invalid_key, quota, error)
+ * for the route to report.
+ *
+ *   mode 'prosody'  The reply is cut by the prosody analysis and the analysed
+ *                   pauses are kept between phrases; Kokoro's per-phrase
+ *                   length_scale is not sent, because ElevenLabs voices carry
+ *                   their own pacing in the user's account.
+ *   mode 'flat'     The reply is cut only at sentence boundaries into segments
+ *                   of at most ELEVENLABS_SEGMENT_CHARS, joined with edge fades
+ *                   and no pause.
+ *
+ * @param {{text: string, elevenlabs: object, sampleRate?: number,
+ *          mode?: 'flat'|'prosody', config?: object}} opts
+ * @returns {Promise<{wav: Buffer, sampleRate: number, phrases: number, path: string}>}
+ */
+export async function synthesizeElevenLabs(opts) {
+  const o = opts || {};
+  const raw = String(o.text || '');
+  if (!raw.trim()) {
+    const err = new Error('No text to synthesise.');
+    err.code = 'empty_text';
+    throw err;
+  }
+  const cfg = o.config || prosodyConfig();
+  const { sampleRate } = elevenLabsOutputFormat(ttsOutputRate(o.sampleRate));
+
+  let units;
+  if ('prosody' === o.mode) {
+    const phraseAnalysis = analyse(raw, { baseLengthScale: 1, config: cfg });
+    const kept = speakablePhrases(phraseAnalysis.phrases);
+    const lastIndex = kept.length - 1;
+    units = kept.map((p, i) => ({ text: elevenLabsText(p.text, i === lastIndex),
+                                  pauseAfterMs: p.pauseAfterMs }));
+  } else {
+    const whole = elevenLabsText(raw, true);
+    const size = elevenLabsSegmentChars();
+    units = segmentForSynthesis(whole, { maxRunChars: size, maxSegmentChars: size })
+      .map((t) => ({ text: t, pauseAfterMs: 0 }));
+  }
+  units = units.filter((u) => u.text && isSpeakable(u.text));
+  if (!units.length) {
+    const err = new Error('No text to synthesise.');
+    err.code = 'empty_text';
+    throw err;
+  }
+
+  // One budget for the whole reply, inside the gateway's deadline, so the
+  // Kokoro fallback always has time to run (see elevenLabsReplyBudgetMs).
+  const deadlineAt = Date.now() + elevenLabsReplyBudgetMs(raw.length);
+  const rendered = await mapWithLimit(units, elevenLabsConcurrency(), async (unit, index) => {
+    const out = await synthesizeElevenLabsPcm({
+      config: o.elevenlabs, text: unit.text,
+      previousText: index > 0 ? units[index - 1].text : '',
+      nextText: index < units.length - 1 ? units[index + 1].text : '',
+      sampleRate, deadlineAt,
+    });
+    assertFullRender({ pcm: out.pcm, sampleRate: out.sampleRate, text: unit.text,
+                       lengthScale: 1, index, total: units.length });
+    return { pcm: out.pcm, pauseAfterMs: unit.pauseAfterMs };
+  });
+
+  const pcm = concatPhrasePcm(rendered, sampleRate, cfg.joinFadeMs);
+  if (!pcm.length) {
+    const err = new Error('ElevenLabs produced no audio.');
+    err.code = 'el_error';
+    err.reason = 'error';
+    throw err;
+  }
+  return {
+    wav: wrapPcmAsWav(pcm, sampleRate), sampleRate, phrases: units.length,
+    path: 'prosody' === o.mode ? 'elevenlabs_prosody' : 'elevenlabs_flat',
+  };
 }
 
 /**
@@ -1621,6 +2357,8 @@ export function ttsWorkerState() {
 export default {
   probeEngines, engineState, resetEngineState, transcribe, synthesize,
   synthesizePcm, synthesizeProsody, synthesizeProsodyStream,
+  // v13.34.0 -- SPEC-AUDIO-003.
+  synthesizeElevenLabs, segmentForSynthesis, assertFullRender, speakableCharCount,
   installedVoices, wrapPcmAsWav, voiceSampleRate, voiceLengthScale,
   silencePcm, applyEdgeFades, concatPhrasePcm,
   describeFailure, prosodyState, prewarmTts, ttsWorkerState,

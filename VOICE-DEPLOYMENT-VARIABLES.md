@@ -197,3 +197,32 @@ implies**.
 and `prosody.emphasis` reports `configured` and `effective` separately — on the
 espeak path emphasis is configured on and effective false, by design, because
 emitting the markup would have the assistant read the brackets aloud.
+
+---
+
+## v13.34.0 additions (SPEC-AUDIO-003)
+
+None of these needs to be set. Every one has a working default; they exist so
+the bounds are data, not code.
+
+### Segmenting (W1)
+
+| Variable | Default | Range | What it does |
+| --- | --- | --- | --- |
+| `VOICE_MAX_TTS_CHARS` | `100000` | 5000..500000 | Anti-abuse ceiling on text submitted for speech. Above it the request is refused with a NAMED `text_too_long`. **Was 5000**, which refused long replies outright; a value below 5000 is now ignored so an old setting cannot reinstate that drop. |
+| `VOICE_TTS_MAX_RUN_CHARS` | `350` | 80..480 | Longest stretch of text between `. , ! ? ;` handed to Kokoro in one call. kokoro-onnx 0.4.9 truncates anything over 510 phonemes in such a stretch and still reports success. |
+| `VOICE_TTS_SEGMENT_CHARS` | `5000` | 200..20000 | Longest text handed to one engine call. Longer replies are cut at sentence boundaries. |
+| `VOICE_SHORT_RENDER_MAX_CPS` | `40` | 10..200 | Duration floor for the short-render check, in letters a second at length_scale 1. |
+| `VOICE_SHORT_RENDER_MIN_CHARS` | `60` | 1..10000 | Below this many letters the short-render check does not run. |
+
+### ElevenLabs, per user (W3)
+
+There is no platform ElevenLabs key and none should be set: each user's own key
+arrives from the gateway in the request that needs it.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `ELEVENLABS_API_BASE` | `https://api.elevenlabs.io` | Test-only override. Leave unset in production. |
+| `ELEVENLABS_TIMEOUT_MS` | `30000` | Per-request timeout (1000..120000). |
+| `ELEVENLABS_CONCURRENCY` | `2` | Phrases in flight at once against one user's account (1..8). |
+| `ELEVENLABS_SEGMENT_CHARS` | `2500` | Longest segment the non-prosody ElevenLabs path sends in one call (200..9000). |
