@@ -1271,6 +1271,12 @@ export async function synthesizePcm(opts) {
     throw err;
   }
 
+  // v13.35.0 -- W7 deliverable 5. The request-builder assertion. After the
+  // strip above it cannot fire for any text the token classes describe; it is
+  // the backstop for a future change to stripMarkers or to the preparation
+  // order, and refuses by name rather than letting a tag be read aloud.
+  assertTagless(text, 'kokoro request');
+
   // Checked here as well as at the route. This function is the last thing
   // before a GPL process runs against a voice model, and compliance obligation
   // 2 is not something to enforce only at the edge.
