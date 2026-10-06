@@ -227,6 +227,9 @@ async function boot() {
       transcribe:     async () => ({ text: '' }),
       synthesize:     async () => ({ wav: Buffer.alloc(0) }),
       synthesizeProsody: async () => ({ wav: Buffer.alloc(0), path: 'prosody' }),
+      // v13.34.0 -- SPEC-AUDIO-003. routes/voice.js imports the buffered
+      // ElevenLabs renderer; this file never reaches it, so it only has to exist.
+      synthesizeElevenLabs: async () => ({ wav: Buffer.alloc(0), path: 'elevenlabs_flat' }),
       synthesizeProsodyStream: async (opts, onSegment) => {
         calls.push(opts);
         // Phrases of trivial PCM, delivered in order, so the route's framing
@@ -415,7 +418,11 @@ test('an out-of-range offset is clamped rather than refused', async () => {
   assert.equal(lines[lines.length - 1].type, 'end');
 });
 
-test('text over the ceiling is refused with 413 before any synthesis', async () => {
+// v13.34.0 -- SPEC-AUDIO-003 W1 (S1). The 5,000-character refusal was a drop
+// point: a long reply could not be spoken at all. This test pinned it, so it is
+// rewritten to the new contract rather than deleted: a reply past the OLD limit
+// is accepted, and only text past the named anti-abuse ceiling is refused.
+test('a reply over the old 5,000-character limit is no longer refused', async () => {
   const app = await boot();
   /* The server is a singleton shared by every test here; it is closed by the
      process exiting, not per test. */
@@ -426,9 +433,26 @@ test('text over the ceiling is refused with 413 before any synthesis', async () 
     body: JSON.stringify({ text: 'x'.repeat(6000), offset: 0, voice: 'af_heart' }),
   });
 
+  assert.equal(res.status, 200, 'the old ceiling no longer refuses a long reply');
+  const lines = await ndjson(res);
+  assert.equal(lines[lines.length - 1].type, 'end');
+});
+
+test('text over the anti-abuse ceiling is refused with a NAMED 413 before any synthesis', async () => {
+  const app = await boot();
+  /* The server is a singleton shared by every test here; it is closed by the
+     process exiting, not per test. */
+
+  const res = await fetch(`${app.base}/voice/synthesize/incremental`, {
+    method: 'POST',
+    headers: HEADERS,
+    body: JSON.stringify({ text: 'x'.repeat(100_001), offset: 0, voice: 'af_heart' }),
+  });
+
   assert.equal(res.status, 413);
   const body = await res.json();
   assert.equal(body.error, 'text_too_long');
+  assert.match(body.message, /the limit is 100000/u, 'the ceiling is named, never silent');
 });
 
 test('an invalid speed is a 422 with a message the UI can render', async () => {
