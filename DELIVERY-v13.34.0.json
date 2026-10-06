@@ -1,0 +1,38 @@
+{
+  "version": "13.34.0",
+  "previous": "13.32.0",
+  "skipped": "13.33.0 (parked register-layer build, SPEC-AUDIO-003 Section 10)",
+  "work_order": "SPEC-AUDIO-003 rev 1 (2026-10-05), slices W1 (connector half) and W3",
+  "changed_files": [
+    "src/voice/voice-engines.js",
+    "src/voice/elevenlabs.js (new)",
+    "src/routes/voice.js",
+    "src/tests/voice-segmenting.test.js (new)",
+    "src/tests/voice-elevenlabs.test.js (new)",
+    "src/tests/voice-elevenlabs-race.test.js (new)",
+    "src/tests/fixtures/fake-kokoro-once.mjs (new)",
+    "src/tests/voice-incremental.test.js (the 5,000-refusal pin rewritten to the new contract; mock gains synthesizeElevenLabs)",
+    "package.json",
+    "VOICE-DEPLOYMENT-VARIABLES.md",
+    "CHANGELOG-v13.34.0.md (new)",
+    "DELIVERY-v13.34.0.json (new)"
+  ],
+  "full_suite": {
+    "runner": "every src/tests/*.test.js and tests/*.test.js in its own `node --experimental-test-module-mocks --test --test-reporter=tap` process, plus `npm test`; dependencies from `npm ci` (the archive's node_modules is partial; the image runs npm ci)",
+    "before": { "artifact": "claude-connector.zip as uploaded (13.32.0)", "tests": 1177, "pass": 1175, "fail": 1, "skipped": 1 },
+    "after": { "artifact": "this archive (13.34.0)", "tests": 1215, "pass": 1213, "fail": 1, "skipped": 1 },
+    "executed_delta": "+38: voice-segmenting 18, voice-elevenlabs 15, voice-elevenlabs-race 4 (all new), voice-incremental +1 (one test rewritten as two). Every other file identical in tests/pass/fail/skipped.",
+    "net_new_failures": 0,
+    "baseline_red_carried": [ "src/tests/voice-gpl-boundary.test.js: no Piper artifact survives anywhere in the source tree (piper_worker.py still exists)" ]
+  },
+  "falsifiers_red_on_previous_tree": "voice-segmenting.test.js against 13.32.0: 15 of 16 red (S1, S2, S3, S5); S4 equivalence passes on both, as it must. voice-elevenlabs*.test.js cannot load on 13.32.0 (no adapter).",
+  "deployment": {
+    "mode": "in-place",
+    "order": "connector 13.34.0 first, then gateway 2.248.0, then client 5.230.0",
+    "variables_added": [ "VOICE_TTS_MAX_RUN_CHARS", "VOICE_TTS_SEGMENT_CHARS", "VOICE_SHORT_RENDER_MAX_CPS", "VOICE_SHORT_RENDER_MIN_CHARS", "ELEVENLABS_API_BASE (tests only)", "ELEVENLABS_TIMEOUT_MS", "ELEVENLABS_CONCURRENCY", "ELEVENLABS_SEGMENT_CHARS", "ELEVENLABS_BUDGET_MS_PER_5000" ],
+    "variables_changed": [ "VOICE_MAX_TTS_CHARS default 5000 -> 100000; accepted range 5000..500000" ],
+    "variables_removed": [],
+    "none_required": true,
+    "rollback_target": "13.32.0"
+  }
+}

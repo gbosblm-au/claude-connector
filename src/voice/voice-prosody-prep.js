@@ -289,7 +289,10 @@ function applyLexicon(text, lexicon) {
  * @param {'espeak'|'misaki'} [options.g2p='espeak'] Which phonemiser will run.
  * @param {boolean} [options.emphasis=true] Emit stress markup for bold text.
  * @param {Object<string,string>} [options.lexicon={}] Pronunciation overrides.
- * @param {'whole'|'final'|'continuation'} [options.position='whole']
+ * @param {'whole'|'final'|'continuation'|'none'} [options.position='whole']
+ *   'none' (v13.35.0, work order W7): no contour shaping at all. For the
+ *   ElevenLabs engine form, which wants this pipeline's flattening and
+ *   normalisation but not Kokoro's appended continuation comma.
  * @param {string} [options.beat=','] Punctuation a dialogue beat becomes.
  * @returns {{text: string, beats: number, tagged: number, overrides: Array<string>,
  *            suppressed: Array<string>, g2p: string}}
@@ -297,7 +300,7 @@ function applyLexicon(text, lexicon) {
 export function prepareForKokoro(input, options) {
   const o = options || {};
   const g2p = G2P_MODES.includes(o.g2p) ? o.g2p : 'espeak';
-  const position = ['whole', 'final', 'continuation'].includes(o.position)
+  const position = ['whole', 'final', 'continuation', 'none'].includes(o.position)
     ? o.position : 'whole';
   const lexicon = (o.lexicon && 'object' === typeof o.lexicon) ? o.lexicon : {};
   const beat = ('string' === typeof o.beat && o.beat) ? o.beat : ',';
@@ -369,7 +372,7 @@ export function prepareForKokoro(input, options) {
   //    so it has to run after every transform that can change it -- a beat
   //    rewritten to a trailing comma, or a flattened link that removed the last
   //    word, both move the character this decision reads.
-  text = shapeContour(text.trim(), position);
+  text = 'none' === position ? text.trim() : shapeContour(text.trim(), position);
 
   // Whitespace tidy. The beat rewrite and the link flattening can both leave a
   // double space, and Kokoro's tokenizer treats runs of space inconsistently.

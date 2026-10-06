@@ -84,6 +84,18 @@ import { analyse, prosodyConfig, replyHash,
 // incremental route's segmentation. Pure and synchronous: it decides only which
 // text is FINISHED, and does no prosody of its own.
 import { splitStream, splitDefaults } from '../voice/voice-stream-split.js';
+// v13.35.0 -- SPEC-AUDIO-004 W6. ElevenLabs speech-to-text with the user's key.
+import { elevenLabsSttFrom, transcribeElevenLabs } from '../voice/elevenlabs-stt.js';
+// v13.34.0 -- SPEC-AUDIO-003. The per-user ElevenLabs engine: the buffered
+// renderer, and the parser for the configuration the gateway forwards.
+import { synthesizeElevenLabs }        from '../voice/voice-engines.js';
+import { parseElevenLabsConfig }       from '../voice/elevenlabs.js';
+// v13.36.0 -- W7 rev 2.1 section 6: the probe, through the real adapter and the
+// real engine-text path, and the fixtures from the register grammar file.
+import { elevenLabsEngineText, wrapPcmAsWav, silencePcm } from '../voice/voice-engines.js';
+import { synthesizeElevenLabsPcm }     from '../voice/elevenlabs.js';
+import { TAG_FIXTURE, WORD_FIXTURE }   from '../voice/engine-form.js';
+import { elevenLabsSttModel }          from '../voice/elevenlabs-stt.js';
 
 /* Section 15: "Rate limiting per user on both voice routes." Voice is far more
  * expensive per request than a normal API call -- one transcription can occupy
@@ -132,6 +144,130 @@ function intEnv(name, fallback) {
 }
 
 /**
+ * The anti-abuse ceiling on text submitted for speech.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 W1 (D1, S1).
+ *
+ * THIS USED TO BE 5,000, AND IT WAS A DROP POINT. A reply longer than that was
+ * refused with 413, so a long answer simply could not be spoken, and the client
+ * pre-trimmed to 4,800 characters to stay under it, which spoke the start of a
+ * reply and silently lost the rest. Length is now handled by segmentation in
+ * voice-engines.js, which renders every clause however long the reply is.
+ *
+ * What remains is a bound on abuse, not on replies: 100,000 characters is about
+ * two hours of speech, far above any assistant reply. It is still NAMED when it
+ * fires (`text_too_long`, with the limit in the message), never a silent cut.
+ * VOICE_MAX_TTS_CHARS still overrides it, now in the range 5,000..500,000 so an
+ * old value carried over from the previous default cannot reinstate the drop
+ * below the reply lengths this release exists to serve, and a typo cannot
+ * remove the bound altogether.
+ *
+ * @returns {number}
+ */
+function maxTtsChars() {
+  const raw = String(process.env.VOICE_MAX_TTS_CHARS || '').trim();
+  const n = parseInt(raw, 10);
+  if (raw && Number.isFinite(n) && n >= 5_000 && n <= 500_000) return n;
+  // An ignored setting is said out loud, once per value, so an operator who
+  // set it is not left believing it applies.
+  if (raw && _ignoredMaxChars !== raw) {
+    _ignoredMaxChars = raw;
+    console.warn(`[voice] VOICE_MAX_TTS_CHARS=${raw.slice(0, 20)} is outside 5000..500000 and `
+      + 'is ignored; the ceiling is 100000');
+  }
+  return 100_000;
+}
+
+/** The last out-of-range VOICE_MAX_TTS_CHARS warned about. */
+let _ignoredMaxChars = '';
+
+/**
+ * JSON body limit for the synthesis routes. Sized for maxTtsChars() of the
+ * widest UTF-8 text (four bytes a character) with room for the other fields.
+ * The previous 256 KB would have refused a long non-Latin reply in the body
+ * parser, before the named ceiling above could answer.
+ */
+const TTS_JSON_LIMIT = '2mb';
+
+/**
+ * The ElevenLabs configuration the gateway forwarded, if any.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 Section 5.3. Returns null for every request that
+ * carries no `elevenlabs` field, which is every user who has not configured it:
+ * nothing else in a route changes for them (D7, E8). A malformed value comes
+ * back as {ok:false}; the route then renders the whole reply with Kokoro and
+ * reports the fallback, because a reply that is not spoken over a gateway
+ * fault would make the fault the user's problem.
+ *
+ * @param {object} body
+ * @returns {null|{ok: boolean, config?: object, reason?: string}}
+ */
+function elevenLabsFrom(body) {
+  return parseElevenLabsConfig(body ? body.elevenlabs : undefined);
+}
+
+/**
+ * The model attribution for an ElevenLabs request's log line (W7 rev 2.1
+ * section 5.1): which id was in force, who supplied it (the user's setting,
+ * the gateway's default, or this connector's constant), and whether the tag
+ * switch was on. Empty for a request without ElevenLabs, so a Kokoro-only log
+ * line is unchanged.
+ *
+ * @param {object|null} elRequest
+ * @returns {object}
+ */
+function elModelMeta(elRequest) {
+  if (!elRequest || !elRequest.ok) return {};
+  return { el_model: elRequest.config.modelId, el_model_source: elRequest.config.modelSource,
+           el_tags: elRequest.config.tags ? 'on' : undefined };
+}
+
+/**
+ * Report which engine spoke, on the response headers.
+ *
+ * Set ONLY when ElevenLabs was requested, so a Kokoro-only response carries
+ * exactly the headers it always has (E8). The gateway reads
+ * X-Tenax-Voice-Fallback to disable a dead key (invalid_key) or record quota.
+ *
+ * @param {object} res
+ * @param {'elevenlabs'|'kokoro'} engine
+ * @param {string|null} fallback invalid_key | quota | error, or null.
+ * @returns {void}
+ */
+function setEngineHeaders(res, engine, fallback) {
+  try {
+    res.setHeader('X-Tenax-Voice-Engine', engine);
+    if (fallback) res.setHeader('X-Tenax-Voice-Fallback', fallback);
+  } catch (err) {
+    // Headers already sent. The log line is the record either way.
+  }
+}
+
+/**
+ * The client-facing message for a synthesis failure.
+ *
+ * v13.34.0 -- SPEC-AUDIO-003 S2. A short render names the segment it came
+ * from, because "the reply was not spoken rather than spoken incompletely" is
+ * the whole point of raising it, and the index is safe to show: it carries no
+ * text and no engine internals.
+ *
+ * @param {Error} err
+ * @param {string} fallbackMessage
+ * @returns {string}
+ */
+function synthesisFailureMessage(err, fallbackMessage) {
+  if (err && 'tts_short_render' === err.code) {
+    const n = Number.isInteger(err.phraseIndex) ? err.phraseIndex : err.segmentIndex;
+    const total = Number.isInteger(err.phraseTotal) ? err.phraseTotal : err.segmentTotal;
+    if (Number.isInteger(n) && Number.isInteger(total)) {
+      return `Segment ${n + 1} of ${total} came back shorter than its text, so the reply `
+        + 'was not spoken rather than spoken incompletely. The connector log has the detail.';
+    }
+  }
+  return fallbackMessage;
+}
+
+/**
  * Per-user limiter.
  *
  * Keyed on the authenticated identity where there is one, falling back to IP.
@@ -175,6 +311,10 @@ const voiceLimiter = rateLimit({
  * Keyed identically to voiceLimiter so one user cannot get a second budget by
  * moving between the two routes. */
 const INCREMENTAL_MAX = intEnv('VOICE_INCREMENTAL_RATE_MAX', 240);
+
+/** v13.35.0 (W7). Reply text either side of an incremental batch, sent to
+ * ElevenLabs as previous_text / next_text. Matches the adapter's own bound. */
+const INCREMENTAL_CONTEXT_CHARS = 500;
 
 const incrementalLimiter = rateLimit({
   windowMs: WINDOW_MS,
@@ -723,8 +863,43 @@ export function registerVoiceRoutes(app) {
         return;
       }
 
+      // v13.35.0 -- SPEC-AUDIO-004 W6. Null unless the gateway forwarded the
+      // user's key, which it does only when their speech-to-text switch is on.
+      // For everyone else nothing below differs from the baseline: no header,
+      // no log field, Whisper as before (D3, T1).
+      const elStt = elevenLabsSttFrom(req);
+      let sttEngine = 'whisper';
+      let sttFallback = null;
+      let elResult = null;
+      if (elStt) {
+        if (!elStt.ok) {
+          // A gateway fault, not the user's: named, and Whisper transcribes.
+          sttFallback = 'error';
+          console.warn('[voice] the gateway forwarded a malformed ElevenLabs key header '
+            + `(${elStt.reason}); transcribing with Whisper`);
+        } else {
+          try {
+            elResult = await transcribeElevenLabs({
+              apiKey: elStt.apiKey, audio, format: check.format,
+              language: language.trim().toLowerCase().slice(0, 8) || undefined,
+              durationHint: check.duration_seconds,
+            });
+            sttEngine = 'elevenlabs';
+          } catch (err) {
+            // Reason and status only; the adapter's errors never carry the key.
+            sttFallback = (err && err.reason) || 'error';
+            console.warn(`[voice] elevenlabs transcription failed (${sttFallback}`
+              + `${err && err.status ? ` ${err.status}` : ''}); transcribing with Whisper`);
+          }
+        }
+        // Set before Whisper runs, so a Whisper failure after an ElevenLabs
+        // 401 still tells the gateway to switch the dead key off.
+        res.setHeader('X-Tenax-Stt-Engine', sttEngine);
+        if (sttFallback) res.setHeader('X-Tenax-Stt-Fallback', sttFallback);
+      }
+
       try {
-        const result = await transcribe(audio, {
+        const result = elResult || await transcribe(audio, {
           format: check.format,
           language: language.trim().toLowerCase().slice(0, 8) || undefined,
           model: model.trim() || undefined,
@@ -736,6 +911,9 @@ export function registerVoiceRoutes(app) {
           audio_seconds: (result.duration_seconds || 0).toFixed(2),
           language: result.language || 'auto',
           elapsed_ms: Date.now() - started,
+          // v13.35.0. Present only when ElevenLabs was requested.
+          engine: elStt ? sttEngine : undefined,
+          el_fallback: sttFallback || undefined,
         });
 
         res.json({
@@ -751,12 +929,155 @@ export function registerVoiceRoutes(app) {
         const known = { unsupported_model: 422, audio_missing: 422, stt_unavailable: 503 };
         const status = known[err.code] || 500;
         logMeta('stt_error', { code: err.code || 'stt_failed', status,
-                               elapsed_ms: Date.now() - started });
+                               elapsed_ms: Date.now() - started,
+                               el_fallback: sttFallback || undefined });
         res.status(status).json({
           error: err.code || 'stt_failed',
           message: status === 500 ? 'Transcription failed.' : err.message,
         });
       }
+    });
+
+  // -------------------------------------------------------------------------
+  // POST /voice/elevenlabs/probe   (v13.36.0, W7 rev 2.1 section 6)
+  // -------------------------------------------------------------------------
+  //
+  // ONE instrument for the model, pin and tag questions. The gateway calls it
+  // with the user's sealed key, unsealed for this request only (the key is
+  // never in this connector's environment, section 6.1 and non-goal 18), and
+  // the request goes through the REAL adapter and the real engine-text path:
+  //
+  //   capability 'tts'  synthesizeElevenLabsPcm with the text the synthesis
+  //                     paths would send (elevenLabsEngineText): the fixture
+  //                     'word' (model availability, section 6.2 item 2), the
+  //                     fixture 'tags' (the tag-capability fixture, section 7),
+  //                     or the caller's own text up to 500 characters.
+  //   capability 'stt'  transcribeElevenLabs with 0.5 s of silence and the
+  //                     pinned (or the named) speech-to-text model.
+  //
+  // Always 200 once the request is well formed: the answer IS the vendor's
+  // answer, described. `verdict` follows the pin rule of section 6.2 item 1:
+  // 'accepted' for a 2xx, 'rejected' when the endpoint refused the request it
+  // was given (400, 404, 422), 'unverified' when it could not be asked
+  // (401, 402, 429, 5xx, unreachable). A check that cannot authenticate is
+  // never reported as a missing or rejected model. A 200 proves the id was
+  // accepted; it does not prove a tag rendered (section 6.2 item 3): only the
+  // returned audio, listened to, settles that.
+  //
+  // `model_echo` answers section 6.4 from the response rather than assuming:
+  // the value of any response header whose name contains "model", or null
+  // when the vendor echoes none. Nothing here claims a served model the
+  // response did not state.
+  app.post('/voice/elevenlabs/probe',
+    voiceCredential,
+    gate,
+    requireAuth,
+    voiceLimiter,
+    express.json({ limit: '64kb' }),
+    async (req, res) => {
+      const started = Date.now();
+      const body = (req.body && 'object' === typeof req.body) ? req.body : {};
+      const el = elevenLabsFrom(body);
+      if (!el || !el.ok) {
+        res.status(422).json({ error: 'elevenlabs_config', reason: el ? el.reason : 'missing',
+          message: 'The probe needs the ElevenLabs configuration the gateway forwards.' });
+        return;
+      }
+      const capability = undefined === body.capability ? 'tts' : body.capability;
+      if (!['tts', 'stt'].includes(capability)) {
+        res.status(422).json({ error: 'invalid_capability', message: 'capability must be "tts" or "stt".' });
+        return;
+      }
+
+      const meta = { status: null, code: '', headers: {}, attempts: 0 };
+      const observe = (m) => {
+        meta.status = m.status; meta.code = m.code || ''; meta.headers = m.headers || {};
+        meta.attempts += 1;
+      };
+      const verdictFor = (ok) => {
+        if (ok) return 'accepted';
+        if ([400, 404, 422].includes(meta.status)) return 'rejected';
+        return 'unverified';
+      };
+      const modelEcho = () => {
+        const hit = Object.keys(meta.headers).find((h) => h.includes('model'));
+        return hit ? meta.headers[hit] : null;
+      };
+      const failure = (err) => {
+        if (err && 'tagged_text' === err.code) return { local_error: 'tagged_text', guard: err.guard };
+        if (null !== meta.status) return {};
+        return { local_error: /time/iu.test(String(err && err.message)) ? 'timeout' : 'unreachable' };
+      };
+
+      if ('stt' === capability) {
+        const requested = 'string' === typeof body.stt_model_id ? body.stt_model_id.trim() : '';
+        if (requested && !/^[a-z0-9_]{1,64}$/u.test(requested)) {
+          res.status(422).json({ error: 'invalid_model_id', message: 'That is not a model id.' });
+          return;
+        }
+        const modelId = requested || elevenLabsSttModel();
+        const audio = wrapPcmAsWav(silencePcm(500, 16000), 16000);
+        let ok = false;
+        let chars = null;
+        let err = null;
+        try {
+          const out = await transcribeElevenLabs({ apiKey: el.config.apiKey, audio, format: 'wav',
+                                                   modelId, observe });
+          ok = true;
+          chars = out.text.length;
+        } catch (e) { err = e; }
+        const answer = {
+          capability, verdict: verdictFor(ok), http_status: meta.status,
+          vendor_error: meta.code || null, attempts: meta.attempts,
+          // Section 6.2's field set. Speech-to-text returns no audio, so these
+          // describe the 0.5 s of silence that was SENT, and say so.
+          audio_bytes: audio.length, sample_rate: 16000, audio_is: 'sent',
+          transcript_chars: chars,
+          elapsed_ms: Date.now() - started, response_headers_of_interest: meta.headers,
+          model_id_in_force: modelId, model_id_source: requested ? 'request' : 'connector_stt_pin',
+          model_echo: modelEcho(), ...failure(err),
+        };
+        logMeta('el_probe', { capability, model: modelId, verdict: answer.verdict,
+                              status: meta.status || undefined, elapsed_ms: answer.elapsed_ms });
+        res.json(answer);
+        return;
+      }
+
+      let text;
+      if ('string' === typeof body.text && body.text.trim()) {
+        if (body.text.length > 500) {
+          res.status(422).json({ error: 'text_too_long', message: 'Probe text is limited to 500 characters.' });
+          return;
+        }
+        text = body.text;
+      } else {
+        const fixture = undefined === body.fixture ? 'word' : body.fixture;
+        if (!['word', 'tags'].includes(fixture)) {
+          res.status(422).json({ error: 'invalid_fixture', message: 'fixture must be "word" or "tags".' });
+          return;
+        }
+        text = 'tags' === fixture ? TAG_FIXTURE : WORD_FIXTURE;
+      }
+      const sent = elevenLabsEngineText(text, { modelId: el.config.modelId, tags: el.config.tags });
+      let pcm = null;
+      let err = null;
+      try {
+        const out = await synthesizeElevenLabsPcm({ config: el.config, text: sent, sampleRate: 24000, observe });
+        pcm = out.pcm;
+      } catch (e) { err = e; }
+      const answer = {
+        capability, verdict: verdictFor(Boolean(pcm)), http_status: meta.status,
+        vendor_error: meta.code || null, attempts: meta.attempts,
+        audio_bytes: pcm ? pcm.length : 0, sample_rate: 24000,
+        elapsed_ms: Date.now() - started, response_headers_of_interest: meta.headers,
+        model_id_in_force: el.config.modelId, model_id_source: el.config.modelSource,
+        tags: el.config.tags, text_sent: sent, model_echo: modelEcho(), ...failure(err),
+      };
+      if (pcm) answer.audio_wav_base64 = wrapPcmAsWav(pcm, 24000).toString('base64');
+      logMeta('el_probe', { capability, model: el.config.modelId, source: el.config.modelSource,
+                            tags: el.config.tags ? 'on' : undefined, verdict: answer.verdict,
+                            status: meta.status || undefined, elapsed_ms: answer.elapsed_ms });
+      res.json(answer);
     });
 
   // -------------------------------------------------------------------------
@@ -771,7 +1092,7 @@ export function registerVoiceRoutes(app) {
     gate,
     requireAuth,
     voiceLimiter,
-    express.json({ limit: '256kb' }),
+    express.json({ limit: TTS_JSON_LIMIT }),
     async (req, res) => {
       const started = Date.now();
       const body = (req.body && typeof req.body === 'object') ? req.body : {};
@@ -784,7 +1105,7 @@ export function registerVoiceRoutes(app) {
         return;
       }
 
-      const MAX_CHARS = intEnv('VOICE_MAX_TTS_CHARS', 5000);
+      const MAX_CHARS = maxTtsChars();
       if (text.length > MAX_CHARS) {
         res.status(413).json({
           error: 'text_too_long',
@@ -888,7 +1209,59 @@ export function registerVoiceRoutes(app) {
         text, voice, speed: flatSpeed, sampleRate: requestedRate,
       });
 
+      // v13.34.0 -- SPEC-AUDIO-003 Section 5.3. Null unless the gateway
+      // forwarded this user's ElevenLabs configuration.
+      const elRequest = elevenLabsFrom(body);
+
       try {
+        // ---- ElevenLabs, per user (SPEC-AUDIO-003 Sections 5.3, 5.5) --------
+        //
+        // Tried FIRST and ALL OR NOTHING. Nothing has been sent yet, so any
+        // ElevenLabs failure renders the WHOLE reply with Kokoro below: one
+        // voice from start to finish, with the reason on the response headers
+        // for the gateway to act on (a 401 disables the switch, a 429 records
+        // quota). Silence is never the outcome of an ElevenLabs failure.
+        //
+        // Compare mode has no ElevenLabs meaning (it compares two Kokoro
+        // renderings), so a Compare request from a user on ElevenLabs is spoken
+        // once in their voice and the degradation is named on the header the
+        // gateway already relays.
+        if (elRequest) {
+          let elFallback = null;
+          if (elRequest.ok) {
+            try {
+              const out = await synthesizeElevenLabs({
+                text, elevenlabs: elRequest.config, sampleRate: requestedRate,
+                mode: ('off' === effective) ? 'flat' : 'prosody', config: prosodyCfg,
+              });
+              logMeta('tts', {
+                voice: 'elevenlabs', engine: 'elevenlabs', chars: text.length,
+                prosody: effective, path: out.path, phrases: out.phrases,
+                bytes: out.wav.length, elapsed_ms: Date.now() - started,
+                ...elModelMeta(elRequest),
+              });
+              setEngineHeaders(res, 'elevenlabs', null);
+              if ('both' === mode) res.setHeader('X-Tenax-Prosody-Degraded', 'engine_elevenlabs');
+              res.setHeader('Content-Type', 'audio/wav');
+              res.setHeader('Content-Length', String(out.wav.length));
+              res.setHeader('X-Tenax-Prosody-Path', out.path);
+              res.setHeader('Cache-Control', 'no-store');
+              res.send(out.wav);
+              return;
+            } catch (elErr) {
+              if ('empty_text' === elErr.code) throw elErr;
+              elFallback = elErr.reason || 'error';
+              console.warn(`[voice] elevenlabs reply failed (${elFallback}`
+                + `${elErr.status ? ` ${elErr.status}` : ''}); rendering the whole reply with Kokoro`);
+            }
+          } else {
+            elFallback = 'error';
+            console.warn('[voice] the gateway forwarded a malformed ElevenLabs configuration '
+              + `(${elRequest.reason}); rendering the reply with Kokoro`);
+          }
+          setEngineHeaders(res, 'kokoro', elFallback);
+        }
+
         // ---- Compare mode (Section 7.2, AC5) -------------------------------
         //
         // Returns BOTH renderings of the same text in one JSON body, paired by
@@ -995,6 +1368,8 @@ export function registerVoiceRoutes(app) {
           voice, language: permit.voice.language, chars: text.length,
           prosody: effective, path, phrases: phrases || undefined,
           bytes: wav.length, elapsed_ms: Date.now() - started,
+          // v13.34.0. Present only when ElevenLabs was requested and fell back.
+          engine: elRequest ? 'kokoro' : undefined,
         });
 
         res.setHeader('Content-Type', 'audio/wav');
@@ -1049,9 +1424,11 @@ export function registerVoiceRoutes(app) {
           // connector log above. 504 is the one exception worth naming,
           // because "it was too slow" is actionable by the user (shorter text)
           // and reveals nothing.
+          // v13.34.0. A short render names its segment (SPEC-AUDIO-003 S2).
           message: status === 504
             ? 'Speech synthesis took too long. Try a shorter passage.'
-            : (status >= 500 ? 'Speech synthesis failed. The connector log has the reason.'
+            : (status >= 500 ? synthesisFailureMessage(err,
+                'Speech synthesis failed. The connector log has the reason.')
                              : err.message),
         });
       }
@@ -1091,7 +1468,7 @@ export function registerVoiceRoutes(app) {
     gate,
     requireAuth,
     voiceLimiter,
-    express.json({ limit: '256kb' }),
+    express.json({ limit: TTS_JSON_LIMIT }),
     async (req, res) => {
       const started = Date.now();
       const body = (req.body && typeof req.body === 'object') ? req.body : {};
@@ -1102,7 +1479,7 @@ export function registerVoiceRoutes(app) {
         return;
       }
 
-      const MAX_CHARS = intEnv('VOICE_MAX_TTS_CHARS', 5000);
+      const MAX_CHARS = maxTtsChars();
       if (text.length > MAX_CHARS) {
         res.status(413).json({
           error: 'text_too_long',
@@ -1189,10 +1566,29 @@ export function registerVoiceRoutes(app) {
       req.on('aborted', () => { aborted = true; });
       res.on('close', () => { aborted = true; });
 
+      // v13.34.0 -- SPEC-AUDIO-003 Section 5.3. Null for a user without
+      // ElevenLabs, in which case nothing below differs from the baseline.
+      const elRequest = elevenLabsFrom(body);
+
       try {
+        // A malformed configuration from the gateway: the reply is Kokoro's
+        // from the first phrase, and the stream says so before any audio.
+        if (elRequest && !elRequest.ok) {
+          console.warn('[voice] the gateway forwarded a malformed ElevenLabs configuration '
+            + `(${elRequest.reason}); streaming with Kokoro`);
+          await writeLine({ type: 'engine_fallback', reason: 'error', index: 0 });
+        }
+
         const result = await synthesizeProsodyStream(
           { text, voice: resolved.voice, speed: Number.isFinite(speed) ? speed : undefined,
-            config: prosodyCfg, sampleRate: streamRate },
+            config: prosodyCfg, sampleRate: streamRate,
+            // v13.34.0. Undefined unless ElevenLabs was requested and valid.
+            elevenlabs: (elRequest && elRequest.ok) ? elRequest.config : undefined,
+            // Written in band, ahead of the first Kokoro phrase after an
+            // ElevenLabs failure. The gateway reads it to disable a dead key.
+            onEngineFallback: elRequest
+              ? (info) => writeLine({ type: 'engine_fallback', reason: info.reason, index: info.index })
+              : undefined },
           async (segment) => {
             // The user navigated away or stopped playback. Throwing here
             // unwinds the phrase pool, so no further Piper process is spawned
@@ -1219,7 +1615,14 @@ export function registerVoiceRoutes(app) {
         );
 
         if (!aborted) {
-          await writeLine({ type: 'end', phrases: result.phrases, bytes: result.bytes });
+          const endLine = { type: 'end', phrases: result.phrases, bytes: result.bytes };
+          // v13.34.0. Engine fields only when ElevenLabs was requested (E8).
+          if (elRequest) {
+            endLine.engine = elRequest.ok ? (result.engine || 'kokoro') : 'kokoro';
+            endLine.engine_fallback = elRequest.ok
+              ? (result.engineFallback ? result.engineFallback.reason : null) : 'error';
+          }
+          await writeLine(endLine);
         }
 
         logMeta('tts_stream', {
@@ -1227,6 +1630,9 @@ export function registerVoiceRoutes(app) {
           chars: text.length, phrases: result.phrases, bytes: result.bytes,
           aborted: aborted || undefined,
           elapsed_ms: Date.now() - started,
+          engine: elRequest ? (result.engine || 'kokoro') : undefined,
+          el_fallback: (elRequest && result.engineFallback) ? result.engineFallback.reason : undefined,
+          ...elModelMeta(elRequest),
         });
       } catch (err) {
         if ('client_aborted' === err.code) {
@@ -1249,7 +1655,9 @@ export function registerVoiceRoutes(app) {
             // The same discretion the non-streaming route applies: Piper's
             // stderr names paths and model internals and does not go to a
             // browser. The connector log above has the real reason.
-            message: 'Speech synthesis failed. The connector log has the reason.',
+            // v13.34.0. A short render names its segment (SPEC-AUDIO-003 S2).
+            message: synthesisFailureMessage(err,
+              'Speech synthesis failed. The connector log has the reason.'),
           });
         } catch (writeErr) { /* the socket is gone; nothing left to say */ }
       } finally {
@@ -1315,7 +1723,7 @@ export function registerVoiceRoutes(app) {
     // is divided into has changed, so the request ceiling moves and the
     // synthesis concurrency (bounded in the pool, FR-2.2) does not.
     incrementalLimiter,
-    express.json({ limit: '256kb' }),
+    express.json({ limit: TTS_JSON_LIMIT }),
     async (req, res) => {
       const started = Date.now();
       const body = (req.body && typeof req.body === 'object') ? req.body : {};
@@ -1329,7 +1737,7 @@ export function registerVoiceRoutes(app) {
       // nothing new" is a normal, expected outcome, not a caller error. The
       // non-incremental routes refuse empty text because for them it can only
       // be a mistake.
-      const MAX_CHARS = intEnv('VOICE_MAX_TTS_CHARS', 5000);
+      const MAX_CHARS = maxTtsChars();
       if (text.length > MAX_CHARS) {
         res.status(413).json({
           error: 'text_too_long',
@@ -1477,7 +1885,17 @@ export function registerVoiceRoutes(app) {
       // would be a second answer to a question already answered.
       const batchText = split.phrases.map((p) => p.text).join(' ');
 
+      // v13.34.0 -- SPEC-AUDIO-003 Section 5.3. Null for a user without
+      // ElevenLabs, in which case nothing below differs from the baseline.
+      const elRequest = elevenLabsFrom(body);
+
       try {
+        if (elRequest && !elRequest.ok) {
+          console.warn('[voice] the gateway forwarded a malformed ElevenLabs configuration '
+            + `(${elRequest.reason}); this batch uses Kokoro`);
+          await writeLine({ type: 'engine_fallback', reason: 'error', index: 0 });
+        }
+
         const result = await synthesizeProsodyStream(
           { text: batchText, voice: resolved.voice,
             speed: Number.isFinite(speed) ? speed : undefined,
@@ -1486,7 +1904,22 @@ export function registerVoiceRoutes(app) {
             // reply. Without this every batch would land on a falling final
             // contour and a long reply would sound like a list of separate
             // short statements.
-            finalPosition: final },
+            finalPosition: final,
+            // v13.34.0. Undefined unless ElevenLabs was requested and valid.
+            elevenlabs: (elRequest && elRequest.ok) ? elRequest.config : undefined,
+            // v13.35.0 -- work order W7, D1. Each batch is its own request, so
+            // its first generation used to start with no previous_text and its
+            // last end with no next_text: a seam the listener hears at every
+            // batch boundary. The reply text either side is sent as context.
+            // Read only by the ElevenLabs renderer, which puts it in engine
+            // form first; Kokoro never sees it.
+            contextBefore: (elRequest && elRequest.ok)
+              ? text.slice(Math.max(0, offset - INCREMENTAL_CONTEXT_CHARS), offset) : undefined,
+            contextAfter: (elRequest && elRequest.ok && !final)
+              ? text.slice(split.consumed, split.consumed + INCREMENTAL_CONTEXT_CHARS) : undefined,
+            onEngineFallback: elRequest
+              ? (info) => writeLine({ type: 'engine_fallback', reason: info.reason, index: info.index })
+              : undefined },
           async (segment) => {
             if (aborted) {
               const stop = new Error('client went away');
@@ -1530,7 +1963,7 @@ export function registerVoiceRoutes(app) {
         // whatever re-segmentation analyse() applied inside it.
         if (!aborted) {
           committed = split.phrases[split.phrases.length - 1].end;
-          await writeLine({
+          const endLine = {
             type: 'end',
             offset: committed,
             sequence: sequence + result.phrases,
@@ -1538,7 +1971,14 @@ export function registerVoiceRoutes(app) {
             bytes: result.bytes,
             deferred: split.deferred,
             final,
-          });
+          };
+          // v13.34.0. Engine fields only when ElevenLabs was requested (E8).
+          if (elRequest) {
+            endLine.engine = elRequest.ok ? (result.engine || 'kokoro') : 'kokoro';
+            endLine.engine_fallback = elRequest.ok
+              ? (result.engineFallback ? result.engineFallback.reason : null) : 'error';
+          }
+          await writeLine(endLine);
         }
 
         logMeta('tts_incremental', {
@@ -1548,6 +1988,9 @@ export function registerVoiceRoutes(app) {
           final: final || undefined,
           aborted: aborted || undefined,
           elapsed_ms: Date.now() - started,
+          engine: elRequest ? (result.engine || 'kokoro') : undefined,
+          el_fallback: (elRequest && result.engineFallback) ? result.engineFallback.reason : undefined,
+          ...elModelMeta(elRequest),
         });
       } catch (err) {
         if ('client_aborted' === err.code) {
@@ -1571,7 +2014,9 @@ export function registerVoiceRoutes(app) {
             error: err.code || 'tts_failed',
             offset: committed,
             sequence: sequence + emittedCount,
-            message: 'Speech synthesis failed. The connector log has the reason.',
+            // v13.34.0. A short render names its segment (SPEC-AUDIO-003 S2).
+            message: synthesisFailureMessage(err,
+              'Speech synthesis failed. The connector log has the reason.'),
           });
         } catch (writeErr) { /* the socket is gone; nothing left to say */ }
       } finally {
@@ -1598,7 +2043,7 @@ export function registerVoiceRoutes(app) {
     gate,
     requireAuth,
     voiceLimiter,
-    express.json({ limit: '256kb' }),
+    express.json({ limit: TTS_JSON_LIMIT }),
     (req, res) => {
       const body = (req.body && typeof req.body === 'object') ? req.body : {};
       const text = String(body.text || '');
@@ -1607,7 +2052,7 @@ export function registerVoiceRoutes(app) {
         return;
       }
 
-      const MAX_CHARS = intEnv('VOICE_MAX_TTS_CHARS', 5000);
+      const MAX_CHARS = maxTtsChars();
       if (text.length > MAX_CHARS) {
         res.status(413).json({
           error: 'text_too_long',

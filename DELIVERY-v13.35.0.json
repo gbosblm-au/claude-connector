@@ -1,0 +1,81 @@
+{
+  "version": "13.35.0",
+  "previous": "13.34.0",
+  "work_orders": [
+    "Work order W7 rev 1.1 (2026-10-06): engine-form text for both synthesis engines; tagless renders at the current pin",
+    "SPEC-AUDIO-004 rev 1 (2026-10-05): build W6 step 7 (ElevenLabs speech-to-text adapter and route) and step 9 (model pin check)"
+  ],
+  "changed_files": [
+    "src/voice/engine-form.js (new)",
+    "src/voice/elevenlabs-stt.js (new)",
+    "src/voice/voice-engines.js",
+    "src/voice/elevenlabs.js",
+    "src/voice/voice-prosody-prep.js (ancillary, additive: position 'none')",
+    "src/routes/voice.js",
+    "scripts/el-punctuation-sweep.mjs (new)",
+    "scripts/elevenlabs-model-pin-check.mjs (new)",
+    "docs/W7-ENGINE-FORM.md (new)",
+    "src/tests/voice-engine-form.test.js (new)",
+    "src/tests/voice-elevenlabs-stt.test.js (new)",
+    "src/tests/elevenlabs-model-pin-check.test.js (new)",
+    "src/tests/fixtures/fake-whisper-once.mjs (new)",
+    "package.json (CRLF preserved)",
+    "VOICE-DEPLOYMENT-VARIABLES.md",
+    "CHANGELOG-v13.35.0.md (new)",
+    "DELIVERY-v13.35.0.json (new)"
+  ],
+  "ancillary_changes": [
+    {
+      "file": "src/voice/voice-prosody-prep.js",
+      "what": "prepareForKokoro accepts position 'none': the whole pipeline without shapeContour",
+      "why_now": "the ElevenLabs engine form must keep the 13.34.0 flattening (links, bold, normalisation) and drop only the appended continuation comma W7 D1 found; a general markdown stripper changed words (independent review)",
+      "consumers": "prepareForKokoro callers: voice-engines.js synthesizePcm (passes o.position || 'whole'; no caller passes 'none'), engine-form.js (passes 'none'), scripts/el-punctuation-sweep.mjs (pre-W7 replica, 'continuation'/'final')",
+      "checked": "voice-prosody-prep 40/40, voice-prosody 52/52, voice-text-normalize 25/25 unchanged",
+      "blast_radius": "a value that was previously coerced to 'whole' is now honoured; only engine-form.js sends it"
+    },
+    {
+      "file": "src/voice/elevenlabs.js",
+      "what": "elError and errorCode exported (no behaviour change)",
+      "why_now": "the STT adapter reports failures with the same reasons and message discipline",
+      "consumers": "elevenlabs-stt.js, scripts/elevenlabs-model-pin-check.mjs",
+      "checked": "voice-elevenlabs 15/15, race 4/4",
+      "blast_radius": "none at runtime"
+    }
+  ],
+  "structural_pins_respected": [
+    "voice-prosody-prep.test.js position ternary count (2): the merged-unit Kokoro path computes partPosition separately",
+    "voice-registry.test.js `sampleRate: sampleRate,` count (2): the merged-unit path passes the same rate in shorthand",
+    "voice-text-normalize.test.js `const text = prepared.text;`: the builder strip writes prepared.text first",
+    "heteronym resolver: exactly three withHeteronyms( call sites, unchanged"
+  ],
+  "full_suite": {
+    "runner": "per-file runner: each src/tests/*.test.js and tests/*.test.js in its own `node --test --test-reporter=tap` process, plus `npm test` (src/test.js); npm ci dependencies",
+    "before": { "artifact": "13.34.0 as delivered", "files": 52, "tests": 1215, "pass": 1213, "fail": 1, "skipped": 1, "npm_test": "30/30" },
+    "after": { "artifact": "this archive (13.35.0)", "files": 55, "tests": 1260, "pass": 1258, "fail": 1, "skipped": 1, "npm_test": "30/30" },
+    "executed_delta": "+45: voice-engine-form 25, voice-elevenlabs-stt 12, elevenlabs-model-pin-check 8 (all new). Every other file identical in tests/pass/fail and failing names.",
+    "net_new_failures": 0,
+    "baseline_red_carried": [ "src/tests/voice-gpl-boundary.test.js :: one test about Piper artifacts, failing identically on 13.34.0 in the same environment" ]
+  },
+  "mutations": {
+    "w7": { "suite": "src/tests/voice-engine-form.test.js", "applied": 24, "red": 23, "not_pinned": [ "the Kokoro builder assertion: it follows a strip of the same text and cannot fire (docs/W7-ENGINE-FORM.md section 3.2)" ], "table": "docs/W7-ENGINE-FORM.md section 7" },
+    "w6_connector": { "suite": "src/tests/voice-elevenlabs-stt.test.js", "applied": 14, "red": 14, "list": [
+      "route ignores the key header", "engine headers not set", "wrong model pin", "audio events tagged",
+      "every failure is error", "key in the error message", "malformed header ignored",
+      "empty transcript is a failure", "no timeout", "language not forwarded", "key in the URL",
+      "key logged on failure", "retry on 5xx", "Whisper always used" ] },
+    "pin_check": { "suite": "src/tests/elevenlabs-model-pin-check.test.js", "applied": 7, "red": 7, "list": [
+      "missing TTS id passes", "capability not checked", "probe rejection is unverified", "fail exits 0",
+      "unverified counts as ok", "probe sends the TTS id", "key printed" ] }
+  },
+  "independent_review": "a separate reviewer found 8 items; 6 fixed (5 code defects, 1 documentation), each with a red-without-fix test; 2 accepted as stated (CHANGELOG-v13.35.0.md)",
+  "not_verified_here": [
+    "D2, D3, D4 by ear and acceptance criterion 6 (needs an ElevenLabs key and a listener)",
+    "the model pins against a live account (needs the key; npm run voice:el-pin-check)"
+  ],
+  "deployment": {
+    "mode": "in-place",
+    "order": "this connector, then ts-gateway-service 2.249.0, then ts-client-gateway 5.231.0",
+    "variables_added": [ "ELEVENLABS_SEGMENT_UNIT", "ELEVENLABS_PUNCTUATION", "ELEVENLABS_BREAK_TAGS_VERIFIED", "ELEVENLABS_STT_MODEL", "ELEVENLABS_STT_TIMEOUT_MS" ],
+    "rollback_target": "13.34.0"
+  }
+}

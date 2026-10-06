@@ -1,0 +1,100 @@
+{
+  "version": "13.36.0",
+  "previous": "13.35.0",
+  "work_orders": [
+    "Work order W7 rev 2.1 (2026-10-06), superseding rev 1.1: three-class engine form from a closed-vocabulary registry, divergent profiles, the tag switch, split guards G1 to G4, the probe, the D6 audit"
+  ],
+  "decisions_taken_as_defaults": {
+    "20_three_class_split": "confirmed as written",
+    "21_deploy_shape": "amendment on top of 13.35.0",
+    "22_v4_dialogue_path": "stays parked",
+    "23_floor_viewport": "1280x720",
+    "24_panel_shape": "Option A, bounded popover",
+    "25_registry_source": "introduced by this order: src/voice/register-grammar.v1.json (no register grammar existed in the connector, gateway or client trees)"
+  },
+  "changed_files": [
+    "src/voice/register-grammar.v1.json (new)",
+    "src/voice/engine-form.js",
+    "src/voice/voice-engines.js",
+    "src/voice/elevenlabs.js",
+    "src/voice/elevenlabs-stt.js",
+    "src/routes/voice.js",
+    "scripts/register-audit.mjs (new)",
+    "scripts/el-punctuation-sweep.mjs",
+    "docs/W7-ENGINE-FORM.md",
+    "src/tests/voice-engine-form.test.js",
+    "src/tests/register-audit.test.js (new)",
+    "src/tests/voice-elevenlabs.test.js",
+    "src/tests/voice-incremental.test.js",
+    "package.json (CRLF preserved)",
+    "CHANGELOG-v13.36.0.md (new)",
+    "DELIVERY-v13.36.0.json (new)"
+  ],
+  "ancillary_changes": [
+    {
+      "file": "src/tests/voice-elevenlabs.test.js",
+      "what": "the parseElevenLabsConfig expectation includes the two new configuration fields (modelSource, tags)",
+      "why_now": "the parser now returns them; the old deepEqual fails on correct output",
+      "consumers": "this test only",
+      "checked": "15/15",
+      "blast_radius": "none at runtime"
+    },
+    {
+      "file": "src/tests/voice-incremental.test.js",
+      "what": "its module mock of voice-engines.js gains elevenLabsEngineText, wrapPcmAsWav and silencePcm",
+      "why_now": "routes/voice.js imports them for the probe; a mock without them fails to link",
+      "consumers": "this test only",
+      "checked": "16/16",
+      "blast_radius": "none at runtime"
+    },
+    {
+      "file": "src/voice/elevenlabs-stt.js",
+      "what": "transcribeElevenLabs accepts a validated modelId override and an observe callback",
+      "why_now": "the probe's STT pin check (section 6.2 item 1) must run the production adapter with a named model",
+      "consumers": "routes/voice.js /voice/transcribe (passes neither: unchanged behaviour) and /voice/elevenlabs/probe",
+      "checked": "voice-elevenlabs-stt 12/12, elevenlabs-model-pin-check 8/8 unchanged",
+      "blast_radius": "an invalid override is ignored for the pinned model; no caller other than the probe passes one"
+    }
+  ],
+  "structural_pins_respected": [
+    "voice-prosody-prep.test.js and voice-text-normalize.test.js: `const prepared = prepareForKokoro(String(o.text || ''), {` and `const text = prepared.text;` at the synthesizePcm choke point",
+    "voice-registry.test.js `sampleRate: sampleRate,` count (2)",
+    "heteronym resolver: exactly three withHeteronyms( call sites"
+  ],
+  "full_suite": {
+    "runner": "per-file runner: each src/tests/*.test.js and tests/*.test.js in its own `node --test --test-reporter=tap` process, plus `npm test` (src/test.js)",
+    "before": { "artifact": "13.35.0 as delivered", "files": 55, "tests": 1260, "pass": 1258, "fail": 1, "skipped": 1, "npm_test": "30/30" },
+    "after": { "artifact": "this archive (13.36.0)", "files": 57, "tests": 1275, "pass": 1273, "fail": 1, "skipped": 1, "npm_test": "30/30" },
+    "executed_delta": "+15: voice-engine-form 25 to 36, register-audit 4 (new). Every other file identical in tests/pass/fail/skipped.",
+    "net_new_failures": 0,
+    "baseline_red_carried": [ "src/tests/voice-gpl-boundary.test.js :: no Piper artifact survives anywhere in the source tree (failing identically on 13.35.0 in the same environment)" ],
+    "caught_by_the_full_run": "a first full run after the review fixes showed 2 net-new failures (voice-prosody-prep, voice-text-normalize): the choke-point call had been rewritten and broke two structural pins. The call shape was restored; the run above is after that."
+  },
+  "mutations": {
+    "suite": "src/tests/voice-engine-form.test.js and src/tests/register-audit.test.js",
+    "applied": 38,
+    "red": 38,
+    "table": "docs/W7-ENGINE-FORM.md section 12"
+  },
+  "d6_audit_at_delivery": {
+    "command": "node scripts/register-audit.mjs --gateway <ts-gateway 2.250.0> --client <ts-client-gateway 5.232.0>",
+    "exit": 0,
+    "walkers": { "W1": 8, "W2": 5, "W3": 4 },
+    "writer_tokens": [ "[TRACE]", "[OUTPUT]", "[RESULT]", "[exam-state]", "[[TRAVEL_RESEARCH_FORM]]", "[[RECREATION_PANEL]]", "[private-conversation]", "[forget]" ],
+    "emittable_but_unregistered": [],
+    "registered_class_a_without_emitter": [],
+    "excluded_by_design": "client-written user-turn tutoring directives ([session-open-homework-check], [session-complete], [tutor-help-request], [tutor-help-exhausted])"
+  },
+  "independent_review": "a separate reviewer reported 10 items; 1 blocking (a link whose label is a registry token made the Kokoro builder refuse the reply) and 9 non-blocking. Fixed: the blocking item, literal em dashes in changed lines, the sweep reading the shell's punctuation rules, the orphaned gateway JSDoc, the model field reusing the key field's class, the probe's 'rejected' wording, emphasis wrappers left as '****', the STT probe field set; documented: the closed-vocabulary consequence for off-registry spellings, the section 2 table's 'tag-capable' condition. Each code fix has a red-without-fix test.",
+  "not_verified_here": [
+    "D2, D3, D4 and the tag fixture by ear (needs an ElevenLabs key and a listener)",
+    "section 6.4: whether the vendor echoes the model served (needs a live response)",
+    "whether the vendor refuses 0.5 s of silence on speech-to-text (would make the STT pin check read 'request refused')"
+  ],
+  "deployment": {
+    "mode": "in-place",
+    "order": "this connector, then ts-gateway-service 2.250.0 (migration 0056), then ts-client-gateway 5.232.0",
+    "variables_added": [],
+    "rollback_target": "13.35.0"
+  }
+}

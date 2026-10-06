@@ -1,0 +1,38 @@
+{
+  "version": "register-grammar/1 2026-10-06",
+  "purpose": "The closed vocabulary of bracketed tokens the engine-form formatter (src/voice/engine-form.js) may remove or pass through. Work order W7 rev 2.1 sections 2 and 3. A bracketed token that is not listed here is CONTENT and is never transformed (section 3.3). This file is introduced by W7 rev 2.1 (section 3.7): no register layer or grammar file existed in connector 13.34.0 or 13.35.0, gateway 2.249.0 or client 5.231.0 (searched by name and by content, see docs/W7-ENGINE-FORM.md section 9).",
+  "matching": "A candidate token matches an entry when it is equal to the entry's token or one of its variants after asterisks and underscores are removed from both (so [**warm**] is [warm], and [[TRAVELRESEARCH_FORM]] is [[TRAVEL_RESEARCH_FORM]], the form the incremental route's markdown stripper produces). Comparison is case-sensitive unless the entry sets case_insensitive. An entry with scope 'line' removes the rest of its line as well (a control line).",
+  "classes": {
+    "A": {
+      "name": "channel scaffolding",
+      "rule": "never speech, on any engine, at any pin: stripped from every engine payload",
+      "tokens": [
+        { "token": "[OUTPUT]", "kind": "channel", "source": "ts-gateway-service lib/thought-trace.js markerInstruction() (the instruction to the model); ts-client-gateway src/js/06b-output-marker.js OUTPUT_MARKERS (the consumer)" },
+        { "token": "[TRACE]", "kind": "channel", "source": "ts-gateway-service lib/thought-trace.js; ts-client-gateway src/js/06b-output-marker.js OUTPUT_MARKERS" },
+        { "token": "[RESULT]", "kind": "channel", "source": "ts-gateway-service lib/thought-trace.js; ts-client-gateway src/js/06b-output-marker.js OUTPUT_MARKERS" },
+        { "token": "[private-conversation]", "kind": "directive", "source": "ts-client-gateway src/js/06b-output-marker.js OUTPUT_MARKER_OUT_OF_SCOPE (a session directive, handled by its own logic)" },
+        { "token": "[forget]", "kind": "directive", "source": "ts-client-gateway src/js/06b-output-marker.js OUTPUT_MARKER_OUT_OF_SCOPE" },
+        { "token": "[[TRAVEL_RESEARCH_FORM]]", "kind": "panel", "source": "ts-client-gateway src/js/06-markdown.js Step 1c (a fenceless trigger the backend module emits in prose)" },
+        { "token": "[[RECREATION_PANEL]]", "kind": "panel", "source": "ts-client-gateway src/js/06-markdown.js Step 1c" },
+        { "token": "[exam-state]", "kind": "control_line", "scope": "line", "case_insensitive": true, "source": "ts-client-gateway src/js/09d-practice-exam.js consumeStateLine (a control line the module writes and the client never renders)" }
+      ]
+    },
+    "B": {
+      "name": "prosody and register cues",
+      "rule": "stripped on the Kokoro path always; on the ElevenLabs path passed through when the user's tag switch is on, stripped otherwise",
+      "tokens": [
+        { "token": "[warm]", "source": "W7 rev 1.1 section 1 (heard spoken live on eleven_multilingual_v2); W7 rev 2.1 section 2" },
+        { "token": "[pause]", "source": "W7 rev 1.1 section 1; W7 rev 2.1 section 2" },
+        { "token": "[slowly]", "source": "W7 rev 1.1 section 1; W7 rev 2.1 section 2" },
+        { "token": "[softly]", "source": "W7 rev 1.1 section 1; W7 rev 2.1 section 2" },
+        { "token": "[drawn out]", "variants": ["[drawn-out]"], "source": "W7 rev 2.1 section 2 writes [drawn out]; W7 rev 1.1 section 1 heard [drawn-out]" }
+      ]
+    }
+  },
+  "fixtures": {
+    "tag_capability": "This is a test phrase. [warm] This sentence should sound warm. [pause] This sentence should follow a pause. [softly] This sentence should be quieter.",
+    "tag_capability_source": "W7 rev 2.1 section 7.1, verbatim",
+    "model_availability": "Test.",
+    "model_availability_source": "W7 rev 2.1 section 6.2 item 2 (a one-word text)"
+  }
+}
