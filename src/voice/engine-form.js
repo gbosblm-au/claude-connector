@@ -1,7 +1,7 @@
 // src/voice/engine-form.js
 //
-// Tenax Voice -- engine-form text. Work order W7 rev 2.1 (2026-10-06), which
-// supersedes rev 1.1. Connector v13.36.0.
+// Tenax Voice -- engine-form text. Work order W7 rev 2.1 (2026-10-06),
+// amended by W8 (2026-10-07). Connector v13.36.0.
 //
 // ===========================================================================
 // WHAT THIS IS
@@ -11,15 +11,20 @@
 // never touches what the user sees: every caller hands it a copy that is used
 // only for synthesis.
 //
-// Rev 1.1 stripped every bracket SHAPE. Rev 2.1 corrects that (section 3): a
-// token is classified by membership of a CLOSED VOCABULARY, the registry in
-// register-grammar.v1.json, and anything not in the registry is content.
+// Rev 1.1 stripped every bracket SHAPE. Rev 2.1 corrected that to membership of
+// a CLOSED VOCABULARY. W8 corrects the other half: membership was the right rule
+// for Class A and the wrong rule for Class B.
 //
 //   Class A  channel scaffolding ([OUTPUT], panel triggers, control lines):
-//            never speech, removed for every engine.
-//   Class B  prosody and register cues ([warm], [pause] ...): removed for
-//            Kokoro always; for ElevenLabs passed through when the user's tag
-//            switch is on, removed otherwise.
+//            never speech, removed for every engine. Matched by MEMBERSHIP
+//            only -- a channel marker is enumerated, never shape-matched,
+//            because a shape rule cannot tell [OUTPUT] from a quoted word.
+//   Class B  prosody and register cues: removed for Kokoro always; for
+//            ElevenLabs passed through when the user's tag switch is on,
+//            removed otherwise. Matched by SHAPE (W8 section 2.2), so a cue the
+//            writer emits before it is registered is classified as a cue rather
+//            than left as content, and a new cue needs no file edit and no
+//            deploy.
 //   Class C  content: everything else in brackets, every markdown link and
 //            misaki span, everything inside a code span. Never transformed.
 //
@@ -27,9 +32,14 @@
 // span, a fenced code block or a `[label](target)` link is content whatever it
 // says, which is the escape hatch for prose ABOUT a marker (section 3.6).
 //
-// Unknown bracket tokens are logged, never transformed (section 3.5), so a
-// marker the writer emits before it is registered becomes visible in the log
-// rather than being silently stripped by an open pattern.
+// Four guards decide before the shape rule, so a token that is tag-shaped is
+// still CONTENT when it is: a subscript context (a[i], arr[idx], m[1][2]), a
+// reference or checkbox form ([1], [^3], [], [x]), or a Class A name in any case
+// ([output] is what a user typed). See contentForm() and isReservedCueName().
+//
+// Unknown bracket tokens are logged, never transformed (section 3.5). Under W8
+// the named half of that log is largely vestigial: a token of the shape it used
+// to name is now classified as a cue, so what remains is the count.
 //
 // Pure and idempotent: format(format(x)) === format(x) for both profiles, and
 // where neither Class A nor Class B is present the text is returned byte for
@@ -113,7 +123,7 @@ export const TAG_FIXTURE = String(REGISTRY.fixtures.tag_capability || '');
 export const WORD_FIXTURE = String(REGISTRY.fixtures.model_availability || 'Test.');
 
 /** The version of the rule table and classifier. Bump on any change to either. */
-export const ENGINE_FORM_VERSION = `engine-form/2 2026-10-06 (pin eleven_multilingual_v2; ${REGISTRY_VERSION})`;
+export const ENGINE_FORM_VERSION = `engine-form/2.2 2026-10-07 (pin eleven_multilingual_v2; ${REGISTRY_VERSION})`;
 
 // ===========================================================================
 // CLASSIFICATION
@@ -129,6 +139,56 @@ const CONTENT_SPANS = [
 
 /** A bracket token candidate: [[...]] first, then [...], neither spanning a line. */
 const CANDIDATE = /\[\[[^\[\]\n]{1,80}\]\]|\[[^\[\]\n]{1,80}\]/gu;
+
+/**
+ * The shape of a Class B cue (W8 section 2.2): one to four lower-case words,
+ * separated by a space or by a comma and a space, with no leading capital.
+ * Case is discriminating, so the lower-case form is a cue and the capitalised
+ * form is content; the two surfaces must agree or they will disagree about what
+ * was said.
+ *
+ * Lifted from the pattern logUnknown() has always used for naming a
+ * not-yet-registered marker, with the comma separator added. The comma form is
+ * accepted pending one render against the engine (W8 section 2.4); if that
+ * render shows the comma form does not hold, the separator comes out and the
+ * claim is withdrawn, not the code.
+ *
+ * @type {RegExp}
+ */
+const TAG_SHAPE = /^\[\p{Ll}[\p{Ll}\p{N}'\u2019-]{0,23}(?:[ ,] ?\p{Ll}[\p{Ll}\p{N}'\u2019-]{0,23}){0,3}\]$/u;
+
+/**
+ * Every Class A spelling, in any case. A channel name is never a cue, however
+ * it is cased, so a user who types [output] does not lose the word. Derived
+ * from the registry rather than written out, so a new Class A entry is picked
+ * up for free -- which the client-side strip cannot do, and is the one place
+ * the two surfaces can drift.
+ */
+const RESERVED_CUE_NAMES = Object.freeze(
+  REGISTRY.entries.filter((e) => 'A' === e.cls)
+    .flatMap((e) => e.spellings.map((sp) => matchKey(sp, true)))
+);
+
+/**
+ * Is this token tag-shaped? Exported for the tests and for any caller that
+ * needs the display-side rule.
+ *
+ * @param {string} token
+ * @returns {boolean}
+ */
+export function isTagShape(token) {
+  return TAG_SHAPE.test(String(token));
+}
+
+/**
+ * Is this token a Class A name in any case?
+ *
+ * @param {string} token
+ * @returns {boolean}
+ */
+export function isReservedCueName(token) {
+  return RESERVED_CUE_NAMES.includes(matchKey(String(token), true));
+}
 
 /** Content forms named for the log, in the order they are tried. */
 function contentForm(token, before) {
@@ -181,7 +241,18 @@ export function classifyBrackets(text) {
         cls = entry.cls;
         kind = entry.kind;
       } else {
-        kind = contentForm(m[0], start > 0 ? s[start - 1] : '');
+        // W8 section 2.2: Class B is matched by the tag SHAPE, not by
+        // membership. The content-form test runs FIRST and returns the four
+        // forms the shape rule must not take (reference, checkbox, indexer,
+        // unknown), so promotion happens only when nothing else claimed it.
+        // A Class A name in another case is content too, which is why the
+        // reserved test comes before the shape test and not after.
+        const before = start > 0 ? s[start - 1] : '';
+        kind = contentForm(m[0], before);
+        if ('unknown' === kind && isTagShape(m[0]) && !isReservedCueName(m[0])) {
+          cls = 'B';
+          kind = 'cue';
+        }
       }
     }
     tokens.push({ text: m[0], start, end, cls, kind, entry });
@@ -201,6 +272,10 @@ export function classifyBrackets(text) {
  * Class B token that matched through emphasis (`[**warm**]`) is written in its
  * registered spelling, so what reaches the engine is well formed (G3).
  *
+ * W8: a shape-matched cue has no registry entry. It is removed on the same
+ * terms as a registered one, and when it is KEPT it is kept exactly as written,
+ * because there is no registered spelling to rewrite it to.
+ *
  * @param {string} text
  * @param {{keepB?: boolean}} [opts]
  * @returns {string}
@@ -214,7 +289,7 @@ export function removeClasses(text, opts) {
   for (let pass = 0; pass < 4; pass += 1) {
     const { tokens } = classifyBrackets(out);
     const edits = tokens.filter((t) => 'A' === t.cls || ('B' === t.cls && !keepB)
-      || ('B' === t.cls && keepB && !t.entry.spellings.includes(t.text)));
+      || ('B' === t.cls && keepB && t.entry && !t.entry.spellings.includes(t.text)));
     if (!edits.length) break;
     let next = '';
     let at = 0;
@@ -224,7 +299,9 @@ export function removeClasses(text, opts) {
       let end = t.end;
       let replacement = '';
       if ('B' === t.cls && keepB) {
-        replacement = t.entry.token;
+        // Only a registry-matched cue can be rewritten to its registered
+        // spelling; a shape-matched one is already whatever the writer wrote.
+        replacement = t.entry ? t.entry.token : t.text;
       } else {
         // An emphasis wrapper around the token (`**[warm]**`, `_[pause]_`)
         // goes with it: left behind it would be an empty `****` the Kokoro
@@ -238,7 +315,7 @@ export function removeClasses(text, opts) {
           start -= lead;
           end += trail;
         }
-        if ('line' === t.entry.scope) {
+        if (t.entry && 'line' === t.entry.scope) {
           const nl = out.indexOf('\n', end);
           end = -1 === nl ? out.length : nl;
         }
@@ -287,10 +364,16 @@ function guardError(guard, where, n, what) {
  *   G1  both builders: no Class A token. Always.
  *   G2  Kokoro builder: no Class B token. Always.
  *   G3  ElevenLabs builder: Class B absent with the tag switch off; with it on,
- *       every Class B token in its registered spelling.
+ *       every REGISTRY-MATCHED Class B token in its registered spelling.
  *   G4  both builders: every bracket token classified, and the classification
  *       count logged when there is one. Unknown tokens are content: logged
  *       by count, never refused.
+ *
+ * W8 note on G3: the malformed test can only apply to a token that matched a
+ * registry entry, because only those have a registered spelling. A shape-matched
+ * cue is well formed by construction. The guard still catches the case it was
+ * written for -- a cue that reached the builder in an emphasis-wrapped or
+ * otherwise unregistered spelling, i.e. one that bypassed the formatter.
  *
  * @param {string} text
  * @param {{builder: 'kokoro'|'elevenlabs', tags?: boolean, where: string}} o
@@ -303,7 +386,7 @@ export function guardRequest(text, o) {
   if ('kokoro' === o.builder && counts.B) throw guardError('G2', o.where, counts.B, 'prosody');
   if ('elevenlabs' === o.builder) {
     if (!o.tags && counts.B) throw guardError('G3', o.where, counts.B, 'prosody');
-    const malformed = tokens.filter((t) => 'B' === t.cls && !t.entry.spellings.includes(t.text));
+    const malformed = tokens.filter((t) => 'B' === t.cls && t.entry && !t.entry.spellings.includes(t.text));
     if (malformed.length) throw guardError('G3', o.where, malformed.length, 'malformed prosody');
   }
   if (counts.total) {
@@ -318,6 +401,12 @@ export function guardRequest(text, o) {
  * tokens (one to four lower-case words) are named, because those are the
  * shape a not-yet-registered marker takes; any other bracketed content is
  * counted and not quoted, since the words of a reply are not logged.
+ *
+ * W8: the naming half is now largely vestigial. A token of the shape this
+ * function names is classified as a cue by classifyBrackets and never reaches
+ * here as 'unknown'. It is kept because it costs nothing and still names a
+ * tag-shaped token in the one case where the shape test was overridden, but a
+ * reader should not expect it to fire on an ordinary reply.
  *
  * @param {Array<object>} tokens
  * @param {string} where
@@ -516,5 +605,5 @@ export function prepareForElevenLabs(text) {
 export default {
   REGISTRY, REGISTRY_VERSION, TAG_FIXTURE, WORD_FIXTURE, ENGINE_FORM_VERSION, RULES,
   BREAK_LIMIT, parseRegistry, classifyBrackets, removeClasses, guardRequest, punctuationChoices,
-  applyPunctuationRules, toEngineForm, entryForm, prepareForElevenLabs,
+  applyPunctuationRules, toEngineForm, entryForm, prepareForElevenLabs, isTagShape, isReservedCueName,
 };

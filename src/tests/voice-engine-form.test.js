@@ -1,8 +1,13 @@
-// src/tests/voice-engine-form.test.js
+// src/tests/voice-engine-form.test.js  --  PART 1 OF 2
 //
-// Work order W7 rev 2.1 (2026-10-06), which supersedes rev 1.1: the three-class
-// partition, the closed-vocabulary registry, the divergent engine profiles, the
-// tag switch, the split guards G1 to G4, and the probe. Connector v13.36.0.
+// ASSEMBLY: part 1 and part 2 concatenated, in order, are the whole file. The
+// seam is the "THE PATHS" banner at the foot of part 1. Split only because the
+// assembled file is 1,055 lines and the write tool caps at 1,000.
+//
+// Work order W7 rev 2.1 (2026-10-06), amended by W8 (2026-10-07): the
+// three-class partition, the closed-vocabulary registry, Class B matched by
+// tag SHAPE rather than membership, the divergent engine profiles, the tag
+// switch, the split guards G1 to G4, and the probe. Connector v13.36.0.
 //
 // What this file proves, in the work order's terms (section 12):
 //
@@ -16,6 +21,10 @@
 //       bypassed the formatter; the old builder-side strip is gone).
 //   T6  Floor: G4's classification count is non-zero on a bracket fixture.
 //   D6  The registry is read from the register grammar file, both ways.
+//
+// W8 adds: Class B by shape, the four guards that decide before the shape rule
+// (subscript, reference, checkbox, reserved channel name), and the corrections
+// the shape rule forces on T1, section 3.5 and T6. Each corrected test says so.
 //
 // Plus the paths: one ElevenLabs generation per sentence, context across
 // incremental batches, the Kokoro fallback, the tag switch end to end, model
@@ -241,20 +250,47 @@ test('T1: Class C forms survive verbatim, in both profiles and both switch state
   }
   // More content forms: indexers, footnotes, years, key names, links whose
   // label is a registry word, misaki markup, a fenced block quoting a cue,
-  // unregistered tag-shaped words, capitalised cue words.
+  // capitalised cue words, checkboxes.
+  //
+  // W8: this array used to include '[whispers] and [sighs heavily]'. Those are
+  // tag-shaped, so under the shape rule they are CUES and no longer belong
+  // here; that assertion moved to the W8 shape test below.
   const more = [
     'm[1][2] and array[0] and f(a[i]).',
     'See note [^3] from [2024].',
     'Use [Ctrl] + [C].',
     'The [warm](https://example.com/warm) link and [tomato](/təˈmɑːtoʊ/).',
     '```\n[OUTPUT] [pause]\n```\nafter the block.',
-    '[whispers] and [sighs heavily] and [Warm] and [PAUSE].',
+    '[Warm] and [PAUSE] and [TODO] and [Note].',
     '- [ ] a task and - [x] a done task',
   ];
   for (const t of more) {
     assert.equal(K(t), t, `kokoro: ${t}`);
     assert.equal(ELon(t), t, `elevenlabs on: ${t}`);
   }
+});
+
+test('W8: a shape-matched cue is a cue; a capitalised or reserved token is not', () => {
+  // Shape, not membership (W8 section 2.2). The engine's vocabulary is wider
+  // than the registry, so a cue needs no file edit and no deploy.
+  assert.equal(K('[whispers] and [sighs heavily] now.'), 'and now.');
+  assert.equal(ELon('[whispers] and [sighs heavily] now.'), '[whispers] and [sighs heavily] now.');
+  assert.equal(K('[clears throat] then.'), 'then.');
+  assert.equal(K('a [warm, pause] b.'), 'a b.');
+  // Case is discriminating, both ways (standing decision 2026-10-06).
+  assert.equal(K('[Warm] and [PAUSE] stay.'), '[Warm] and [PAUSE] stay.');
+  // A Class A name in another case is content, not a cue: a user who types
+  // [output] loses nothing.
+  assert.equal(K('[output] is what I typed'), '[output] is what I typed');
+  assert.equal(K('[Trace] is not [TRACE].'), '[Trace] is not.');
+  // Classified one at a time rather than asserted as a set: a single fixture
+  // holding all four would pass on a rule that took them all.
+  assert.equal(form.classifyBrackets('[whispers]').counts.B, 1);
+  assert.equal(form.classifyBrackets('[Warm]').counts.B, 0);
+  assert.equal(form.classifyBrackets('[output]').counts.B, 0);
+  assert.equal(form.classifyBrackets('a[i]').counts.B, 0);
+  assert.equal(form.classifyBrackets('[x]').counts.B, 0);
+  assert.equal(form.classifyBrackets('[sic]').counts.B, 1, 'the known casualty, asserted rather than assumed');
 });
 
 test('T2: Class A always removed; Class B removed for Kokoro and with the switch off, kept with it on', () => {
@@ -276,7 +312,9 @@ test('T2: Class A always removed; Class B removed for Kokoro and with the switch
   assert.equal(K('Question.\n[exam-state] phase=questions discipline=Organic chemistry q=1 of 5\nWhat is it?'),
     'Question.\n\nWhat is it?');
   assert.equal(K('[EXAM-STATE] phase=review'), '', 'the exam-state entry is case-insensitive, as its consumer is');
-  // Case-sensitive entries stay content in another case, as the client does.
+  // Case-sensitive entries stay content in another case. Under W8 this holds
+  // for the shape rule too, and for the same reason the client holds it: an
+  // [output] a user typed is a word, not a channel marker.
   assert.equal(K('[output] is what I typed'), '[output] is what I typed');
 });
 
@@ -286,6 +324,7 @@ test('T3: idempotent, both profiles, both switch states, rules off and on', () =
     T1_FIXTURE,
     '[OUTPUT] The answer is [warm] ready. [pause] Next [[RECREATION_PANEL]] step.',
     '[warm][pause] x', 'a [pause]. b', 'ready.[warm] next', '[**warm**] hi [_softly_]',
+    '[whispers] and [clears throat] and [Warm]',
     'Question.\n[exam-state] phase=q\nWhat?', 'Note: this; that \u2014 other… (aside) end.',
   ];
   for (const text of inputs) {
@@ -345,12 +384,22 @@ test('Unicode: accents, apostrophes and non-Latin scripts survive both profiles'
   assert.equal(ELon(text), text);
 });
 
-test('section 3.5: unknown bracket tokens are logged, never transformed', () => {
+// ===========================================================================
+// W8 section 3.5: what is left unclassified
+// ===========================================================================
+
+test('W8 section 3.5: what remains unclassified is counted, and a cue is never "unknown"', () => {
+  // Under the shape rule a tag-shaped token is a CUE, so the naming half of
+  // the 3.5 log can no longer fire on one. This test used to assert that
+  // [whispers] and [sighs heavily] were NAMED as unregistered; under W8 they
+  // are classified, so what is asserted now is the count, and that the words
+  // of a reply are never quoted.
   const before = printed.length;
   const t = 'A [whispers] cue, a [sighs heavily] cue, and [Enter].';
-  assert.equal(form.toEngineForm(t, 'kokoro', { where: 'unit test' }), t);
+  assert.equal(form.toEngineForm(t, 'kokoro', { where: 'unit test' }), 'A cue, a cue, and [Enter].');
   const logged = printed.slice(before).join('\n');
-  assert.match(logged, /engine-form unit test: 3 unregistered bracket token\(s\) left as content: \[whispers\] \[sighs heavily\]/u);
+  assert.match(logged, /engine-form unit test: 1 unregistered bracket token\(s\) left as content/u);
+  assert.ok(!logged.includes('[whispers]'), 'a cue is classified, so it is not reported as unknown');
   assert.ok(!logged.includes('[Enter]'), 'non-tag content is counted, not quoted');
   const quietBefore = printed.length;
   form.toEngineForm('No brackets at all.', 'kokoro', { where: 'unit test' });
@@ -372,7 +421,10 @@ test('T6 floor: G4 classifies and counts every bracket token of a bracket fixtur
   const { counts } = form.classifyBrackets(fixture);
   assert.ok(counts.total > 0, 'the scan saw the brackets');
   assert.equal(counts.total, counts.A + counts.B + counts.C);
-  assert.deepEqual({ A: counts.A, B: counts.B }, { A: 1, B: 1 });
+  // W8: [warm] AND [whispers] are both cues under the shape rule, and
+  // [OUTPUT] is the only channel token. This was {A:1, B:1} before the shape
+  // rule; the extra B is [whispers], which the registry never listed.
+  assert.deepEqual({ A: counts.A, B: counts.B }, { A: 1, B: 2 });
   const before = printed.length;
   form.guardRequest(T1_FIXTURE, { builder: 'kokoro', where: 'g4 test' });
   assert.match(printed.slice(before).join('\n'), /engine-form g4 test: brackets=\d+ A=0 B=0 content=\d+ unknown=\d+/u);
@@ -395,6 +447,9 @@ test('T5 / G2: the Kokoro builder refuses a prosody cue that bypassed the format
   await assert.rejects(engines.synthesizePcm({ text: '[warm] Hello there.', voice: 'af_heart' }),
     (err) => 'tagged_text' === err.code && 'G2' === err.guard && !err.message.includes('warm'));
   assert.deepEqual(kokoroTexts(), [], 'Kokoro was not called');
+  // W8: a shape-matched cue is refused here too, not only a registered one.
+  await assert.rejects(engines.synthesizePcm({ text: '[clears throat] Hello there.', voice: 'af_heart' }),
+    (err) => 'G2' === err.guard);
   // Content in brackets passes the Kokoro builder.
   await engines.synthesizePcm({ text: 'Press [Enter] and see [1] or a[i].', voice: 'af_heart' });
   assert.equal(kokoroTexts().length, 1);
@@ -426,6 +481,13 @@ test('G3: the ElevenLabs builder admits cues only with the switch on, and only w
   await adapter.synthesizeElevenLabsPcm({ config: { ...EL_CFG, tags: true }, text: 'Hi [warm] there.', sampleRate: 24000 });
   assert.equal(el.calls.length, 1);
   assert.equal(el.calls[0].body.text, 'Hi [warm] there.');
+  // W8: a shape-matched cue is well formed by construction, so it passes with
+  // the switch on. The "malformed" half of G3 can only bite a registry-matched
+  // cue, which is the case it was written for: one that bypassed the formatter.
+  reset();
+  await adapter.synthesizeElevenLabsPcm({ config: { ...EL_CFG, tags: true },
+    text: 'Hi [whispers] there.', sampleRate: 24000 });
+  assert.equal(el.calls[0].body.text, 'Hi [whispers] there.');
   // Content passes either way.
   reset();
   await adapter.synthesizeElevenLabsPcm({ config: EL_CFG, text: 'Press [Enter] now.', sampleRate: 24000 });
@@ -492,10 +554,6 @@ test('the ElevenLabs preparation: links and bold flattened, words kept, no conto
   assert.equal(engines.elevenLabsEngineText('**Bold** move [warm] now.', { tags: true }), 'Bold move [warm] now.');
 });
 
-// ===========================================================================
-// THE PATHS
-// ===========================================================================
-
 const COMMA_DENSE = 'First, we read the specification carefully; then, we test it: slowly, '
   + 'deliberately, and well. The second sentence follows it, briefly.';
 
@@ -530,6 +588,27 @@ test('the tag switch end to end: off strips cues, on sends them, Class A always 
       assert.ok(!on.includes('OUTPUT'), `${path}: Class A never sent`);
       assert.deepEqual(kokoroTexts(), [], `${path}: Kokoro did not speak`);
     }
+  });
+});
+
+test('W8: the tag switch carries a shape-matched cue, and never a reserved name', async () => {
+  await withEnv({ VOICE_PROSODY_ENABLED: 'true' }, async () => {
+    const reply = 'The plan is ready. [clears throat] We start tomorrow. [output] is not sent.';
+    reset();
+    await post('/voice/synthesize/stream', { text: reply, voice: 'af_heart', elevenlabs: CONFIG_TAGS });
+    const on = ttsCalls().map((c) => c.body.text).join(' ');
+    assert.ok(on.includes('[clears throat]'), `an unregistered cue is sent with the switch on: ${on}`);
+    assert.ok(!on.includes('[output]') || on.includes('is not sent'),
+      'the reserved word survives as prose rather than being taken as a cue');
+    reset();
+    await post('/voice/synthesize/stream', { text: reply, voice: 'af_heart', elevenlabs: CONFIG });
+    const off = ttsCalls().map((c) => c.body.text).join(' ');
+    assert.ok(!off.includes('[clears throat]'), `switch off strips it: ${off}`);
+    reset();
+    await post('/voice/synthesize/stream', { text: reply, voice: 'af_heart' });
+    const kok = kokoroTexts().join(' ');
+    assert.ok(!kok.includes('[clears throat]'), `Kokoro never receives it: ${kok}`);
+    assert.ok(kok.includes('[output]'), `Kokoro keeps the reserved word as prose: ${kok}`);
   });
 });
 

@@ -1,11 +1,11 @@
 {
-  "version": "register-grammar/1 2026-10-06",
-  "purpose": "The closed vocabulary of bracketed tokens the engine-form formatter (src/voice/engine-form.js) may remove or pass through. Work order W7 rev 2.1 sections 2 and 3. A bracketed token that is not listed here is CONTENT and is never transformed (section 3.3). This file is introduced by W7 rev 2.1 (section 3.7): no register layer or grammar file existed in connector 13.34.0 or 13.35.0, gateway 2.249.0 or client 5.231.0 (searched by name and by content, see docs/W7-ENGINE-FORM.md section 9).",
-  "matching": "A candidate token matches an entry when it is equal to the entry's token or one of its variants after asterisks and underscores are removed from both (so [**warm**] is [warm], and [[TRAVELRESEARCH_FORM]] is [[TRAVEL_RESEARCH_FORM]], the form the incremental route's markdown stripper produces). Comparison is case-sensitive unless the entry sets case_insensitive. An entry with scope 'line' removes the rest of its line as well (a control line).",
+  "version": "register-grammar/2 2026-10-07",
+  "purpose": "The vocabulary of bracketed tokens the engine-form formatter (src/voice/engine-form.js) may remove or pass through. Work order W7 rev 2.1 sections 2 and 3, amended by W8 sections 2 and 3. A bracketed token that is neither listed here NOR tag-shaped is CONTENT and is never transformed.",
+  "matching": "Two rules, and the class decides which applies. CLASS A is matched by MEMBERSHIP only: a channel marker is enumerated, never shape-matched, because a shape rule cannot tell [OUTPUT] from a quoted word. A Class A token matches when it is equal to the entry's token or one of its variants after asterisks and underscores are removed from both (so [**warm**] is [warm], and [[TRAVELRESEARCH_FORM]] is [[TRAVEL_RESEARCH_FORM]], the form the incremental route's markdown stripper produces). Comparison is case-sensitive unless the entry sets case_insensitive. An entry with scope 'line' removes the rest of its line as well (a control line). CLASS B is matched by SHAPE, not by membership: a single-bracket token of one to four lower-case words separated by a space or by a comma and a space is a cue, whatever words it contains. Case is discriminating, so [warm] is a cue and [Warm] is content. Three exclusions decide before the shape rule, so a token is content even when it is tag-shaped: a subscript context (a[i], arr[idx] -- the character before the bracket is a letter, digit, underscore or close bracket), a reference or checkbox form ([1], [^3], [], [ ], [x]), and a Class A name in any case. Content spans (fenced blocks, inline code, [label](target) links) are decided before any token is classified, so a cue inside one is content whatever it says.",
   "classes": {
     "A": {
       "name": "channel scaffolding",
-      "rule": "never speech, on any engine, at any pin: stripped from every engine payload",
+      "rule": "never speech, on any engine, at any pin: stripped from every engine payload. Matched by membership only.",
       "tokens": [
         { "token": "[OUTPUT]", "kind": "channel", "source": "ts-gateway-service lib/thought-trace.js markerInstruction() (the instruction to the model); ts-client-gateway src/js/06b-output-marker.js OUTPUT_MARKERS (the consumer)" },
         { "token": "[TRACE]", "kind": "channel", "source": "ts-gateway-service lib/thought-trace.js; ts-client-gateway src/js/06b-output-marker.js OUTPUT_MARKERS" },
@@ -19,13 +19,18 @@
     },
     "B": {
       "name": "prosody and register cues",
-      "rule": "stripped on the Kokoro path always; on the ElevenLabs path passed through when the user's tag switch is on, stripped otherwise",
+      "rule": "stripped on the Kokoro path always; on the ElevenLabs path passed through when the user's tag switch is on, stripped otherwise. Matched by SHAPE (see matching), not by membership.",
+      "matched_by": "shape",
+      "confirmed": "The tokens below are the set whose behaviour has actually been observed rather than inferred. They are RETAINED here because Kokoro has no tag vocabulary, so a bracketed token that reaches it is read aloud; on that path this list and the shape rule have the same effect, and the list is the documented safe set. The list is NOT the matching rule: the engine's vocabulary is wider than this and is maintained by the vendor, so a new cue does not need a file edit and a deploy.",
       "tokens": [
         { "token": "[warm]", "source": "W7 rev 1.1 section 1 (heard spoken live on eleven_multilingual_v2); W7 rev 2.1 section 2" },
-        { "token": "[pause]", "source": "W7 rev 1.1 section 1; W7 rev 2.1 section 2" },
+        { "token": "[pause]", "source": "W7 rev 1.1 section 1; W7 rev 2.1 section 2. The vendor's enumerated list does not carry it; whether it is acted on as against silently ignored is UNCONFIRMED." },
         { "token": "[slowly]", "source": "W7 rev 1.1 section 1; W7 rev 2.1 section 2" },
         { "token": "[softly]", "source": "W7 rev 1.1 section 1; W7 rev 2.1 section 2" },
         { "token": "[drawn out]", "variants": ["[drawn-out]"], "source": "W7 rev 2.1 section 2 writes [drawn out]; W7 rev 1.1 section 1 heard [drawn-out]" }
+      ],
+      "known_casualties": [
+        { "token": "[sic]", "note": "Tag-shaped, so the shape rule strips it. Left un-special-cased; the escape is a backtick." }
       ]
     }
   },
