@@ -13,7 +13,7 @@ startCommand = "node src/server-http.js"
 # anything, so an instance whose /data volume had failed to mount kept
 # receiving traffic and the restart policy could never fire.
 healthcheckPath = "/health/ready"
-healthcheckTimeout = 30
+healthcheckTimeout = 120
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 
