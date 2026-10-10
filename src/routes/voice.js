@@ -41,11 +41,11 @@ import express                    from 'express';
 import rateLimit                  from 'express-rate-limit';
 
 import { voiceEnabled, gateState, benchmarkState,
-         voiceAvailableFor, voiceAvailableForAsync,
-         allowlistDiagnostics, currentAllowlistSource,
-         resolveIdentity, testUsers } from '../voice/voice-gate.js';
-import { allowlistConfigProblems,
-         deploymentConfigProblems } from '../voice/voice-allowlist.js';
+         voiceAvailableFor, voiceRenderableFor, entitlementClaimed,
+         resolveIdentity, ENTITLEMENT_HEADER } from '../voice/voice-gate.js';
+// v13.37.0 (TENAX-VOICE-2026-10-07-02): the allowlist module is deleted; the
+// deployment check it also held lives on in its own file.
+import { deploymentConfigProblems } from '../voice/voice-deployment.js';
 // v12.50.0: the transport credential. MCP_API_KEY (operator) or
 // RAILWAY_RESTORE_TOKEN (gateway). See src/voice/voice-auth.js for why the
 // gateway could not previously reach these routes at all.
@@ -335,29 +335,18 @@ const incrementalLimiter = rateLimit({
 });
 
 /**
- * Section 7 layer 2, now two-layer (Per-User Feature Gate Spec Section 4.1).
+ * Section 7 layer 2 (Per-User Feature Gate Spec Section 4.1).
  *
- * Both must hold: the master switch AND the per-user allowlist. Every refusal
- * produces the byte-identical 404 -- master switch off, identity absent,
- * identity unknown, identity not allowlisted. There is deliberately no separate
- * status or message for "you are not allowlisted": that would confirm the
- * feature exists and that the caller is merely on the wrong side of it, which
- * Section 4.1 forbids.
- *
- * The master switch short-circuits first, so when voice is globally off no
- * identity is read at all.
+ * v13.37.0 (TENAX-VOICE-2026-10-07-02): the master switch, then an identity.
+ * The per-user allowlist is retired: who may use voice is decided per request
+ * on the gateway, which refuses before forwarding, and the connector keeps no
+ * copy of that decision. Every refusal here still produces the byte-identical
+ * 404, and nothing here makes a network or database call: the master switch
+ * short-circuits first, so when voice is off no identity is read at all.
  */
-async function gate(req, res, next) {
-  // Async so gateway mode can refresh the allowlist before answering. In env
-  // mode this resolves without touching the network, so the cost is a
-  // microtask.
-  //
-  // Errors are swallowed into a 404 rather than surfaced: a refusal must look
-  // identical whatever caused it, and a 500 here would tell an unauthorised
-  // caller that the feature exists and that something went wrong reaching its
-  // allowlist.
+function gate(req, res, next) {
   let ok = false;
-  try { ok = await voiceAvailableForAsync(req); } catch (e) { ok = false; }
+  try { ok = voiceAvailableFor(req); } catch (e) { ok = false; }
   if (!ok) { res.status(404).json({ error: 'not_found' }); return; }
   next();
 }
@@ -589,80 +578,56 @@ export function registerVoiceRoutes(app) {
     // Health remains the one voice route that is never 404 (Section 8.1), so
     // the UI can learn in one cheap call that the feature is unavailable.
     //
-    // But it now answers PER USER. A non-allowlisted caller gets the exact same
-    // body as a caller on a connector where voice is globally off -- same keys,
-    // same values. Reporting enabled:true to someone who cannot use the feature
-    // would tell them it exists and that they are merely excluded, which is
-    // precisely what Section 4.1 forbids the routes from revealing. It would
-    // also give their UI grounds to render a control that 404s.
+    // But it answers PER USER. A caller the gateway did not entitle gets the
+    // exact same body as a caller on a connector where voice is globally off --
+    // same keys, same values. Reporting enabled:true to someone who cannot use
+    // the feature would tell them it exists and that they are merely excluded,
+    // which is precisely what Section 4.1 forbids the routes from revealing. It
+    // would also give their UI grounds to render a control that fails.
     //
-    // No engine is probed on this path either, so a non-allowlisted caller
-    // cannot use health to trigger a model load.
-    if (!(await voiceAvailableForAsync(req).catch(() => false))) {
+    // v13.37.0 (TENAX-VOICE-2026-10-07-02 section 5): who is entitled is the
+    // gateway's per-request answer, carried in X-Tenax-Voice-Entitlement from
+    // the same gateway function that refuses at the stream. This route RENDERS
+    // from that claim and nothing more; it computes no entitlement of its own.
+    //
+    // No engine is probed on this path, so a caller who is not entitled cannot
+    // use health to trigger a model load.
+    if (!voiceRenderableFor(req)) {
       const body = {
         enabled: false,
         voice_enabled_for_this_user: false,
         stt_ready: false, tts_ready: false, models_loaded: [],
       };
 
-      // Configuration faults are reported even to a denied caller, but ONLY when
-      // the master switch is on. Rationale for each half:
-      //
-      //   Master off  -> say nothing. Voice is deliberately absent and the
-      //                  routes must be indistinguishable from routes that do
-      //                  not exist.
-      //   Master on   -> the operator who needs this message is, by definition,
-      //                  the person being denied. Withholding it means the only
-      //                  way to see a misconfiguration is to already be past it,
-      //                  which is the state they cannot reach.
-      //
-      // The messages name variables and modes, never identities.
-      if (voiceEnabled()) {
-        // v13.2.0. ALLOWLIST PROBLEMS ONLY, deliberately.
-        //
-        // deploymentConfigProblems() is NOT included here, and the distinction
-        // is the one the comment above turns on. An allowlist fault EXPLAINS
-        // THIS REFUSAL -- the person being denied is the person who needs it.
-        // CONNECTOR_URL being unset explains nothing about why they were
-        // denied; it is unrelated infrastructure detail that helps them not at
-        // all and helps someone mapping the deployment quite a lot.
-        //
-        // Deployment faults go to /voice/health, which is operator-gated, and
-        // to the boot log. See the health route below.
-        const problems = allowlistConfigProblems();
-        if (problems.length) body.configuration_problems = problems;
-      }
-
       // v12.50.0. The masking above is right for an end user and actively
       // misleading for the operator debugging it: `enabled:false` is returned
-      // whether the master switch is off or the caller simply is not
-      // allowlisted, so VOICE_ENABLED=true looks like a variable being ignored.
-      // That misdiagnosis cost real hours.
+      // whether the master switch is off or the caller is simply not
+      // entitled, so VOICE_ENABLED=true looks like a variable being ignored.
       //
       // So a caller presenting MCP_API_KEY -- the connector's own key, which
-      // already grants remote code execution here -- is told which of the two
-      // it was. The gateway holds the restore token, not this key, so nothing
-      // added here can reach a browser and the /ti-voice contract is unchanged.
+      // already grants remote code execution here -- is told which it was. The
+      // gateway holds the restore token, not this key, so nothing added here
+      // can reach a browser and the /ti-voice contract is unchanged.
       if (req.voiceOperator) {
         const identity = resolveIdentity(req);
+        const claimed = entitlementClaimed(req);
         body.operator_diagnostics = {
           note: 'enabled:false above reports YOUR access, not the value of '
             + 'VOICE_ENABLED. master_switch below is the variable.',
           master_switch: voiceEnabled(),
           denied_reason: !voiceEnabled() ? 'master_switch_off'
-            : (!identity.userId ? 'no_identity_header' : 'identity_not_allowlisted'),
+            : (!identity.userId ? 'no_identity_header'
+              : (!claimed ? 'not_entitled_by_gateway' : 'unknown')),
           identity_seen: {
             user_id: identity.userId,
             tenant_id: identity.tenantId,
             source: identity.source,
           },
-          // Counts and modes only. The entries themselves are account
-          // identifiers and never appear in a response or a log.
-          allowlist: allowlistDiagnostics(),
-          hint: 'A VOICE_TEST_USERS entry written <tenant_id>:<user_id> matches only '
-            + 'when BOTH headers are sent: X-Tenax-User-Id and X-Tenax-Tenant-Id. '
-            + 'The Gateway Service sends both from the verified JWT; a manual curl '
-            + 'must send both too.',
+          entitlement_claimed: claimed,
+          hint: 'Voice renders for a user when the Gateway Service sends '
+            + 'X-Tenax-User-Id and X-Tenax-Voice-Entitlement: entitled, which it '
+            + 'does for every active account that is not a student without an '
+            + 'override. A manual curl must send both.',
         };
       }
 
@@ -687,7 +652,7 @@ export function registerVoiceRoutes(app) {
       // exactly as written, so a client coded to the specification works.
       enabled: true,
       // Per-User Feature Gate Spec Section 4.2. True here by construction --
-      // a non-allowlisted caller never reaches this branch -- but stated
+      // a caller the gateway did not entitle never reaches this branch -- but stated
       // explicitly so the UI branches on one flag in both responses rather than
       // inferring availability from the absence of a key.
       voice_enabled_for_this_user: true,
@@ -700,14 +665,12 @@ export function registerVoiceRoutes(app) {
       // speak, so the two are reported side by side rather than conflated.
       voices_installed: engines.voices_installed || [],
 
-      // v13.2.0. Deployment faults, on the ALLOWLISTED branch only.
+      // v13.2.0. Deployment faults, on the ENTITLED branch only.
       //
-      // Not on the refusal branch above, and the distinction matters: an
-      // allowlist fault explains why THAT caller was denied, so the person
-      // being denied is the person who needs it. CONNECTOR_URL being unset
-      // explains nothing about a denial -- it is infrastructure detail that
-      // helps a denied caller not at all and helps someone mapping the
-      // deployment quite a lot.
+      // Not on the refusal branch above: CONNECTOR_URL being unset explains
+      // nothing about a denial -- it is infrastructure detail that helps a
+      // denied caller not at all and helps someone mapping the deployment
+      // quite a lot.
       //
       // Omitted entirely when the configuration is coherent, so its presence is
       // itself the signal rather than an empty array an operator has to inspect.
@@ -749,11 +712,6 @@ export function registerVoiceRoutes(app) {
       benchmark_completed: bench.completed,
       benchmark_at: bench.at,
       catalogue: catalogState(),
-      // Where the allowlist is read from, and -- in env mode -- the standing
-      // warning that a revoke in the admin screen is not live until this
-      // connector is updated. Reported so the drift is visible from the
-      // system itself rather than only from documentation.
-      allowlist: allowlistDiagnostics(),
       // Section 13: TTS covers four languages; STT covers ~99. Reported as two
       // separate facts so the UI cannot imply symmetric coverage.
       tts_languages: TTS_LANGUAGES.slice(),
@@ -2109,12 +2067,10 @@ export function registerVoiceRoutes(app) {
       });
     });
 
-  // Reports the master switch and the SIZE of the allowlist, never its
-  // contents: the identities are operator account ids and do not belong in
-  // logs.
-  const allowlisted = testUsers().length;
+  // v13.37.0: no allowlist to report. Who may use voice is the gateway's
+  // per-request answer (TENAX-VOICE-2026-10-07-02).
   console.log(`[voice] routes registered (master=${voiceEnabled()}, `
-    + `source=${currentAllowlistSource()}, allowlisted_users=${allowlisted})`);
+    + `entitlement=gateway, header=${ENTITLEMENT_HEADER})`);
   // Said at boot, once, at error level. A correct-but-silent refusal is
   // indistinguishable from a working "off", and the deployment that hit this had
   // no way to tell the two apart from the outside.
@@ -2167,11 +2123,11 @@ export function registerVoiceRoutes(app) {
   }
 
   if (voiceEnabled()) {
-    const problems = [ ...allowlistConfigProblems(), ...deploymentConfigProblems() ];
+    const problems = deploymentConfigProblems();
     problems.forEach((p) => console.error('[voice] CONFIGURATION: ' + p));
     if (problems.length) {
-      console.error('[voice] Voice is enabled but NO USER CAN REACH IT until the above is fixed. '
-        + 'GET /voice/health reports the same under configuration_problems.');
+      console.error('[voice] Voice is enabled with the deployment faults above. '
+        + 'GET /voice/health reports the same under deployment_problems to an entitled caller.');
     }
   }
 }

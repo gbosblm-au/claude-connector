@@ -10,7 +10,6 @@ import { WebSocket } from 'ws';
 process.env.VOICE_STREAMING_ENABLED = 'true';
 process.env.VOICE_ENABLED = 'true';
 process.env.MCP_API_KEY = 'smoke-key-0123456789';
-process.env.VOICE_TEST_USERS = 'user-1';
 process.env.VOICE_STREAM_DEBUG_LOG = 'true';
 
 const { attachVoiceStream, stopVoiceStream, streamHealth } =
@@ -56,15 +55,20 @@ await new Promise( ( resolve ) => {
   ws.on( 'error', () => resolve() );
 } );
 
-// ── 3. non-entitled user is refused with 403 ───────────────────────────────
+// ── 3. a blank identity is no identity ─────────────────────────────────────
+//
+// v13.37.0 (TENAX-VOICE-2026-10-07-02). The connector no longer holds a list,
+// so it cannot refuse a non-entitled user: the gateway's stream proxy runs the
+// entitlement predicate before it opens this socket. What the connector still
+// refuses is a request with no identity, and whitespace is not an identity.
 await new Promise( ( resolve ) => {
   const ws = connect( { authorization: 'Bearer smoke-key-0123456789',
-                        'x-tenax-user-id': 'somebody-else' } );
+                        'x-tenax-user-id': '   ' } );
   ws.on( 'unexpected-response', ( _req, res ) => {
-    results.push( [ 'not entitled refused', 403 === res.statusCode, res.statusCode ] );
+    results.push( [ 'blank identity refused', 401 === res.statusCode, res.statusCode ] );
     resolve();
   } );
-  ws.on( 'open', () => { results.push( [ 'not entitled refused', false, 'opened' ] ); resolve(); } );
+  ws.on( 'open', () => { results.push( [ 'blank identity refused', false, 'opened' ] ); resolve(); } );
   ws.on( 'error', () => resolve() );
 } );
 

@@ -34,7 +34,7 @@ import { mock, after } from 'node:test';
 
 import { splitStream } from '../voice/voice-stream-split.js';
 
-/** The allowlisted caller. Matched verbatim by the gate. */
+/** The caller. Any non-empty id is an identity; the gateway decides entitlement. */
 const TEST_USER = 'voice-incremental-test-user';
 const TEST_KEY  = 'test-key-for-voice-incremental';
 
@@ -46,7 +46,7 @@ const HEADERS = {
   // Without this the gate resolves no identity and answers 404 -- the same
   // 404 it gives when voice is globally off, which is deliberate and which
   // makes a missing header look exactly like a disabled feature.
-  'X-Tenax-User-Id': TEST_USER,
+  'X-Tenax-User-Id': TEST_USER, 'X-Tenax-Voice-Entitlement': 'entitled',
 };
 
 // The shared server is torn down once, when the whole file has finished.
@@ -266,9 +266,6 @@ async function boot() {
   });
 
   process.env.VOICE_ENABLED = 'true';
-  // The allowlist is verbatim: no wildcards, no case folding, no prefix
-  // match. A literal id is the only thing that opens the gate.
-  process.env.VOICE_TEST_USERS = TEST_USER;
   process.env.MCP_API_KEY = TEST_KEY;
   process.env.VOICE_PROSODY_ENABLED = 'true';
 

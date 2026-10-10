@@ -1,0 +1,104 @@
+{
+  "version": "13.37.0",
+  "previous": "13.36.0",
+  "work_orders": [
+    "TENAX-VOICE-2026-10-07-02, voice access for all users: the connector half (allowlist deleted, render from the gateway's X-Tenax-Voice-Entitlement claim, never enforce with it; C-08, C-10, C-11)",
+    "TENAX-2026-10-09-01, deliverable return and the zip round trip: the connector half, Track A route A1 chosen by the user on 2026-10-10 ('A1: on-demand fetch (Recommended)'): coding_deliverable_publish, and C-CALIBRATION"
+  ],
+  "changed_files": [
+    "src/voice/voice-allowlist.js (deleted)",
+    "src/voice/voice-deployment.js (new: deploymentConfigProblems moved verbatim)",
+    "src/voice/voice-gate.js",
+    "src/voice/voice-stream-auth.js",
+    "src/voice/voice-auth.js (comments)",
+    "src/middleware/mcpAuth.js (comments)",
+    "src/routes/voice.js",
+    "src/voice/voice-engines.js (assertTagless call replaced by guardRequest)",
+    "src/tools/coding-delivery.js (new)",
+    "src/utils/zipCentralDirectory.js (new)",
+    "src/utils/retentionCalibration.js (new)",
+    "src/server-http.js",
+    "scripts/voice-stream-smoke.mjs",
+    "VOICE-DEPLOYMENT-VARIABLES.md",
+    ".env.example",
+    "src/tests/coding-delivery.test.js (new)",
+    "src/tests/route-inventory.test.js (new)",
+    "src/tests/retention-calibration.test.js",
+    "src/tests/voice.test.js",
+    "src/tests/voice-auth.test.js",
+    "src/tests/voice-incremental.test.js",
+    "src/tests/voice-segmenting.test.js",
+    "src/tests/voice-engine-form.test.js",
+    "src/tests/voice-elevenlabs-stt.test.js",
+    "src/tests/voice-elevenlabs.test.js",
+    "src/tests/voice-elevenlabs-race.test.js",
+    "package.json",
+    "CHANGELOG-v13.37.0.md (new)",
+    "DELIVERY-v13.37.0.json (new)"
+  ],
+  "ancillary_changes": [
+    {
+      "file": "src/voice/voice-engines.js",
+      "what": "the call to assertTagless (removed from engine-form.js in 13.36.0) is replaced by guardRequest, the 13.36.0 replacement",
+      "why_now": "every Kokoro synthesis threw ReferenceError on the uploaded tree; voice definition-of-done item 1 (a client hears a reply) cannot pass without it",
+      "consumers": "routes/voice.js buffered, stream and incremental synthesis paths (the only importers of the Kokoro builder)",
+      "checked": "voice-elevenlabs-race 0/4 to 4/4, voice-elevenlabs 6/15 to 15/15, voice-engine-form 32/38 to 38/38, voice-segmenting 10/18 to 18/18; each failing case logged 'assertTagless is not defined' when re-run on the uploaded tree",
+      "blast_radius": "voice synthesis only"
+    },
+    {
+      "file": "src/tests/voice-incremental.test.js, voice-segmenting.test.js, voice-engine-form.test.js, voice-elevenlabs-stt.test.js, voice-elevenlabs.test.js, voice-elevenlabs-race.test.js",
+      "what": "requests carry X-Tenax-Voice-Entitlement: entitled beside X-Tenax-User-Id; VOICE_TEST_USERS lines removed",
+      "why_now": "the surface renders from the gateway's claim and the allowlist variable no longer exists",
+      "consumers": "these tests only",
+      "checked": "every file green after",
+      "blast_radius": "none at runtime"
+    }
+  ],
+  "variables": {
+    "added": [
+      "TENAX_FRAME_URL (the tool is listed only when this and the token are set)",
+      "TENAX_FRAME_READ_TOKEN (a FRAME_AUTH_TOKENS entry of role reader on tenax-frame 1.10.0)",
+      "CODING_DELIVERY_MAX_BYTES (optional, default 209715200)",
+      "CODING_DELIVERY_TIMEOUT_MS (optional, default 120000)"
+    ],
+    "delete": [
+      "VOICE_TEST_USERS", "VOICE_ALLOWLIST_SOURCE", "VOICE_ALLOWLIST_URL", "VOICE_ALLOWLIST_KEY",
+      "VOICE_ALLOWLIST_TTL_MS", "VOICE_ALLOWLIST_MAX_STALE_MS", "VOICE_ALLOWLIST_TIMEOUT_MS"
+    ],
+    "behaviour_changed": "DOWNLOADS_TTL_HOURS below the signed-link lifetime is raised to it, with a boot warning"
+  },
+  "full_suite": {
+    "runner": "per-file: each test file under src/tests, tests, src/tools, src/tools-memory and src/tools-self-model in its own `node --experimental-test-module-mocks --test` process, plus `npm test` (src/test.js); dependencies from `npm ci` (the uploaded node_modules lacks better-sqlite3)",
+    "before": { "artifact": "13.36.0 as uploaded", "files": 60, "tests": 1295, "pass": 1266, "fail": 28, "skipped": 1, "npm_test": "30/30" },
+    "after": { "artifact": "this archive (13.37.0)", "files": 62, "tests": 1298, "pass": 1296, "fail": 1, "skipped": 1, "npm_test": "30/30" },
+    "executed_delta": "+3: coding-delivery +12 (new), route-inventory +3 (new), retention-calibration +3 (9 to 12), voice.test.js -15 (24 allowlist and gateway-mode tests removed with the module they tested, 9 added: the claim, C-08, C-10, C-11, the identity predicate). voice-auth.test.js 17 to 17 (two renamed). Every other file identical in tests and skipped.",
+    "net_new_failures": 0,
+    "baseline_red_cleared": "27: the assertTagless fault (voice-elevenlabs-race 4, voice-elevenlabs 9, voice-engine-form 6, voice-segmenting 8)",
+    "baseline_red_carried": [ "src/tests/voice-gpl-boundary.test.js :: no Piper artifact survives anywhere in the source tree (failing identically on 13.36.0 in the same environment)" ]
+  },
+  "mutations": {
+    "applied": 16,
+    "red": 16,
+    "list": [
+      "C-DOWNLOADS-CONTENTS written to uploads, not downloads", "C-NO-BUILT-URL the tool builds the URL",
+      "C-NEG-SUBSET-ZIP a subset accepted", "C-FRAME-PREDECESSOR a manifest without the predecessor accepted",
+      "the declared sha256 not checked", "C-CALIBRATION the reaper not raised to the link",
+      "C-CALIBRATION-b the reaper sweeps at the raw value", "C-NEG-UNAUTH-PUSH an unauthenticated artefact route",
+      "C-08 the kill switch ignored for an entitled caller", "C-10 VOICE_TEST_USERS read again",
+      "C-11 VOICE_PROSODY_ENABLED read a second time", "the claim header not needed to render",
+      "blank identity accepted", "the orphaned assertTagless call restored",
+      "C3 the narrow root character class restored", "the filename's tree binding dropped"
+    ]
+  },
+  "end_to_end": "Gateway Service 2.251.0 (PostgreSQL 16, migrations to 58) driving this connector's tool against a running tenax-frame 1.10.0: 31 of 31 checks with the root 'widget' and 31 of 31 with the root 'My Été App' (link verified by this connector's own verifier, 259200-second expiry, complete archive under the seed's root, re-uploaded delivery superseded by sha256, deterministic re-publication).",
+  "independent_review": "A separate reviewer that had not seen the work reported 1 blocking and 4 knowing findings across the four components. Blocking, fixed: the root rule refused any folder name outside [A-Za-z0-9._-] here and in the frame, while the gateway accepted it at intake (now one shared one-segment rule, refused at intake only where delivery would refuse). Knowing, acted on here: the tool could replace any .zip in the shared downloads directory; the filename is now bound to the tree hash. Knowing, acted on in the client: final approval and publication ran under a 30 s browser bound. Knowing, no change: the Progress read before migration 0058 (unreachable: the gateway refuses to boot below 58); the frame builds the archive synchronously (queued).",
+  "not_verified_here": [
+    "a real /data/downloads volume on Railway, and a link opened from outside the container",
+    "the voice surface in a real browser against a real gateway"
+  ],
+  "deployment": {
+    "mode": "in-place",
+    "order": "tenax-frame 1.10.0 and its reader token, then Gateway Service 2.251.0 with migrations 0057 and 0058, then this connector with TENAX_FRAME_URL and TENAX_FRAME_READ_TOKEN, then delete the seven voice allowlist variables, then ts-client-gateway 5.233.0",
+    "rollback_target": "13.36.0 (restore VOICE_TEST_USERS first if rolling back: 13.36.0 enforces its allowlist)"
+  }
+}

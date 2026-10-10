@@ -63,6 +63,8 @@ import { resolveContained, isSafeFilename }                        from './utils
 import { createInternalConfigHandler }                             from './utils/internalConfig.js';
 // TNX-FEAT-SIGNEDURLS: per-file HMAC signed download links.
 import { verifySignedRequest, signedLinksEnabled, resolveSigningSecret, linkExpirySeconds } from './utils/signedUrls.js';
+// v13.37.0 -- TENAX-2026-10-09-01 C-CALIBRATION: reaper >= link, enforced.
+import { calibrateDownloadsTtl } from './utils/retentionCalibration.js';
 // v12.28.0 (TNX-H-004 / TNX-H-006): process guards, HTTP timeout tuning,
 // graceful drain and readiness checks. The connector previously had none of
 // these; the gateway had all of them.
@@ -578,6 +580,17 @@ import {
   renderToolsStatus,
 } from "./tools/render-tools.js";
 
+// v13.37.0 -- TENAX-2026-10-09-01 Track A, route A1. A delivered coding tree,
+// fetched from the frame runner with a read-only credential and published from
+// the downloads directory through the existing signed-link path. Reached only
+// through the tool layer: no route is added.
+import {
+  CODING_DELIVERY_TOOL,
+  codingDeliverablePublishToolDefinition,
+  frameDeliveryConfigured,
+  handleCodingDeliverablePublish,
+} from "./tools/coding-delivery.js";
+
 // SPEC-GTW-TOOL-001. Additive, exactly as the render tools were: script_execute
 // and the editor scripts it can reach are unchanged and remain available.
 import {
@@ -1027,6 +1040,12 @@ const TOOLS = [
   // ---------- Gateway validation tools (SPEC-GTW-TOOL-003) ----------
   ...(SKILL_ENABLED && VALIDATION_TOOLS_ENABLED ? VALIDATION_TOOL_DEFINITIONS : []),
 
+  // ---------- Coding delivery (v13.37.0, TENAX-2026-10-09-01 A1) ----------
+  // Advertised only when the frame runner is configured (TENAX_FRAME_URL and
+  // TENAX_FRAME_READ_TOKEN): without them the tool can only ever answer
+  // frame_not_configured.
+  ...(frameDeliveryConfigured() ? [codingDeliverablePublishToolDefinition] : []),
+
   // ---------- Modular Skill System (v11.0.0) ----------
   // Only advertised when SKILL_MODULAR_ENABLED=true (requires SKILL_FILE_PATH).
   // skill_compile replaces skill_read at session start when modular mode is active.
@@ -1398,6 +1417,12 @@ async function dispatchToolCallCore(name, args, context = null) {
         // feature-flag check cannot be applied to three tools and forgotten on
         // the fourth. dispatchRenderTool returns null for any name it does not
         // own, which cannot happen here but keeps the contract explicit.
+        // ---------- Coding delivery (v13.37.0, TENAX-2026-10-09-01 A1) ----------
+        // Dispatched whether or not it is advertised, so a misconfigured
+        // deployment answers frame_not_configured by name rather than
+        // "Unknown tool".
+        case CODING_DELIVERY_TOOL: return await handleCodingDeliverablePublish(args);
+
         case "document_render":
         case "pdf_render":
         case "xlsx_render":
@@ -2851,6 +2876,16 @@ const DOWNLOADS_DIR            = process.env.DOWNLOADS_DIR || '/data/downloads/'
 const DOWNLOADS_TTL_HOURS      = parseInt(process.env.DOWNLOADS_TTL_HOURS || String(3 * 24), 10);
 
 /**
+ * v13.37.0 -- TENAX-2026-10-09-01 C-CALIBRATION. The window the reaper
+ * actually runs at: DOWNLOADS_TTL_HOURS, raised to the signed-link lifetime
+ * when it is configured below it, so the ordering documented above is
+ * enforced rather than described (src/utils/retentionCalibration.js).
+ */
+const DOWNLOADS_REAPER = calibrateDownloadsTtl(DOWNLOADS_TTL_HOURS, linkExpirySeconds());
+const DOWNLOADS_REAPER_HOURS   = DOWNLOADS_REAPER.hours;
+if (DOWNLOADS_REAPER.raised) log('warn', `[retention] ${DOWNLOADS_REAPER.message}`);
+
+/**
  * Files under /data/downloads that must survive the reaper.
  *
  * ava_brain_data.json is the Neural Core architecture scan. 20-neural-core.js
@@ -2875,7 +2910,7 @@ function sweepExpiredUploads() {
 function sweepExpiredDownloads() {
   return sweepExpiredFiles({
     dir:       DOWNLOADS_DIR,
-    ttlHours:  DOWNLOADS_TTL_HOURS,
+    ttlHours:  DOWNLOADS_REAPER_HOURS,
     protected: DOWNLOADS_PROTECTED,
     label:     'sweep/downloads',
   });
@@ -2903,7 +2938,8 @@ if (UPLOAD_SWEEP_ENABLED) {
   if (typeof _retentionTimer.unref === 'function') _retentionTimer.unref();
   log('info',
     `retention sweeper active: uploads ${DEFAULT_TTL_HOURS}h, ` +
-    `downloads ${Math.round(DOWNLOADS_TTL_HOURS / 24)}d ` +
+    `downloads ${Math.round(DOWNLOADS_TTL_HOURS / 24)}d configured, ` +
+    `${Math.round(DOWNLOADS_REAPER_HOURS / 24)}d effective ` +
     `(protected: ${[...DOWNLOADS_PROTECTED].join(', ') || 'none'}), ` +
     `interval ${Math.round(UPLOAD_SWEEP_INTERVAL_MS / 60000)}min`);
 }
