@@ -22,8 +22,9 @@ import express        from 'express';
 import Database       from 'better-sqlite3';
 
 import { voiceEnabled, benchmarkState, gateState, requireVoiceEnabled,
-         requireVoiceForUser, testUsers, resolveIdentity, userAllowed,
-         voiceAvailableFor, USER_ID_HEADER, TENANT_ID_HEADER }
+         requireVoiceForUser, resolveIdentity, identityPresent, entitlementClaimed,
+         voiceAvailableFor, voiceRenderableFor, USER_ID_HEADER, TENANT_ID_HEADER,
+         ENTITLEMENT_HEADER }
                       from '../voice/voice-gate.js';
 import { parseMultipart, parseBoundary } from '../voice/multipart.js';
 import { validateAudio, sniffFormat, wavDurationSeconds }
@@ -32,11 +33,7 @@ import { voicePermitted, voicesForLanguage, catalogState, attributions,
          VOICE_CATALOG, TTS_LANGUAGES } from '../voice/voice-catalog.js';
 import { initVoiceSchema, setVoiceSettings, getVoiceSettings, logVoiceUsage }
                       from '../voice/voice-schema.js';
-import { voiceAvailableForAsync } from '../voice/voice-gate.js';
-import { allowlistSource, parseAllowlist, currentAllowlist,
-         ensureAllowlistFresh, allowlistState, resetAllowlistCache,
-         allowlistConfigProblems }
-                      from '../voice/voice-allowlist.js';
+import { readdirSync, statSync, existsSync } from 'node:fs';
 import { registerVoiceRoutes } from '../routes/voice.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -54,18 +51,28 @@ function wav(seconds = 1, rate = 16000) {
   return Buffer.concat([h, data]);
 }
 
-/** A request object carrying the per-call identity the gate reads. */
-function reqWith(userId, tenantId) {
+/**
+ * A request object carrying the per-call identity the gate reads, and (v13.37.0)
+ * the gateway's entitlement claim when `entitled` is given.
+ */
+function reqWith(userId, tenantId, entitled) {
   const headers = {};
   if (userId !== undefined && userId !== null) headers[USER_ID_HEADER] = userId;
   if (tenantId) headers[TENANT_ID_HEADER] = tenantId;
+  if (entitled !== undefined) headers[ENTITLEMENT_HEADER] = entitled;
   return { headers };
 }
 
-/** Fetch headers for an identified caller. */
+/**
+ * Fetch headers for an identified caller, as the Gateway Service sends them for
+ * a user its entitlement predicate allowed: the identity and the claim.
+ */
 function asUser(userId, tenantId, extra) {
   const h = { ...(extra || {}) };
-  if (userId) h['X-Tenax-User-Id'] = userId;
+  if (userId) {
+    h['X-Tenax-User-Id'] = userId;
+    h['X-Tenax-Voice-Entitlement'] = 'entitled';
+  }
   if (tenantId) h['X-Tenax-Tenant-Id'] = tenantId;
   return h;
 }
@@ -184,9 +191,9 @@ test('the benchmark gate does not accept an unparseable date', () => {
   }
 });
 
-test('gateState reports per user, not globally', () => {
-  withEnv({ VOICE_ENABLED: undefined, VOICE_TEST_USERS: '8' }, () => {
-    const off = gateState({ sttReady: true, ttsReady: true }, reqWith('8'));
+test('gateState reports per user, not globally, rendering from the gateway claim', () => {
+  withEnv({ VOICE_ENABLED: undefined }, () => {
+    const off = gateState({ sttReady: true, ttsReady: true }, reqWith('8', null, 'entitled'));
     assert.equal(off.enabled, false);
     assert.equal(off.voice_enabled_for_this_user, false, 'the kill switch wins');
     assert.equal(off.render_voice_ui, false, 'no voice UI in the DOM at all');
@@ -195,17 +202,17 @@ test('gateState reports per user, not globally', () => {
     assert.equal(off.degraded, false, 'off is not degraded -- they are different states');
   });
 
-  withEnv({ VOICE_ENABLED: 'true', VOICE_TEST_USERS: '8' }, () => {
-    // The allowlisted operator.
-    const mine = gateState({ sttReady: false, ttsReady: false, degraded: true }, reqWith('8'));
+  withEnv({ VOICE_ENABLED: 'true' }, () => {
+    // A user the gateway entitled.
+    const mine = gateState({ sttReady: false, ttsReady: false, degraded: true }, reqWith('8', null, 'entitled'));
     assert.equal(mine.voice_enabled_for_this_user, true);
     assert.equal(mine.render_voice_ui, true);
     assert.equal(mine.degraded, true, 'gate on + engine down renders a degraded state');
 
-    // Everyone else on the same connector, while the master switch is ON. This
-    // is the leak the per-user gate exists to close: a UI handed a global
-    // `enabled` would render a mic button for this user too.
-    const theirs = gateState({ sttReady: true, ttsReady: true }, reqWith('9'));
+    // A user the gateway did not entitle (a student without an override), while
+    // the master switch is ON. A UI handed a global `enabled` would render a mic
+    // button for this user too.
+    const theirs = gateState({ sttReady: true, ttsReady: true }, reqWith('9', null, 'denied'));
     assert.equal(theirs.enabled, true, 'the global fact is still reported');
     assert.equal(theirs.voice_enabled_for_this_user, false, 'but availability is per user');
     assert.equal(theirs.render_voice_ui, false, 'so this user emits no voice elements');
@@ -213,8 +220,9 @@ test('gateState reports per user, not globally', () => {
       'and sees no readiness, which would otherwise be grounds to render something');
     assert.equal(theirs.tts_ready, false);
 
-    // No identity at all.
-    const anon = gateState({ sttReady: true, ttsReady: true }, reqWith(null));
+    // No claim at all renders as not entitled; no identity likewise.
+    assert.equal(gateState({}, reqWith('9')).render_voice_ui, false, 'no claim, no surface');
+    const anon = gateState({ sttReady: true, ttsReady: true }, reqWith(null, null, 'entitled'));
     assert.equal(anon.voice_enabled_for_this_user, false, 'absent identity fails closed');
   });
 });
@@ -354,9 +362,8 @@ test('AC: gate off -- the two routes 404, health answers enabled:false', async (
 });
 
 test('AC: an unsupported language or voice is a clear 422, never a 500', async () => {
-  const prior = { e: process.env.VOICE_ENABLED, u: process.env.VOICE_TEST_USERS };
+  const prior = { e: process.env.VOICE_ENABLED };
   process.env.VOICE_ENABLED = 'true';
-  process.env.VOICE_TEST_USERS = 'op-1';
   const { base, close } = await listen(makeApp());
   const post = (body) => fetch(`${base}/voice/synthesize`, {
     method: 'POST',
@@ -405,14 +412,12 @@ test('AC: an unsupported language or voice is a clear 422, never a 500', async (
   } finally {
     await close();
     if (prior.e === undefined) delete process.env.VOICE_ENABLED; else process.env.VOICE_ENABLED = prior.e;
-    if (prior.u === undefined) delete process.env.VOICE_TEST_USERS; else process.env.VOICE_TEST_USERS = prior.u;
   }
 });
 
 test('AC: bad audio is rejected at the edge with the right status', async () => {
-  const prior = { e: process.env.VOICE_ENABLED, u: process.env.VOICE_TEST_USERS };
+  const prior = { e: process.env.VOICE_ENABLED };
   process.env.VOICE_ENABLED = 'true';
-  process.env.VOICE_TEST_USERS = 'op-1';
   const { base, close } = await listen(makeApp());
   try {
     const bad = await fetch(`${base}/voice/transcribe`, {
@@ -432,16 +437,13 @@ test('AC: bad audio is rejected at the edge with the right status', async () => 
   } finally {
     await close();
     if (prior.e === undefined) delete process.env.VOICE_ENABLED; else process.env.VOICE_ENABLED = prior.e;
-    if (prior.u === undefined) delete process.env.VOICE_TEST_USERS; else process.env.VOICE_TEST_USERS = prior.u;
   }
 });
 
 test('AC: health reports that the benchmark gate has not been passed', async () => {
   const priorV = process.env.VOICE_ENABLED;
   const priorB = process.env.VOICE_BENCHMARK_COMPLETED;
-  const priorU = process.env.VOICE_TEST_USERS;
   process.env.VOICE_ENABLED = 'true';
-  process.env.VOICE_TEST_USERS = 'op-1';
   delete process.env.VOICE_BENCHMARK_COMPLETED;
   const { base, close } = await listen(makeApp());
   try {
@@ -466,22 +468,19 @@ test('AC: health reports that the benchmark gate has not been passed', async () 
   } finally {
     await close();
     if (priorV === undefined) delete process.env.VOICE_ENABLED; else process.env.VOICE_ENABLED = priorV;
-    if (priorU === undefined) delete process.env.VOICE_TEST_USERS; else process.env.VOICE_TEST_USERS = priorU;
     if (priorB !== undefined) process.env.VOICE_BENCHMARK_COMPLETED = priorB;
   }
 });
 
 test('AC: an unauthenticated request is refused', async () => {
-  const prior = { e: process.env.VOICE_ENABLED, u: process.env.VOICE_TEST_USERS };
+  const prior = { e: process.env.VOICE_ENABLED };
   process.env.VOICE_ENABLED = 'true';
-  process.env.VOICE_TEST_USERS = 'op-1';
   const app = express();
   registerVoiceRoutes(app);          // no auth middleware at all
   const { base, close } = await listen(app);
   try {
-    // Allowlisted, so the gate passes -- and the AUTH layer still refuses. The
-    // per-user gate is a testing keyhole, not an authentication mechanism, and
-    // must not become a way to skip authentication by naming yourself.
+    // Identified and entitled, so the gate passes -- and the AUTH layer still
+    // refuses. Naming yourself in a header is not a way to skip authentication.
     const r = await fetch(`${base}/voice/synthesize`, {
       method: 'POST',
       headers: asUser('op-1', null, { 'Content-Type': 'application/json' }),
@@ -491,7 +490,6 @@ test('AC: an unauthenticated request is refused', async () => {
   } finally {
     await close();
     if (prior.e === undefined) delete process.env.VOICE_ENABLED; else process.env.VOICE_ENABLED = prior.e;
-    if (prior.u === undefined) delete process.env.VOICE_TEST_USERS; else process.env.VOICE_TEST_USERS = prior.u;
   }
 });
 
@@ -573,67 +571,66 @@ test('requireVoiceEnabled sends 404 and reports that it did', () => {
 });
 
 // ===========================================================================
-// PER-USER FEATURE GATE  (Tenax Voice -- Per-User Feature Gate Spec)
+// PER-USER GATE, v13.37.0  (TENAX-VOICE-2026-10-07-02)
 //
-// Section 3's truth table, plus the six cases Section 6.3 names. The property
-// under test throughout is that every refusal is INDISTINGUISHABLE from the
-// feature not existing.
+// The allowlist is retired, not repaired. The connector checks the master
+// switch and that an identity was sent; who is ENTITLED is the gateway's
+// per-request answer, which /voice/health renders from and nothing enforces
+// with. Every refusal is still INDISTINGUISHABLE from the feature not existing.
 // ===========================================================================
 
-test('the allowlist is parsed exactly, and an empty one opens nothing', () => {
-  withEnv({ VOICE_TEST_USERS: undefined }, () => {
-    assert.deepEqual(testUsers(), [], 'empty by default -- voice unreachable');
-  });
-  withEnv({ VOICE_TEST_USERS: '' }, () => assert.deepEqual(testUsers(), []));
+/** Source of every non-test .js file under src/, comments removed. */
+function connectorCodeFiles() {
+  const root = join(HERE, '..');
+  const out = [];
+  const walk = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const abs = join(dir, name);
+      if (name === 'tests' || name === 'node_modules') continue;
+      if (statSync(abs).isDirectory()) { walk(abs); continue; }
+      if (!/\.(m?js)$/.test(name) || /\.test\.m?js$/.test(name)) continue;
+      const src = readFileSync(abs, 'utf8');
+      out.push({ file: abs.slice(root.length + 1),
+        code: src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/([^:'"`])\/\/[^\n'"`]*$/gm, '$1') });
+    }
+  };
+  walk(root);
+  return out;
+}
 
-  withEnv({ VOICE_TEST_USERS: ' 8 , op-1,ts_50f3be57:8 ' }, () => {
-    assert.deepEqual(testUsers(), ['8', 'op-1', 'ts_50f3be57:8'], 'trimmed, order kept');
-  });
-
-  // A trailing comma must not leave an empty entry: an empty string would match
-  // a caller who sent no identity at all, turning a typo into an open door.
-  withEnv({ VOICE_TEST_USERS: 'op-1,,' }, () => {
-    assert.deepEqual(testUsers(), ['op-1']);
-    assert.equal(userAllowed({ userId: null }), false, 'no identity is still refused');
-    assert.equal(userAllowed({ userId: '' }), false);
-  });
+test('C-10: no connector path reads VOICE_TEST_USERS or any VOICE_ALLOWLIST_* variable', () => {
+  assert.equal(existsSync(join(VOICE_DIR, 'voice-allowlist.js')), false, 'the allowlist module is deleted');
+  const retired = ['VOICE_TEST_USERS', 'VOICE_ALLOWLIST_SOURCE', 'VOICE_ALLOWLIST_URL', 'VOICE_ALLOWLIST_KEY',
+    'VOICE_ALLOWLIST_TTL_MS', 'VOICE_ALLOWLIST_MAX_STALE_MS', 'VOICE_ALLOWLIST_TIMEOUT_MS'];
+  const files = connectorCodeFiles();
+  assert.ok(files.length > 50, 'the walk found the connector source');
+  const readers = [];
+  for (const { file, code } of files) {
+    for (const name of retired) if (code.includes(name)) readers.push(`${file}: ${name}`);
+    if (/voice-allowlist/.test(code)) readers.push(`${file}: imports voice-allowlist`);
+  }
+  assert.deepEqual(readers, [], 'a retired allowlist variable is read in code');
 });
 
-test('matching is exact: no substring, no case folding, no prefix', () => {
-  withEnv({ VOICE_TEST_USERS: 'op-1,8' }, () => {
-    assert.equal(userAllowed({ userId: 'op-1' }), true);
-    assert.equal(userAllowed({ userId: '8' }), true);
-
-    // Section 2.2: "no substring match, no case folding". Every one of these is
-    // a different person from an allowlisted one.
-    assert.equal(userAllowed({ userId: 'OP-1' }), false, 'case is not folded');
-    assert.equal(userAllowed({ userId: 'op-10' }), false, 'no prefix match');
-    assert.equal(userAllowed({ userId: 'xop-1' }), false, 'no suffix match');
-    assert.equal(userAllowed({ userId: 'op-1 extra' }), false);
-    assert.equal(userAllowed({ userId: '80' }), false, '"8" must not admit "80"');
-    assert.equal(userAllowed({ userId: '8-guest' }), false);
-    assert.equal(userAllowed({ userId: 'op' }), false);
-  });
+test('C-11: VOICE_PROSODY_ENABLED is read in one place only, prosody.js', () => {
+  const readers = connectorCodeFiles().filter(({ code }) => code.includes('VOICE_PROSODY_ENABLED')).map(({ file }) => file);
+  assert.deepEqual(readers, [join('voice', 'prosody.js')]);
 });
 
-test('a tenant-qualified entry narrows the grant rather than widening it', () => {
-  // Observed user_id values are small integers, so user 8 of tenant A is a
-  // different person from user 8 of tenant B. A bare "8" would admit both.
-  withEnv({ VOICE_TEST_USERS: 'ts_aaa:8' }, () => {
-    assert.equal(userAllowed({ userId: '8', tenantId: 'ts_aaa' }), true);
-    assert.equal(userAllowed({ userId: '8', tenantId: 'ts_bbb' }), false,
-      'the same user id in another tenant is a different person');
-    assert.equal(userAllowed({ userId: '8', tenantId: null }), false,
-      'a qualified entry needs the tenant, so an unqualified caller is refused');
-    assert.equal(userAllowed({ userId: '9', tenantId: 'ts_aaa' }), false);
-  });
-
-  // A malformed entry must not degrade into a wildcard.
-  withEnv({ VOICE_TEST_USERS: ':8,ts_aaa:' }, () => {
-    assert.equal(userAllowed({ userId: '8', tenantId: 'ts_aaa' }), false,
-      'half-written entries grant nothing');
-    assert.equal(userAllowed({ userId: '8' }), false);
-  });
+test('identity presence is an explicit predicate, and the entitlement claim is read exactly', () => {
+  assert.equal(identityPresent({ userId: '38' }), true);
+  for (const bad of [null, undefined, {}, { userId: null }, { userId: '' }, { userId: '   ' }, { userId: 38 }]) {
+    assert.equal(identityPresent(bad), false, JSON.stringify(bad));
+  }
+  assert.equal(entitlementClaimed(reqWith('8', null, 'entitled')), true);
+  assert.equal(entitlementClaimed(reqWith('8', null, ' Entitled ')), true, 'case and spacing as HTTP may carry them');
+  for (const v of ['denied', 'yes', 'true', '1', '', 'entitled,entitled']) {
+    assert.equal(entitlementClaimed(reqWith('8', null, v)), false, `"${v}" is not the claim`);
+  }
+  assert.equal(entitlementClaimed(reqWith('8')), false, 'no header, no claim');
+  assert.equal(entitlementClaimed({ headers: { [ENTITLEMENT_HEADER]: ['entitled', 'entitled'] } }), false,
+    'a header sent twice is ambiguous and reads as no claim');
+  assert.equal(entitlementClaimed(null), false);
 });
 
 test('identity is read per request, never from the process singleton', () => {
@@ -651,121 +648,125 @@ test('identity is read per request, never from the process singleton', () => {
   // says fail closed on any ambiguity.
   assert.equal(resolveIdentity({ headers: { [USER_ID_HEADER]: ['a', 'b'] } }).userId, null);
 
-  // The tenant falls back to whatever tenantAuth resolved, so a qualified
-  // allowlist entry works without the caller restating the tenant.
   const viaAuth = resolveIdentity({ headers: { [USER_ID_HEADER]: '8' }, tsTenantId: 'ts_aaa' });
   assert.equal(viaAuth.tenantId, 'ts_aaa');
 
-  // The gate must NOT consult getCurrentUser(). That singleton is seeded by
+  // The gate must NOT consult getCurrentUser(): that singleton is seeded by
   // whoever last ran session-init, so a gate built on it would judge one user's
-  // request against another's identity -- failing open under exactly the shared
-  // conditions this gate was written for.
+  // request against another's identity.
   const src = readFileSync(join(VOICE_DIR, 'voice-gate.js'), 'utf8');
   const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   assert.ok(!/getCurrentUser/.test(code),
     'voice-gate.js must not read the process-level session context');
 });
 
-test('Section 3 truth table: both layers are required, in every combination', () => {
-  const allowed = reqWith('op-1');
-  const other = reqWith('op-2');
-  const anon = reqWith(null);
+test('truth table: the routes need the master switch and an identity; the surface needs the claim too', () => {
+  const entitled = reqWith('op-1', null, 'entitled');
+  const notClaimed = reqWith('op-2');
+  const denied = reqWith('op-3', null, 'denied');
+  const anon = reqWith(null, null, 'entitled');
 
-  // Row 1: master off -- nothing opens, whatever the allowlist says.
-  withEnv({ VOICE_ENABLED: undefined, VOICE_TEST_USERS: 'op-1' }, () => {
-    assert.equal(voiceAvailableFor(allowed), false, 'the kill switch overrides the allowlist');
-    assert.equal(voiceAvailableFor(other), false);
-  });
-  withEnv({ VOICE_ENABLED: 'ture', VOICE_TEST_USERS: 'op-1' }, () => {
-    assert.equal(voiceAvailableFor(allowed), false, 'and a typo is still off');
-  });
-
-  // Row 2: master on, not allowlisted -- refused.
-  withEnv({ VOICE_ENABLED: 'true', VOICE_TEST_USERS: 'op-1' }, () => {
-    assert.equal(voiceAvailableFor(other), false);
+  // Master off: nothing opens and nothing renders, whatever the claim says.
+  for (const v of [undefined, 'ture', 'false']) {
+    withEnv({ VOICE_ENABLED: v }, () => {
+      for (const r of [entitled, notClaimed, denied, anon]) {
+        assert.equal(voiceAvailableFor(r), false, `master ${v}`);
+        assert.equal(voiceRenderableFor(r), false, `master ${v}`);
+      }
+    });
+  }
+  withEnv({ VOICE_ENABLED: 'true' }, () => {
+    // The routes: identity is required, the claim is not read (the gateway
+    // enforced it before forwarding; a header is a claim, not an authority).
+    assert.equal(voiceAvailableFor(entitled), true);
+    assert.equal(voiceAvailableFor(notClaimed), true);
+    assert.equal(voiceAvailableFor(denied), true);
     assert.equal(voiceAvailableFor(anon), false, 'absent identity fails closed');
-
-    // Row 3: master on and allowlisted -- the only combination that opens.
-    assert.equal(voiceAvailableFor(allowed), true);
-  });
-
-  // The allowlist alone can never open voice, and neither can the master
-  // switch alone. Two independent failures must both happen.
-  withEnv({ VOICE_ENABLED: 'true', VOICE_TEST_USERS: undefined }, () => {
-    assert.equal(voiceAvailableFor(allowed), false, 'empty allowlist -- nobody gets in');
+    // The surface: only an entitled claim renders it.
+    assert.equal(voiceRenderableFor(entitled), true);
+    assert.equal(voiceRenderableFor(notClaimed), false);
+    assert.equal(voiceRenderableFor(denied), false);
+    assert.equal(voiceRenderableFor(anon), false);
   });
 });
 
-test('AC: a non-allowlisted user gets the identical 404, on every route', async () => {
-  await withEnv({ VOICE_ENABLED: 'true', VOICE_TEST_USERS: 'op-1' }, async () => {
+test('C-08: VOICE_ENABLED=false refuses everyone with no network call, an entitled caller included', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; throw new Error('the kill switch must not call out'); };
+  try {
+    await withEnv({ VOICE_ENABLED: 'false' }, async () => {
+      assert.equal(voiceAvailableFor(reqWith('op-1', 'ts_a', 'entitled')), false);
+      assert.equal(voiceRenderableFor(reqWith('op-1', 'ts_a', 'entitled')), false);
+      const res = { s: null, status(v) { this.s = v; return this; }, json() { return this; } };
+      assert.equal(requireVoiceForUser(reqWith('op-1', 'ts_a', 'entitled'), res), false);
+      assert.equal(res.s, 404);
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(calls, 0, 'no network call was made');
+});
+
+test('AC: a caller with no identity, or one the gateway did not entitle, sees voice as absent', async () => {
+  await withEnv({ VOICE_ENABLED: 'true' }, async () => {
     const { base, close } = await listen(makeApp());
     try {
       // The reference: what the world looks like when voice is globally off.
       const offBody = { enabled: false, voice_enabled_for_this_user: false,
                         stt_ready: false, tts_ready: false, models_loaded: [] };
 
+      // No identity: refused on every route with the indistinguishable 404.
+      const t = await fetch(`${base}/voice/transcribe`, {
+        method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav(1),
+      });
+      assert.equal(t.status, 404);
+      assert.deepEqual(await t.json(), { error: 'not_found' }, 'only "not found" -- never "you are not allowed"');
+      const s = await fetch(`${base}/voice/synthesize`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: 'hello', language: 'en' }),
+      });
+      assert.equal(s.status, 404);
+
+      // Health: byte-identical to voice being off for a stranger with no
+      // identity and for a user the gateway did not entitle (a student).
+      const bodies = [];
       for (const [label, headers] of [
-        ['not allowlisted', asUser('op-2')],
-        ['no identity',     {}],
-        ['near miss',       asUser('op-10')],
-        ['case variant',    asUser('OP-1')],
+        ['no identity', {}],
+        ['identity, no claim', { 'X-Tenax-User-Id': 'op-2' }],
+        ['identity, denied', { 'X-Tenax-User-Id': 'op-3', 'X-Tenax-Voice-Entitlement': 'denied' }],
       ]) {
-        const t = await fetch(`${base}/voice/transcribe`, {
-          method: 'POST', headers: { ...headers, 'Content-Type': 'audio/wav' }, body: wav(1),
-        });
-        assert.equal(t.status, 404, `${label}: transcribe 404s`);
-        assert.deepEqual(await t.json(), { error: 'not_found' },
-          `${label}: and says only "not found" -- never "you are not allowed"`);
-
-        const s = await fetch(`${base}/voice/synthesize`, {
-          method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: 'hello', language: 'en' }),
-        });
-        assert.equal(s.status, 404, `${label}: synthesize 404s`);
-
-        // Health answers, but must be byte-identical to the globally-off body.
-        // Reporting enabled:true here would tell this caller the feature exists
-        // and that they are merely excluded.
         const h = await fetch(`${base}/voice/health`, { headers });
-        assert.equal(h.status, 200);
-        assert.deepEqual(await h.json(), offBody,
-          `${label}: health is indistinguishable from voice being off`);
+        assert.equal(h.status, 200, label);
+        const text = await h.text();
+        assert.deepEqual(JSON.parse(text), offBody, `${label}: indistinguishable from voice being off`);
+        bodies.push(text);
       }
+      assert.equal(new Set(bodies).size, 1, 'the three refusals are byte-identical');
     } finally { await close(); }
   });
 });
 
-test('AC: the allowlisted operator reaches the routes', async () => {
-  await withEnv({ VOICE_ENABLED: 'true', VOICE_TEST_USERS: 'op-1' }, async () => {
+test('AC: an entitled caller reaches the routes and the surface with no list of any kind', async () => {
+  // The negative row carried from the retired suite: an entitled non-student
+  // speaks with no grant and nothing configured on the connector for them.
+  await withEnv({ VOICE_ENABLED: 'true' }, async () => {
     const { base, close } = await listen(makeApp());
     try {
-      // Past the gate: these fail on their own merits (unaudited voice, bad
-      // audio) rather than with the gate's 404. That distinction is the whole
-      // test -- a 404 here would mean the operator is locked out of their own
-      // testing, which the specification names as the risk of scoping the gate
-      // to the wrong field.
       const s = await fetch(`${base}/voice/synthesize`, {
         method: 'POST',
         headers: asUser('op-1', null, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ text: 'hello', language: 'en' }),
       });
-      assert.notEqual(s.status, 404, 'the operator is not gated out');
-      // From v12.50.0 English clears the catalogue, so this now reaches the
-      // ENGINE and fails there (no Piper in the test image). The distinction
-      // the test protects is unchanged: whatever refuses the operator, it must
-      // not be the per-user gate.
+      assert.notEqual(s.status, 404, 'not gated out');
       assert.ok([422, 500].includes(s.status), `expected an engine or catalogue answer, got ${s.status}`);
 
-      // An unaudited language still stops at the catalogue, which proves the
-      // request got that far rather than being turned away at the gate.
       const zh = await fetch(`${base}/voice/synthesize`, {
         method: 'POST',
         headers: asUser('op-1', null, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ text: 'hello', language: 'zh' }),
       });
       assert.equal(zh.status, 422);
-      // v13. Refused for a different reason now: Chinese is not a language this
-      // deployment speaks at all, rather than one with no audited voice.
       assert.equal((await zh.json()).error, 'unsupported_language');
 
       const t = await fetch(`${base}/voice/transcribe`, {
@@ -773,18 +774,18 @@ test('AC: the allowlisted operator reaches the routes', async () => {
         headers: asUser('op-1', null, { 'Content-Type': 'audio/wav' }),
         body: Buffer.from('not audio'),
       });
-      assert.notEqual(t.status, 404);
       assert.equal(t.status, 415, 'and reaches the real validator');
 
       const h = await (await fetch(`${base}/voice/health`, { headers: asUser('op-1') })).json();
       assert.equal(h.enabled, true);
       assert.equal(h.voice_enabled_for_this_user, true);
+      assert.equal(h.allowlist, undefined, 'there is no allowlist to describe');
     } finally { await close(); }
   });
 });
 
-test('AC: the kill switch shuts the allowlisted operator out too', async () => {
-  await withEnv({ VOICE_ENABLED: undefined, VOICE_TEST_USERS: 'op-1' }, async () => {
+test('AC: the kill switch shuts an entitled caller out too', async () => {
+  await withEnv({ VOICE_ENABLED: undefined }, async () => {
     const { base, close } = await listen(makeApp());
     try {
       const s = await fetch(`${base}/voice/synthesize`, {
@@ -792,34 +793,11 @@ test('AC: the kill switch shuts the allowlisted operator out too', async () => {
         headers: asUser('op-1', null, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({ text: 'hello', language: 'en' }),
       });
-      assert.equal(s.status, 404, 'VOICE_ENABLED unset overrides the allowlist entirely');
+      assert.equal(s.status, 404, 'VOICE_ENABLED unset overrides the claim entirely');
 
       const h = await (await fetch(`${base}/voice/health`, { headers: asUser('op-1') })).json();
       assert.equal(h.enabled, false);
       assert.equal(h.voice_enabled_for_this_user, false);
-    } finally { await close(); }
-  });
-});
-
-test('AC: with the allowlist empty, behaviour is identical to the old global gate', async () => {
-  // Section 7's upgrade-order claim: "it degrades safely: with the allowlist
-  // empty and VOICE_ENABLED off, behaviour is byte-for-byte identical to
-  // today's gate". Asserted rather than assumed, because it is what makes
-  // deploying the connector ahead of the UI safe.
-  await withEnv({ VOICE_ENABLED: undefined, VOICE_TEST_USERS: undefined }, async () => {
-    const { base, close } = await listen(makeApp());
-    try {
-      const t = await fetch(`${base}/voice/transcribe`, { method: 'POST', body: wav(1) });
-      assert.equal(t.status, 404);
-      assert.deepEqual(await t.json(), { error: 'not_found' });
-
-      const h = await fetch(`${base}/voice/health`);
-      assert.equal(h.status, 200, 'health still always answers');
-      const body = await h.json();
-      assert.equal(body.enabled, false);
-      assert.equal(body.stt_ready, false);
-      assert.equal(body.tts_ready, false);
-      assert.deepEqual(body.models_loaded, []);
     } finally { await close(); }
   });
 });
@@ -832,372 +810,23 @@ test('requireVoiceForUser refuses with the same 404 as the global guard', () => 
     return r;
   };
 
-  withEnv({ VOICE_ENABLED: 'true', VOICE_TEST_USERS: 'op-1' }, () => {
+  withEnv({ VOICE_ENABLED: 'true' }, () => {
     const ok = mk();
     assert.equal(requireVoiceForUser(reqWith('op-1'), ok), true);
-    assert.equal(ok._status, null, 'an allowed caller gets no response written');
+    assert.equal(ok._status, null, 'an identified caller gets no response written');
 
     const refused = mk();
-    assert.equal(requireVoiceForUser(reqWith('op-2'), refused), false);
+    assert.equal(requireVoiceForUser(reqWith(null), refused), false);
     assert.equal(refused._status, 404);
     assert.deepEqual(refused._payload, { error: 'not_found' });
   });
 
-  // The global guard, for comparison. Identical status and identical body, so
-  // the two refusals cannot be told apart from outside.
+  // The global guard, for comparison. Identical status and identical body.
   withEnv({ VOICE_ENABLED: undefined }, () => {
     const global = mk();
     assert.equal(requireVoiceEnabled(global), false);
     assert.equal(global._status, 404);
     assert.deepEqual(global._payload, { error: 'not_found' });
-  });
-});
-
-test('the allowlist contents never reach the logs', () => {
-  // Identities are operator account ids. The registration line reports the
-  // COUNT so an operator can see the keyhole is configured, never the values.
-  const src = readFileSync(join(HERE, '..', 'routes', 'voice.js'), 'utf8');
-  const logLine = src.slice(src.indexOf('routes registered'), src.indexOf('routes registered') + 200);
-  assert.ok(/allowlisted_users=\$\{allowlisted\}/.test(logLine), 'the count is logged');
-  assert.ok(!/testUsers\(\)\.join|VOICE_TEST_USERS\}/.test(src),
-    'the identities themselves are never interpolated into a log line');
-});
-
-// ===========================================================================
-// ALLOWLIST SOURCE  (v12.48.0 -- the revoke-drift fix)
-//
-// The failure being closed: with the allowlist in VOICE_TEST_USERS and grants
-// recorded in the gateway, a REVOKE that is not manually pasted back leaves the
-// user with voice while the admin screen says they do not have it. Grant-drift
-// is safe (the user simply has no voice); revoke-drift is a security-relevant
-// lie. These tests pin the fix and the failure behaviour around it.
-// ===========================================================================
-
-test('env mode is the default and is unchanged', () => {
-  withEnv({ VOICE_ALLOWLIST_SOURCE: undefined, VOICE_TEST_USERS: 'op-1,op-2' }, () => {
-    assert.equal(allowlistSource(), 'env', 'switching a security gate to a network read is opt-in');
-    assert.deepEqual(currentAllowlist(), ['op-1', 'op-2']);
-  });
-  // Only the exact string switches over, matching VOICE_ENABLED's strictness.
-  for (const v of ['Gateway ', 'gatewy', 'remote', 'true']) {
-    withEnv({ VOICE_ALLOWLIST_SOURCE: v }, () => {
-      assert.equal(allowlistSource(), v.trim().toLowerCase() === 'gateway' ? 'gateway' : 'env',
-        `"${v}" must not silently change the source`);
-    });
-  }
-  withEnv({ VOICE_ALLOWLIST_SOURCE: 'gateway' }, () => {
-    assert.equal(allowlistSource(), 'gateway');
-  });
-});
-
-test('both sources parse an entry identically', () => {
-  // The two modes must not disagree about who is allowed, so they share the
-  // parser. The string is the same one the admin screen shows for pasting.
-  const raw = ' ts_aaa:8 , ts_bbb:12 ,, ';
-  assert.deepEqual(parseAllowlist(raw), ['ts_aaa:8', 'ts_bbb:12']);
-  assert.deepEqual(parseAllowlist(''), []);
-  assert.deepEqual(parseAllowlist(null), []);
-  assert.deepEqual(parseAllowlist('a,,b'), ['a', 'b'], 'no empty entry survives');
-});
-
-test('gateway mode denies everyone until a fetch has succeeded', async () => {
-  await withEnv({
-    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-    VOICE_ALLOWLIST_URL: 'http://127.0.0.1:1', VOICE_ALLOWLIST_KEY: 'k',
-    VOICE_ALLOWLIST_TIMEOUT_MS: '300',
-  }, async () => {
-    resetAllowlistCache();
-    // A gate that fails open on startup is not a gate.
-    assert.deepEqual(currentAllowlist(), [], 'no snapshot means deny');
-    await ensureAllowlistFresh();
-    assert.deepEqual(currentAllowlist(), [], 'and a failed first fetch still denies');
-    assert.equal(await voiceAvailableForAsync(reqWith('op-1')), false);
-  });
-  resetAllowlistCache();
-});
-
-test('gateway mode reads the live allowlist, and a revoke takes effect', async () => {
-  // The whole point. A revoke at the gateway propagates without anyone pasting
-  // anything into Railway.
-  let current = 'ts_aaa:8,ts_aaa:9';
-  let hits = 0;
-
-  const app = express();
-  app.get('/admin/ti-users/voice-access/allowlist', (req, res) => {
-    hits++;
-    if (req.headers.authorization !== 'Bearer test-key') { res.status(403).json({}); return; }
-    res.json({ voice_test_users: current, granted_count: current.split(',').filter(Boolean).length });
-  });
-  const { base, close } = await listen(app);
-
-  try {
-    await withEnv({
-      VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-      VOICE_ALLOWLIST_URL: base, VOICE_ALLOWLIST_KEY: 'test-key',
-      VOICE_ALLOWLIST_TTL_MS: '1',
-    }, async () => {
-      resetAllowlistCache();
-
-      await ensureAllowlistFresh();
-      assert.deepEqual(currentAllowlist(), ['ts_aaa:8', 'ts_aaa:9']);
-      assert.equal(await voiceAvailableForAsync(reqWith('8', 'ts_aaa')), true);
-      assert.equal(await voiceAvailableForAsync(reqWith('9', 'ts_aaa')), true);
-
-      // The operator revokes user 9 in the admin screen. Nothing is pasted
-      // anywhere and nothing is redeployed.
-      current = 'ts_aaa:8';
-      await new Promise(r => setTimeout(r, 5));   // let the 1ms TTL lapse
-
-      assert.equal(await voiceAvailableForAsync(reqWith('9', 'ts_aaa')), false,
-        'the revoke is live -- this is the drift the fix removes');
-      assert.equal(await voiceAvailableForAsync(reqWith('8', 'ts_aaa')), true,
-        'and the still-granted user is unaffected');
-    });
-  } finally {
-    await close();
-    resetAllowlistCache();
-  }
-  assert.ok(hits > 0, 'the gateway was actually consulted');
-});
-
-test('a burst of requests produces one gateway call, not one per request', async () => {
-  let hits = 0;
-  const app = express();
-  app.get('/admin/ti-users/voice-access/allowlist', (req, res) => {
-    hits++;
-    setTimeout(() => res.json({ voice_test_users: 'ts_aaa:8' }), 20);
-  });
-  const { base, close } = await listen(app);
-
-  try {
-    await withEnv({
-      VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-      VOICE_ALLOWLIST_URL: base, VOICE_ALLOWLIST_KEY: 'k',
-      VOICE_ALLOWLIST_TTL_MS: '60000',
-    }, async () => {
-      resetAllowlistCache();
-      // Ten concurrent voice requests arriving on a cold cache must share one
-      // fetch, or a busy moment becomes a stampede against the gateway.
-      await Promise.all(Array.from({ length: 10 }, () => voiceAvailableForAsync(reqWith('8', 'ts_aaa'))));
-      assert.equal(hits, 1, `concurrent refreshes are shared (got ${hits} calls)`);
-    });
-  } finally {
-    await close();
-    resetAllowlistCache();
-  }
-});
-
-test('a gateway outage serves the last good answer, but only for a bounded time', async () => {
-  let up = true;
-  const app = express();
-  app.get('/admin/ti-users/voice-access/allowlist', (req, res) => {
-    if (!up) { res.status(503).json({}); return; }
-    res.json({ voice_test_users: 'ts_aaa:8' });
-  });
-  const { base, close } = await listen(app);
-
-  try {
-    await withEnv({
-      VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-      VOICE_ALLOWLIST_URL: base, VOICE_ALLOWLIST_KEY: 'k',
-      VOICE_ALLOWLIST_TTL_MS: '1', VOICE_ALLOWLIST_MAX_STALE_MS: '120',
-    }, async () => {
-      resetAllowlistCache();
-      await ensureAllowlistFresh();
-      assert.deepEqual(currentAllowlist(), ['ts_aaa:8']);
-
-      up = false;
-      await new Promise(r => setTimeout(r, 5));
-      await ensureAllowlistFresh();
-      // A brief blip must not cut voice off mid-sentence.
-      assert.deepEqual(currentAllowlist(), ['ts_aaa:8'], 'the last good answer survives an outage');
-      assert.equal(allowlistState().last_error !== null, true, 'and the failure is recorded');
-
-      // But staleness is CAPPED. Unbounded "last known good" would reinvent the
-      // very drift this module removes, only invisibly.
-      await new Promise(r => setTimeout(r, 150));
-      assert.deepEqual(currentAllowlist(), [],
-        'past the stale cap it denies everyone rather than trusting an old answer');
-      assert.equal(allowlistState().stale, true);
-    });
-  } finally {
-    await close();
-    resetAllowlistCache();
-  }
-});
-
-test('a malformed gateway response is an error, not an empty allowlist', async () => {
-  const app = express();
-  app.get('/admin/ti-users/voice-access/allowlist', (req, res) => res.json({ granted_count: 0 }));
-  const { base, close } = await listen(app);
-
-  try {
-    await withEnv({
-      VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-      VOICE_ALLOWLIST_URL: base, VOICE_ALLOWLIST_KEY: 'k',
-    }, async () => {
-      resetAllowlistCache();
-      await ensureAllowlistFresh();
-      // A missing field is a contract change. Reading it as "nobody is granted"
-      // would silently revoke everyone; treating it as an error keeps the last
-      // good snapshot until the stale cap, which is the safer failure.
-      assert.equal(allowlistState().last_error !== null, true,
-        'a response with no voice_test_users string is rejected');
-      assert.deepEqual(currentAllowlist(), [], 'and with no prior snapshot, denies');
-    });
-  } finally {
-    await close();
-    resetAllowlistCache();
-  }
-});
-
-test('the kill switch never waits on the gateway', async () => {
-  // VOICE_ENABLED must work when the gateway is unreachable, compromised, or
-  // serving nonsense. An emergency stop that depends on a network call to the
-  // system it might be stopping is not an emergency stop.
-  await withEnv({
-    VOICE_ENABLED: undefined, VOICE_ALLOWLIST_SOURCE: 'gateway',
-    VOICE_ALLOWLIST_URL: 'http://127.0.0.1:1', VOICE_ALLOWLIST_KEY: 'k',
-    VOICE_ALLOWLIST_TIMEOUT_MS: '5000',
-  }, async () => {
-    resetAllowlistCache();
-    const t0 = Date.now();
-    assert.equal(await voiceAvailableForAsync(reqWith('op-1')), false);
-    assert.ok(Date.now() - t0 < 200,
-      'the master switch short-circuits before any network call');
-  });
-  resetAllowlistCache();
-});
-
-test('health names the drift risk in env mode and the staleness in gateway mode', () => {
-  withEnv({ VOICE_ALLOWLIST_SOURCE: undefined, VOICE_TEST_USERS: 'a,b' }, () => {
-    const s = allowlistState();
-    assert.equal(s.source, 'env');
-    assert.equal(s.count, 2);
-    // The drift is surfaced by the system, not only by documentation, so an
-    // operator can see from health alone that a revoke needs a manual paste.
-    assert.ok(/revoke/i.test(s.drift_risk), 'env mode states the revoke risk');
-    assert.ok(/VOICE_TEST_USERS/.test(s.drift_risk));
-  });
-
-  withEnv({ VOICE_ALLOWLIST_SOURCE: 'gateway' }, () => {
-    resetAllowlistCache();
-    const s = allowlistState();
-    assert.equal(s.source, 'gateway');
-    assert.equal(s.drift_risk, null, 'gateway mode has no drift to warn about');
-    assert.equal(s.fetched, false);
-    assert.ok('max_stale_seconds' in s);
-  });
-  resetAllowlistCache();
-});
-
-test('the allowlist entries never reach the logs or /voice/health', () => {
-  const src = readFileSync(join(VOICE_DIR, 'voice-allowlist.js'), 'utf8');
-  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  // Counts and errors, never identities.
-  assert.ok(!/console\.\w+\([^)]*cache\.entries/.test(code),
-    'the cached entries are never logged');
-  assert.ok(!/entries:\s*cache\.entries/.test(code.slice(code.indexOf('allowlistState'))),
-    'and are not returned by the diagnostics');
-});
-
-// ===========================================================================
-// v12.49.0 -- configuration faults must not be silent
-// ===========================================================================
-
-test('gateway mode without a URL denies everyone, and says so', () => {
-  // THE REPORTED FAILURE. VOICE_ENABLED=true, VOICE_ALLOWLIST_SOURCE=gateway,
-  // VOICE_TEST_USERS=ava:38, no VOICE_ALLOWLIST_URL. Every user denied, no mic
-  // button, no error -- indistinguishable from voice being switched off, with
-  // VOICE_TEST_USERS sitting in the variable list looking operative.
-  withEnv({
-    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-    VOICE_TEST_USERS: 'ava:38',
-    VOICE_ALLOWLIST_URL: undefined, VOICE_ALLOWLIST_KEY: undefined,
-    GATEWAY_ADMIN_KEY: undefined,
-  }, () => {
-    resetAllowlistCache();
-    assert.deepEqual(currentAllowlist(), [], 'nobody is allowed');
-
-    const problems = allowlistConfigProblems();
-    assert.ok(problems.length >= 2, 'the faults are detected');
-    assert.ok(problems.some(p => /VOICE_ALLOWLIST_URL is not set/.test(p)),
-      'the missing URL is named');
-    assert.ok(problems.some(p => /GATEWAY_ADMIN_KEY/.test(p)),
-      'as is the missing key');
-
-    // The most confusing part of the report: a variable that is set and ignored.
-    assert.ok(problems.some(p => /VOICE_TEST_USERS is set but IGNORED/.test(p)),
-      'and the fact that VOICE_TEST_USERS is ignored in this mode is stated');
-
-    // Each message must name what to change, not merely what is wrong.
-    for (const p of problems) {
-      assert.ok(/VOICE_[A-Z_]+|GATEWAY_ADMIN_KEY/.test(p),
-        'every message names a variable: ' + p.slice(0, 50));
-    }
-  });
-  resetAllowlistCache();
-});
-
-test('an empty env allowlist is reported too', () => {
-  withEnv({
-    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'env', VOICE_TEST_USERS: undefined,
-  }, () => {
-    const problems = allowlistConfigProblems();
-    assert.ok(problems.some(p => /VOICE_TEST_USERS is empty/.test(p)));
-    // Points at the tool that generates the correct value, rather than leaving
-    // the operator to work out the entry format.
-    assert.ok(problems.some(p => /Voice Access admin screen/.test(p)),
-      'and names where the correct value comes from');
-  });
-});
-
-test('a coherent configuration reports no faults', () => {
-  withEnv({
-    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'env', VOICE_TEST_USERS: 'ts_aaa:38',
-  }, () => {
-    assert.deepEqual(allowlistConfigProblems(), [], 'env mode with entries is clean');
-  });
-  withEnv({
-    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-    VOICE_ALLOWLIST_URL: 'https://gw.test', VOICE_ALLOWLIST_KEY: 'k',
-    VOICE_TEST_USERS: undefined,
-  }, () => {
-    assert.deepEqual(allowlistConfigProblems(), [], 'gateway mode with url and key is clean');
-  });
-});
-
-test('health reports the faults to a denied caller, but only when enabled', async () => {
-  // The operator who needs this message is the person being denied. Withholding
-  // it means the only way to see a misconfiguration is to already be past it.
-  await withEnv({
-    VOICE_ENABLED: 'true', VOICE_ALLOWLIST_SOURCE: 'gateway',
-    VOICE_TEST_USERS: 'ava:38', VOICE_ALLOWLIST_URL: undefined,
-  }, async () => {
-    resetAllowlistCache();
-    const { base, close } = await listen(makeApp());
-    try {
-      const body = await (await fetch(`${base}/voice/health`, { headers: asUser('ava:38') })).json();
-      assert.equal(body.enabled, false, 'this caller cannot use voice');
-      assert.ok(Array.isArray(body.configuration_problems),
-        'and health tells them why the deployment is broken');
-      assert.ok(body.configuration_problems.some(p => /VOICE_ALLOWLIST_URL/.test(p)));
-    } finally { await close(); }
-  });
-  resetAllowlistCache();
-
-  // Master switch off: say nothing. The routes must stay indistinguishable from
-  // routes that do not exist.
-  await withEnv({
-    VOICE_ENABLED: undefined, VOICE_ALLOWLIST_SOURCE: 'gateway',
-    VOICE_ALLOWLIST_URL: undefined,
-  }, async () => {
-    const { base, close } = await listen(makeApp());
-    try {
-      const body = await (await fetch(`${base}/voice/health`)).json();
-      assert.equal(body.configuration_problems, undefined,
-        'a disabled deployment leaks no configuration detail');
-    } finally { await close(); }
   });
 });
 

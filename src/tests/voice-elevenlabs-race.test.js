@@ -58,7 +58,6 @@ await new Promise((r) => elServer.listen(0, '127.0.0.1', r));
 
 Object.assign(process.env, {
   VOICE_ENABLED: 'true',
-  VOICE_TEST_USERS: TEST_USER,
   MCP_API_KEY: TEST_KEY,
   VOICE_KOKORO_PYTHON: WRAPPER,
   VOICE_TTS_WORKER_ENABLED: 'false',
@@ -123,7 +122,7 @@ for (const s of SCENARIOS) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json', 'X-Railway-Restore-Token': TEST_KEY,
-        Authorization: `Bearer ${TEST_KEY}`, 'X-Tenax-User-Id': TEST_USER,
+        Authorization: `Bearer ${TEST_KEY}`, 'X-Tenax-User-Id': TEST_USER, 'X-Tenax-Voice-Entitlement': 'entitled',
       },
       body: JSON.stringify({ text: REPLY, voice: 'af_heart',
                              elevenlabs: { api_key: 'sk_race_000000000000', voice_id: 'RaceVoice1' } }),

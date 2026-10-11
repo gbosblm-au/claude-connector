@@ -1275,7 +1275,11 @@ export async function synthesizePcm(opts) {
   // strip above it cannot fire for any text the token classes describe; it is
   // the backstop for a future change to stripMarkers or to the preparation
   // order, and refuses by name rather than letting a tag be read aloud.
-  assertTagless(text, 'kokoro request');
+  // v13.37.0: this line called assertTagless, which v13.36.0's engine-form
+  // rewrite removed and replaced with guardRequest; the call was left behind
+  // and threw ReferenceError on every Kokoro synthesis. The same backstop, on
+  // the PREPARED text, through the function that replaced it.
+  guardRequest(text, { builder: 'kokoro', where: 'kokoro prepared request' });
 
   // Checked here as well as at the route. This function is the last thing
   // before a GPL process runs against a voice model, and compliance obligation
