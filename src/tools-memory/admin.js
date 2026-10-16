@@ -13,7 +13,9 @@ export function adminDumpHandler(_req, res) {
       "SELECT * FROM memories WHERE (ttl IS NULL OR ttl > ?) ORDER BY category, key",
     )
     .all(now);
-  const entries = rows.map((r) => rowToEntry(r, { includeValue: true }));
+  // A backup carries the stored bytes; redaction applies on the injection
+  // paths (rowToEntry's default), not to an export that may be re-imported.
+  const entries = rows.map((r) => rowToEntry(r, { includeValue: true, redact: false }));
   res.setHeader(
     "Content-Disposition",
     `attachment; filename="memory_dump_${now.replace(/[:.]/g, "-")}.json"`,

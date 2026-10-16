@@ -26,6 +26,7 @@ import {
   handleWpMemoryDelete,
   handleWpMemoryList,
   handleWpMemoryGetSessionContext,
+  handleWpMemoryRecheckDue,
   getWpMemoryHealthSnapshot,
 } from './wp-memory.js';
 
@@ -36,6 +37,7 @@ export {
   memoryDeleteToolDefinition,
   memoryListToolDefinition,
   memoryGetSessionContextToolDefinition,
+  memoryRecheckDueToolDefinition,
   ALL_MEMORY_TOOL_DEFINITIONS,
 } from './definitions.js';
 
@@ -85,6 +87,7 @@ export async function initMemorySubsystem({
         delete:         (await import('./memory-delete.js')).handleMemoryDelete,
         list:           (await import('./memory-list.js')).handleMemoryList,
         sessionContext: (await import('./memory-get-session-context.js')).handleMemoryGetSessionContext,
+        recheckDue:     (await import('./memory-recheck-due.js')).handleMemoryRecheckDue,
       }));
 
       _sqliteHandlers = handlers;
@@ -159,6 +162,7 @@ async function dispatchToWp(name, args) {
     case 'memory_delete':              return handleWpMemoryDelete(args);
     case 'memory_list':                return handleWpMemoryList(args);
     case 'memory_get_session_context': return handleWpMemoryGetSessionContext(args);
+    case 'memory_recheck_due':         return handleWpMemoryRecheckDue(args);
     default: throw new Error(`Unknown memory tool: ${name}`);
   }
 }
@@ -172,6 +176,7 @@ async function dispatchToSqlite(name, args) {
     case 'memory_delete':              return h.delete(args);
     case 'memory_list':                return h.list(args);
     case 'memory_get_session_context': return h.sessionContext(args);
+    case 'memory_recheck_due':         return h.recheckDue(args);
     default: throw new Error(`Unknown memory tool: ${name}`);
   }
 }
@@ -186,6 +191,8 @@ export const MEMORY_TOOL_NAMES = new Set([
   'memory_delete',
   'memory_list',
   'memory_get_session_context',
+  // v13.39.0 (TENAX-2026-10-15-01 H-10).
+  'memory_recheck_due',
 ]);
 
 /**

@@ -61,6 +61,8 @@ import { existsSync }         from 'node:fs';
 import { spawn }              from 'node:child_process';
 import { join, dirname }      from 'node:path';
 import { createStdioWorker }  from './stdio-worker.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from '../utils/processGuard.js';
 
 const WORKER_SCRIPT = new URL('./kokoro_worker.py', import.meta.url).pathname;
 
@@ -432,6 +434,7 @@ export function synthesizeOnce(opts) {
     const timeoutMs = intEnv('VOICE_TTS_ONESHOT_TIMEOUT_MS', 120_000, 1000, 600_000);
     let child;
     try {
+      assertLaunchAllowed('voice.kokoro_worker', interpreter, [WORKER_SCRIPT, '--once', ...workerArgs()]);
       child = spawn(interpreter, [WORKER_SCRIPT, '--once', ...workerArgs()], {
         cwd: existsSync(kokoroDir()) ? kokoroDir() : undefined,
         env: childEnv(),

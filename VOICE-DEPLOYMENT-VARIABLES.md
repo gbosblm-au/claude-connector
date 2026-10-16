@@ -1,7 +1,8 @@
 # Voice deployment — Railway variables
 
-For **claude-connector v13.2.0**, **ts-gateway-service v2.111.0**,
-**ts-client-gateway v5.139.0**.
+For **claude-connector v13.37.0**, **ts-gateway-service v2.251.0**,
+**ts-client-gateway v5.233.0**. (Per-user access section revised for
+TENAX-VOICE-2026-10-07-02; the rest dates from v13.2.0.)
 
 Derived from the code, not from memory: every `process.env` read on the voice
 path was enumerated and cross-referenced against what the image already sets.
@@ -52,35 +53,39 @@ No trailing slash.
 
 ---
 
-## Connector — required only if you want speech-to-text
+## Connector — who may use voice (v13.37.0)
 
-### `VOICE_ALLOWLIST_SOURCE` and friends
+There is no per-user variable any more. TENAX-VOICE-2026-10-07-02 retired the
+allowlist: voice is available to every account except students without an
+override, and that is decided **on the gateway**, per request, from the
+account row (`lib/voice-entitlement.js`).
 
-Voice is gated per user as well as globally. Two modes:
+The gateway sends `X-Tenax-Voice-Entitlement: entitled` alongside the identity
+headers when its predicate allows the caller. The connector **renders** from
+that header (the mic and Speak buttons in `/voice/health`) and **never
+enforces** with it: the gateway refuses a non-entitled caller before any
+request reaches the connector, at the voice routes and at the stream proxy.
 
-**Environment mode (default, simplest):**
+What the connector still checks on every voice request: `VOICE_ENABLED`, the
+transport credential, and that an identity (`X-Tenax-User-Id`) was sent.
+
+**Delete these seven variables from the connector service.** Nothing reads
+them; a test fails if any connector code does:
 
 ```
-VOICE_ALLOWLIST_SOURCE=env          # or leave unset
-VOICE_TEST_USERS=<user-id>,<user-id>
+VOICE_TEST_USERS
+VOICE_ALLOWLIST_SOURCE
+VOICE_ALLOWLIST_URL
+VOICE_ALLOWLIST_KEY
+VOICE_ALLOWLIST_TTL_MS
+VOICE_ALLOWLIST_MAX_STALE_MS
+VOICE_ALLOWLIST_TIMEOUT_MS
 ```
 
-**Gateway mode (the allowlist is managed centrally):**
-
-```
-VOICE_ALLOWLIST_SOURCE=gateway
-VOICE_ALLOWLIST_URL=https://<your-gateway>.up.railway.app
-VOICE_ALLOWLIST_KEY=<same value as GATEWAY_ADMIN_KEY>
-```
-
-**The failure mode worth knowing:** setting
-`VOICE_ALLOWLIST_SOURCE=gateway` without `VOICE_ALLOWLIST_URL` means the
-allowlist cannot be fetched, `VOICE_TEST_USERS` is ignored, and **every user is
-denied**. That is correct fail-closed behaviour and it is indistinguishable from
-voice simply being off. The connector names this specific fault in
-`/voice/health` under `configuration_problems` — it is one of the few messages
-deliberately shown to a *denied* caller, because the operator who needs it is by
-definition the person being denied.
+Order matters: deploy the gateway (v2.251.0 or later, with its migration)
+before this connector. A connector of this version behind an older gateway
+renders no voice surface for anyone, because the older gateway does not send
+the entitlement header.
 
 ---
 

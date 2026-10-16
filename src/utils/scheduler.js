@@ -22,6 +22,43 @@ import { detectSequenceEngagement, appendTrackingEvent } from "./tracking.js";
 const TZ = "Australia/Melbourne";
 
 // -----------------------------------------------------------------------
+// v13.39.0 (TENAX-2026-10-15-01 H-5): the unattended default, stated.
+//
+// A scheduled send runs with nobody there to answer, and an email cannot be
+// recalled. So this path FAILS CLOSED wherever the human intent behind the
+// schedule may no longer hold:
+//
+//   LATE   A send whose send_at has passed by more than the late grace (the
+//          connector was down, the volume was restored, the tick stalled) is
+//          not sent late. It is HELD (status held_overdue) for a person to
+//          release (email_schedule_release) or cancel. Before this release the
+//          boot catch-up sent every overdue email the moment the process came
+//          back, however old.
+//   TWICE  Overlapping ticks cannot dispatch the same pending send twice: a
+//          tick that finds one already running does nothing.
+//   NEVER  A hold nobody answers within the hold expiry TIMES OUT and the send
+//          is denied (status expired_unconfirmed). A timeout is not a refusal:
+//          it is not counted with cancellations, and asking again (a new
+//          email_schedule) is never penalised.
+//
+// Both windows are operator settings with stated defaults:
+//   SCHEDULE_LATE_GRACE_MINUTES   default 60, 1..10080
+//   SCHEDULE_HOLD_EXPIRY_DAYS     default 7, 1..90
+// -----------------------------------------------------------------------
+function boundedEnvInt(name, fallback, min, max) {
+  const n = Number.parseInt(String(process.env[name] ?? ""), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+export function lateGraceMs() { return boundedEnvInt("SCHEDULE_LATE_GRACE_MINUTES", 60, 1, 10080) * 60000; }
+export function holdExpiryMs() { return boundedEnvInt("SCHEDULE_HOLD_EXPIRY_DAYS", 7, 1, 90) * 86400000; }
+
+/** Statuses a person decided (refusals). A timeout is deliberately not one. */
+export const REFUSAL_STATUSES = Object.freeze(["cancelled"]);
+
+let _tickInFlight = false;
+
+// -----------------------------------------------------------------------
 // Persistence
 // -----------------------------------------------------------------------
 let store = { schedules: [], sequences: [], _counter: 0 };
@@ -250,6 +287,11 @@ export function cancelSchedule({ schedule_id, sequence_id }) {
     if (rec.status === "sent" || rec.status === "failed") {
       return { error: `Cannot cancel a schedule with status "${rec.status}".`, code: "INVALID_STATE", was_pending: false };
     }
+    // v13.39.0 (H-5): an expired hold already denied the send by timeout.
+    // Cancelling it would rewrite a timeout as a refusal, so it stays expired.
+    if (rec.status === "expired_unconfirmed") {
+      return { error: "This send already expired unconfirmed and was not sent; there is nothing to cancel.", code: "INVALID_STATE", was_pending: false };
+    }
     const wasPending = rec.status === "pending";
     rec.status = "cancelled";
     rec.cancelled_at = now;
@@ -262,7 +304,9 @@ export function cancelSchedule({ schedule_id, sequence_id }) {
     if (!seq) return { error: `Unknown sequence_id "${sequence_id}".`, code: "NOT_FOUND" };
     let cancelledCount = 0;
     for (const sched of store.schedules) {
-      if (sched.sequence_id === sequence_id && sched.status === "pending") {
+      // v13.39.0 (H-5): a held step belongs to the sequence too; cancelling the
+      // sequence cancels it rather than leaving it to time out.
+      if (sched.sequence_id === sequence_id && (sched.status === "pending" || sched.status === "held_overdue")) {
         sched.status = "cancelled";
         sched.cancelled_at = now;
         cancelledCount += 1;
@@ -286,7 +330,7 @@ export function listSchedules({ status = "pending", since_days = 7, company } = 
     if (status !== "all" && s.status !== status) continue;
     if (company && s.company.toLowerCase() !== company.toLowerCase()) continue;
     if (cutoffMs > 0 && s.status !== "pending") {
-      const ts = Date.parse(s.sent_at || s.cancelled_at || s.created_at);
+      const ts = Date.parse(s.sent_at || s.cancelled_at || s.expired_at || s.held_at || s.created_at);
       if (!isNaN(ts) && ts < cutoffMs) continue;
     }
     out.push({
@@ -302,6 +346,10 @@ export function listSchedules({ status = "pending", since_days = 7, company } = 
       send_at: s.send_at,
       sent_at: s.sent_at,
       cancelled_at: s.cancelled_at,
+      // v13.39.0 (H-5): held and expired sends say when and why.
+      held_at: s.held_at || null,
+      held_reason: s.held_reason || null,
+      expired_at: s.expired_at || null,
       schedule_type: s.schedule_type,
       tracking_id: s.tracking_id,
       error_code: s.error_code,
@@ -327,18 +375,72 @@ async function maybeSkipDueToEngagement(sched) {
   return await detectSequenceEngagement(trackingIds);
 }
 
-async function checkAndFireDueSchedules() {
-  if (!config.scheduleEnabled) return;
-  const nowMs = Date.now();
+export async function checkAndFireDueSchedules({ send = sendEmailInternal, nowMs = Date.now() } = {}) {
+  if (!config.scheduleEnabled) return { ran: false, reason: "disabled" };
+  // H-5 TWICE: one tick at a time. An overlapping tick does nothing.
+  if (_tickInFlight) {
+    log("warn", "Scheduler tick skipped: the previous tick is still dispatching");
+    return { ran: false, reason: "tick_in_flight" };
+  }
+  _tickInFlight = true;
+  try {
+    return await fireDue({ send, nowMs });
+  } finally {
+    _tickInFlight = false;
+  }
+}
+
+async function fireDue({ send, nowMs }) {
+  const nowIsoTz = DateTime.fromMillis(nowMs).setZone(TZ).toISO({ suppressMilliseconds: true });
+  let changed = false;
+
+  // H-5 NEVER: a hold nobody released within the expiry times out. The send
+  // is denied; the record says expired, not cancelled.
+  for (const s of store.schedules) {
+    if (s.status !== "held_overdue") continue;
+    const heldMs = Date.parse(s.held_at || "");
+    if (Number.isFinite(heldMs) && nowMs - heldMs >= holdExpiryMs()) {
+      s.status = "expired_unconfirmed";
+      s.expired_at = nowIsoTz;
+      changed = true;
+      log("warn", `Schedule ${s.schedule_id} hold expired unconfirmed after ${Math.round((nowMs - heldMs) / 86400000)}d; not sent (a timeout, not a refusal)`);
+    }
+  }
+
   const due = store.schedules.filter(
     (s) => s.status === "pending" && Date.parse(s.send_at) <= nowMs
   );
-  if (due.length === 0) return;
+  if (due.length === 0) {
+    if (changed) saveStore();
+    return { ran: true, sent: 0, held: 0, expired: changed };
+  }
 
   // Process oldest first (preserve drip ordering)
   due.sort((a, b) => Date.parse(a.send_at) - Date.parse(b.send_at));
 
+  let sentCount = 0;
+  let heldCount = 0;
   for (const sched of due) {
+    // H-5: the due list was taken before the first await, and a person can
+    // cancel while an earlier send in this tick is in flight. Re-check, so a
+    // cancelled send is never dispatched.
+    if (sched.status !== "pending") continue;
+    // H-5 LATE: past the grace, the send is held for a person, never sent late.
+    const lateMs = nowMs - Date.parse(sched.send_at);
+    if (lateMs > lateGraceMs()) {
+      sched.status = "held_overdue";
+      sched.held_at = nowIsoTz;
+      sched.held_reason = `send_at passed ${Math.round(lateMs / 60000)} minutes ago, beyond the ${Math.round(lateGraceMs() / 60000)}-minute late grace. `
+        + "Sending this late with nobody present could surprise the recipient; release it with email_schedule_release or cancel it.";
+      heldCount += 1;
+      log("warn", `Schedule ${sched.schedule_id} HELD: ${sched.held_reason}`);
+      if (sched.sequence_id) {
+        const seq = store.sequences.find((q) => q.sequence_id === sched.sequence_id);
+        const stepRef = seq && seq.steps.find((st) => st.schedule_id === sched.schedule_id);
+        if (stepRef) stepRef.status = "held_overdue";
+      }
+      continue;
+    }
     try {
       // Drip engagement gate
       if (await maybeSkipDueToEngagement(sched)) {
@@ -369,7 +471,7 @@ async function checkAndFireDueSchedules() {
         continue;
       }
 
-      const result = await sendEmailInternal({
+      const result = await send({
         to_address: sched.to_address,
         to_name: sched.to_name,
         subject: sched.subject,
@@ -381,6 +483,7 @@ async function checkAndFireDueSchedules() {
       });
 
       if (result.status === "sent") {
+        sentCount += 1;
         sched.status = "sent";
         sched.sent_at = result.timestamp;
         sched.tracking_id = result.tracking_id;
@@ -405,6 +508,65 @@ async function checkAndFireDueSchedules() {
   }
 
   saveStore();
+  return { ran: true, sent: sentCount, held: heldCount, expired: changed };
+}
+
+// -----------------------------------------------------------------------
+// v13.39.0 (H-5): a person releases a held send, or reads the outcomes.
+// -----------------------------------------------------------------------
+
+/**
+ * Release a held send: it becomes pending, due now, and the next tick sends it.
+ *
+ * @param {{ schedule_id: string, released_by?: string }} input
+ * @returns {object}
+ */
+export function releaseHeldSchedule({ schedule_id, released_by = "operator" } = {}) {
+  const rec = store.schedules.find((s) => s.schedule_id === schedule_id);
+  if (!rec) return { error: `Unknown schedule_id "${schedule_id}".`, code: "NOT_FOUND" };
+  if (rec.status !== "held_overdue") {
+    return {
+      error: rec.status === "expired_unconfirmed"
+        ? "This hold has expired and the send was denied. Schedule it again with email_schedule if it is still wanted."
+        : `Only a held send can be released; this one is "${rec.status}".`,
+      code: "INVALID_STATE",
+    };
+  }
+  const now = DateTime.now().setZone(TZ).toISO({ suppressMilliseconds: true });
+  rec.status = "pending";
+  rec.released_at = now;
+  rec.released_by = String(released_by || "operator").slice(0, 60);
+  rec.original_send_at = rec.original_send_at || rec.send_at;
+  rec.send_at = now;
+  if (rec.sequence_id) {
+    const seq = store.sequences.find((q) => q.sequence_id === rec.sequence_id);
+    const stepRef = seq && seq.steps.find((st) => st.schedule_id === rec.schedule_id);
+    if (stepRef) stepRef.status = "pending";
+  }
+  saveStore();
+  return { schedule_id, status: "pending", send_at: now, released_at: now };
+}
+
+/**
+ * Counts by outcome. `refusals` counts what a person declined; a timed-out
+ * hold is reported as expired and never folded into refusals.
+ *
+ * @returns {{ by_status: Record<string, number>, refusals: number, expired: number }}
+ */
+export function scheduleOutcomes() {
+  const by = {};
+  for (const s of store.schedules) by[s.status] = (by[s.status] || 0) + 1;
+  return {
+    by_status: by,
+    refusals: REFUSAL_STATUSES.reduce((n, st) => n + (by[st] || 0), 0),
+    expired: by.expired_unconfirmed || 0,
+  };
+}
+
+/** Test support only: replace the in-memory store. */
+export function _setStoreForTests(next) {
+  store = { schedules: [], sequences: [], _counter: 0, ...(next || {}) };
+  _tickInFlight = false;
 }
 
 // -----------------------------------------------------------------------

@@ -106,6 +106,8 @@ import { resolveContained, isSafeFilename } from '../utils/pathContainment.js';
 import { guardToolCall } from './tool-call-guard.js';
 import './render-schemas.js';
 import { buildScriptEnv } from '../utils/scriptEnv.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from '../utils/processGuard.js';
 import { buildDownloadLinks, snapshotDownloads, downloadsBase } from '../utils/downloadLinks.js';
 
 // ---------------------------------------------------------------------------
@@ -868,6 +870,7 @@ export function runRenderer( opts ) {
   for ( let i = 0; i < forms.length; i += 1 ) {
     const argv = renderArgv( forms[ i ], values );
 
+    assertLaunchAllowed( 'render_tools.run', bin, [ scriptPath, ...argv ] );
     const result = spawnSync( bin, [ scriptPath, ...argv ], {
       cwd: scriptsBase(),
       timeout,

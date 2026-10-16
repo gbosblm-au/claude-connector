@@ -1,0 +1,87 @@
+{
+  "version": "13.39.0",
+  "previous": "13.38.0",
+  "work_orders": [
+    "TENAX-2026-10-15-01 'Hermes adoption' rev 2 with Addendum 1 (Ava, at Brian's direction, 15 October 2026): connector half of H-2, H-3, H-4, H-5, H-6, H-7, H-8, H-10, H-11. Delivery record: TENAX-2026-10-15-01-DELIVERY-RECORD.md (combined delivery). Operator runbook: Gateway Service RUNBOOK-TENAX-2026-10-15-01.md."
+  ],
+  "companion_release": "Gateway Service 2.262.0 (deploy first) and ts-client-gateway 5.235.0",
+  "changed_files": [
+    "src/utils/storeWriteDiscipline.js (new, H-2)",
+    "src/utils/derivedIndexes.js (new, H-2)",
+    "src/tools/hermes-admin-tools.js (new: store_discipline, module_ledger)",
+    "src/utils/moduleLedger.js (new, H-3)",
+    "src/utils/processGuard.js (new, H-4)",
+    "src/guards/proc_guard_boot.py (new, H-4)",
+    "src/utils/unattendedPaths.js (new, H-5)",
+    "src/tools-memory/memoryWriteGuard.js (new, H-6; byte-identical to Gateway lib/memory-write-guard.js)",
+    "src/tools-memory/memory-recheck-due.js (new, H-10)",
+    "src/tools/skill-occupancy.js (new, H-7)",
+    "src/tools/selection-telemetry.js (new, H-8)",
+    "src/tools/module-intake.js (new, H-11)",
+    "src/tools/skill-content.js (H-2 guards and restore claim, H-3 ledger, H-11 intake)",
+    "src/tools/skill-modular.js (H-2 restore claim, H-3 ledger, H-7 occupancy, H-8 telemetry; dispatch logic unchanged)",
+    "src/tools/skill.js (H-3 ledger)",
+    "src/routes/volume-snapshot.js (H-2 restore claim, H-4 launch guard)",
+    "src/routes/export.js (H-4 launch guard)",
+    "src/server-http.js (H-4 launch guard; tool registration; occupancy on /ti-skill-compile)",
+    "src/tools/script-execute.js, src/tools/homeworkTools.js, src/tools/nudgeTools.js, src/tools/render-tools.js, src/tools/socraticTools.js, src/tools/brain-scan-trigger.js, src/voice/kokoro-worker-supervisor.js, src/voice/stdio-worker.js, src/voice/voice-engines.js (H-4 launch guard)",
+    "src/utils/scheduler.js, src/tools/emailSchedule.js (H-5)",
+    "src/tools-memory/db.js, memory-write.js, wp-memory.js, rowMapper.js, admin.js, definitions.js, index.js, schemas/index.js, memory-get-session-context.js (H-6, H-10)",
+    "src/tests: compile-occupancy, memory-write-guard, module-intake, module-ledger, process-guard, selection-telemetry, store-write-discipline, unattended-paths (all new); helpers/compile-volume.js, helpers/source-scan.js (new); fixtures/memory-guard-fixture.json, fixtures/compile-occupancy-wire.json (new, shared with the gateway)",
+    "tests/volume-restore-discipline.test.js (new)",
+    "scripts/mutation-verifier.mjs (new: the gateway's verifier, with nodeArgs, credential file excluded from scratch copies)",
+    "scripts/verify-tenax-2026-10-15-mutations.mjs (new, 47 mutations)",
+    ".env.example (SCHEDULE_LATE_GRACE_MINUTES, SCHEDULE_HOLD_EXPIRY_DAYS)",
+    "package.json (13.38.0 to 13.39.0; tenax-2026-10-15:mutations script); package-lock.json left as uploaded at 13.25.0, as in previous releases",
+    "CHANGELOG-v13.39.0.md (new)",
+    "DELIVERY-v13.39.0.json (new)"
+  ],
+  "existing_tests_modified": "none",
+  "untouched_on_purpose": [
+    "data/google-service-account.json (a credential file in the repository; not read, not copied by the mutation verifier)",
+    ":memory: (the SQLite file the existing memory.test.js writes; shipped as the baseline's bytes)"
+  ],
+  "variables": {
+    "added": [
+      "SCHEDULE_LATE_GRACE_MINUTES (default 60)",
+      "SCHEDULE_HOLD_EXPIRY_DAYS (default 7)"
+    ],
+    "required": "none"
+  },
+  "full_suite": {
+    "runner": "per-file: each test file under src/tests, tests, src/tools, src/tools-memory and src/tools-self-model in its own `node --experimental-test-module-mocks --test` process, plus `npm test`; same tool and command on both trees",
+    "before": {
+      "artifact": "13.38.0 as delivered",
+      "files": 63,
+      "tests": 1305,
+      "pass": 1303,
+      "fail": 1,
+      "skipped": 1,
+      "npm_test": "30/30"
+    },
+    "after": {
+      "artifact": "this tree (13.39.0)",
+      "files": 72,
+      "tests": 1414,
+      "pass": 1412,
+      "fail": 1,
+      "skipped": 1,
+      "npm_test": "30/30"
+    },
+    "executed_delta": "+109 in 9 new files: compile-occupancy 9, memory-write-guard 19, module-intake 14, module-ledger 7, process-guard 14, selection-telemetry 7, store-write-discipline 19, unattended-paths 17, volume-restore-discipline 3; all 63 pre-existing files identical (tests/pass/fail/skipped)",
+    "net_new_failures": 0,
+    "carried": "voice-gpl-boundary 'no Piper artifact survives anywhere in the source tree' (present at 13.37.0 and 13.38.0)"
+  },
+  "mutations": {
+    "command": "npm run tenax-2026-10-15:mutations",
+    "applied": 47,
+    "claims": 35,
+    "red": "47/47 named mutations demonstrated red, controls green."
+  },
+  "twin_parity": {
+    "memory_guard_sha256": "5a8e86c37fb39bc6cd013f91dc6e615bba4b3a47f55662038a55c61c5e4bb81d",
+    "memory_fixture_sha256": "570a906dd98b9644af1250fdf0f80794cdc07b1c3207af9e8cc2271b013364ba",
+    "occupancy_wire_sha256": "1b5a25ac95e91de2d6d47772c617904fb1855c3980170c35af2e634cb1e894c9"
+  },
+  "boundary": "See the delivery record, section 4. Questions for Brian (not fixed; frozen dispatch layer): Q-1 handleSkillRecompile drops module_access_level (src/tools/skill-modular.js:1513); Q-2 compileSkill reads moduleMap before its const declaration (lines 801 / 823). The H-11 independence gate is this build's reading, for Ava to confirm."
+}
