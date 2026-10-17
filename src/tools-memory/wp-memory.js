@@ -23,9 +23,12 @@ import {
   memoryDeleteSchema,
   memoryListSchema,
   memorySessionContextSchema,
+  memoryRecheckDueSchema,
   MAX_VALUE_LENGTH,
 } from './schemas/index.js';
 import { ToolError } from './errors.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-6, H-10): the shared write guard.
+import { guardMemoryWrite, redactDeepForInjection } from './memoryWriteGuard.js';
 
 /* =========================================================================
    HTTP helper
@@ -189,6 +192,48 @@ export async function handleWpMemoryWrite(rawArgs) {
     );
   }
 
+  // ── H-6 / H-10: the shared write guard, against the writer's visible scope ──
+  //
+  // The scope is read before the write: /stats for the count the capacity
+  // ceiling applies to, /list?include_value=true for the values the duplicate
+  // guard compares (the store's list is bounded at its most recent 500; in
+  // tenant mode the gateway route re-checks against every row). If the scope
+  // cannot be read the write is refused: a guard that cannot see what it
+  // guards has not checked anything, and storing anyway is the fail-open.
+  let scopeRows;
+  let scopeCount;
+  try {
+    const [stats, listed] = await Promise.all([
+      // Same call shapes as getWpMemoryHealthSnapshot and handleWpMemoryList.
+      wpFetch('/stats'),
+      wpFetch('/list?include_value=true'),
+    ]);
+    // /stats counts every visible row; /list is bounded, so the true count
+    // goes to the guard separately and the ceiling sees it even when the
+    // listing was cut. Consolidation candidates come from the listed rows.
+    scopeCount = (stats.categories || []).reduce((n, r) => n + (parseInt(r.count, 10) || 0), 0);
+    scopeRows = (listed.entries || []).map((e) => ({ category: e.category, key: e.key ?? e.key_name, value: e.value, updated_at: e.updated_at }));
+  } catch (err) {
+    throw new ToolError('MEMORY_GUARD_UNAVAILABLE',
+      `Refused: the memory store's current entries could not be read to check this write (${err.message}). Nothing was stored; try again.`, 503);
+  }
+  const decision = guardMemoryWrite({
+    category: args.category,
+    key: args.key,
+    value: args.value,
+    scopeRows,
+    scopeCount,
+    recheckClass: args.recheck_class ?? null,
+    recheckAfterDays: args.recheck_after_days ?? null,
+  });
+  if (!decision.ok) {
+    const { ok: _ok, code, reason, ...details } = decision;
+    throw new ToolError(code, reason, code === 'MEMORY_DUPLICATE' || code === 'MEMORY_AT_CAPACITY' ? 409 : 400,
+      Object.keys(details).length ? details : null);
+  }
+  let storedValue = typeof args.value === 'string' ? JSON.stringify(decision.text) : decision.text;
+  try { JSON.parse(storedValue); } catch { storedValue = JSON.stringify(decision.text); }
+
   // Calculate TTL ISO string if ttl_days provided.
   let ttl = null;
   if (args.ttl_days != null) {
@@ -198,11 +243,15 @@ export async function handleWpMemoryWrite(rawArgs) {
   const body = {
     category:       args.category,
     key_name:       args.key,
-    value:          serialisedValue,
+    value:          storedValue,
     tags:           JSON.stringify(args.tags || []),
     ttl,
     source_session: args.source_session ?? null,
     confidence:     args.confidence ?? 1.0,
+    // v13.39.0 (H-10): the re-check obligation, decided by the shared guard.
+    recheck_class:      decision.recheck.recheck_class,
+    recheck_at:         decision.recheck.recheck_at,
+    verified_source:    args.verified_source ?? null,
   };
 
   const result = await wpFetch('/upsert', {
@@ -215,6 +264,27 @@ export async function handleWpMemoryWrite(rawArgs) {
     id:         result.id,
     operation:  result.operation,
     updated_at: result.updated_at,
+    redactions: decision.redactions.length ? decision.redactions : undefined,
+    recheck_class: decision.recheck.recheck_class,
+    recheck_at: decision.recheck.recheck_at,
+    recheck_inferred: decision.recheck.recheck_class ? decision.recheck.inferred : undefined,
+  };
+}
+
+/* =========================================================================
+   memory_recheck_due  (v13.39.0, TENAX-2026-10-15-01 H-10)
+   ========================================================================= */
+
+export async function handleWpMemoryRecheckDue(rawArgs) {
+  const parsed = memoryRecheckDueSchema.safeParse(rawArgs || {});
+  if (!parsed.success) {
+    throw new ToolError('VALIDATION_ERROR', 'Invalid input for memory_recheck_due.', 400, parsed.error.flatten());
+  }
+  const result = await wpFetch(`/recheck-due?limit=${parsed.data.limit}`);
+  return {
+    entries: redactDeepForInjection(result.entries || []),
+    count: result.count ?? (result.entries || []).length,
+    note: 'Each entry is due to be re-verified by reading its artefact. Nothing has been removed or demoted.',
   };
 }
 
@@ -246,8 +316,9 @@ export async function handleWpMemoryRead(rawArgs) {
 
   const result = await wpFetch(`/read?${params.toString()}`);
 
+  // v13.39.0 (H-6): redaction before injection, as on the SQLite store.
   return {
-    entries: result.entries || [],
+    entries: redactDeepForInjection(result.entries || []),
     count:   result.count ?? 0,
   };
 }
@@ -273,7 +344,7 @@ export async function handleWpMemorySearch(rawArgs) {
   });
 
   return {
-    entries: result.entries || [],
+    entries: redactDeepForInjection(result.entries || []),
     count:   result.count ?? 0,
     query:   args.query,
   };
@@ -323,7 +394,7 @@ export async function handleWpMemoryList(rawArgs) {
   const result = await wpFetch(`/list?${params.toString()}`);
 
   return {
-    entries:     result.entries || [],
+    entries:     redactDeepForInjection(result.entries || []),
     total:       result.total ?? 0,
     by_category: result.by_category ?? {},
   };
@@ -360,7 +431,7 @@ export async function handleWpMemoryGetSessionContext(rawArgs) {
   // which has not been ported yet) yields a readable empty result instead of
   // an absent key that a caller would have to guard.
   return {
-    context:             result.context,
+    context:             redactDeepForInjection(result.context),
     assembled_at:        result.assembled_at,
     entry_count:         result.entry_count,
     context_hint:        result.context_hint ?? null,
@@ -368,7 +439,11 @@ export async function handleWpMemoryGetSessionContext(rawArgs) {
     conversations_tiers: result.conversations_tiers ?? {
       exact: 0, related: 0, associative: 0, recency: 0,
     },
-    tiered:              Array.isArray( result.tiered ) ? result.tiered : [],
+    tiered:              Array.isArray( result.tiered ) ? redactDeepForInjection( result.tiered ) : [],
+    // v13.39.0 (H-10): the gateway's past-due list. Whitelisted here for the
+    // same reason as `tiered`: a field this function does not copy never
+    // reaches the model. Defaulted so a pre-2.262.0 gateway reads as empty.
+    recheck_due:         Array.isArray( result.recheck_due ) ? redactDeepForInjection( result.recheck_due ) : [],
   };
 }
 

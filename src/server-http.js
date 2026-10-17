@@ -63,6 +63,8 @@ import { resolveContained, isSafeFilename }                        from './utils
 import { createInternalConfigHandler }                             from './utils/internalConfig.js';
 // TNX-FEAT-SIGNEDURLS: per-file HMAC signed download links.
 import { verifySignedRequest, signedLinksEnabled, resolveSigningSecret, linkExpirySeconds } from './utils/signedUrls.js';
+// v13.37.0 -- TENAX-2026-10-09-01 C-CALIBRATION: reaper >= link, enforced.
+import { calibrateDownloadsTtl } from './utils/retentionCalibration.js';
 // v12.28.0 (TNX-H-004 / TNX-H-006): process guards, HTTP timeout tuning,
 // graceful drain and readiness checks. The connector previously had none of
 // these; the gateway had all of them.
@@ -129,6 +131,8 @@ import { authenticateUpgrade } from "./voice/voice-stream-auth.js";
 // execFileSync, which passes an argument array directly to execve and never
 // involves a shell, eliminating the command-injection class outright.
 import { execFileSync } from "child_process";
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from "./utils/processGuard.js";
 import { registerExportRoute } from './routes/export.js';
 // v12.22.0: pre/post deployment volume snapshot and restore endpoints.
 import { registerVolumeSnapshotRoutes } from './routes/volume-snapshot.js';
@@ -273,6 +277,10 @@ import {
 } from "./tools/selfModelQuery.js";
 import { selfModelRecordToolCall } from "./tools-self-model/hook.js";
 import { initSelfModelDb, isSelfModelEnabled } from "./tools-self-model/db.js";
+// v13.40.0 (TENAX-2026-10-17-03 item D): the memory ceiling this process
+// resolved from MEMORY_CAPACITY_PER_SCOPE. The guard file imports nothing, so
+// loading it here has no side effect whether or not memory is enabled.
+import { MEMORY_CAPACITY, MEMORY_CAPACITY_ENV, describeMemoryCapacity } from "./tools-memory/memoryWriteGuard.js";
 
 // Sustained Self Across Sessions (Phase 2)
 import {
@@ -326,9 +334,11 @@ import {
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
   emailScheduleListToolDefinition,
+  emailScheduleReleaseToolDefinition,
   handleEmailSchedule,
   handleEmailScheduleCancel,
   handleEmailScheduleList,
+  handleEmailScheduleRelease,
 } from "./tools/emailSchedule.js";
 
 // v8.0.0 additions
@@ -466,6 +476,20 @@ import {
   getBrainScanPaths,
   setBrainScanLogger,
 } from "./tools/brain-scan-trigger.js";
+// v13.39.0 (TENAX-2026-10-15-01): the operable and readable surfaces for H-2,
+// H-3/H-11 and H-8. store_discipline is a write tool (SYSTEM_WRITE_TOOLS);
+// module_ledger and skill_selection_report are read-only.
+import {
+  storeDisciplineToolDefinition,
+  moduleLedgerToolDefinition,
+  handleStoreDiscipline,
+  handleModuleLedger,
+} from "./tools/hermes-admin-tools.js";
+import {
+  skillSelectionReportToolDefinition,
+  handleSkillSelectionReport,
+} from "./tools/selection-telemetry.js";
+import { loadMergedManifest } from "./tools/manifest-fragments.js";
 import { validateAndConsumeState, storeToken } from "./utils/tokenStore.js";
 import { getLinkedInCredentials } from "./utils/credentialStore.js";
 import { config } from "./config.js";
@@ -524,6 +548,7 @@ import {
   handlePersonalityWrite,
   handleDispatchRuleAdd,
   handleModulesRestoreFromWp,
+  getModularPaths,
 } from "./tools/skill-modular.js";
 import {
   avaMemoryBackupToolDefinition,
@@ -577,6 +602,17 @@ import {
   renderToolsEnabled,
   renderToolsStatus,
 } from "./tools/render-tools.js";
+
+// v13.37.0 -- TENAX-2026-10-09-01 Track A, route A1. A delivered coding tree,
+// fetched from the frame runner with a read-only credential and published from
+// the downloads directory through the existing signed-link path. Reached only
+// through the tool layer: no route is added.
+import {
+  CODING_DELIVERY_TOOL,
+  codingDeliverablePublishToolDefinition,
+  frameDeliveryConfigured,
+  handleCodingDeliverablePublish,
+} from "./tools/coding-delivery.js";
 
 // SPEC-GTW-TOOL-001. Additive, exactly as the render tools were: script_execute
 // and the editor scripts it can reach are unchanged and remain available.
@@ -890,6 +926,7 @@ const TOOLS = [
   emailScheduleToolDefinition,
   emailScheduleCancelToolDefinition,
   emailScheduleListToolDefinition,
+  emailScheduleReleaseToolDefinition,
 
   // ---------- WordPress get content ----------
   wpGetContentToolDefinition,
@@ -1002,6 +1039,10 @@ const TOOLS = [
         scriptReadToolDefinition,
         scriptWriteToolDefinition,
         scriptExecuteToolDefinition,
+        // v13.39.0 (TENAX-2026-10-15-01 H-2, H-3, H-8).
+        storeDisciplineToolDefinition,
+        moduleLedgerToolDefinition,
+        skillSelectionReportToolDefinition,
       ]
     : []),
 
@@ -1026,6 +1067,12 @@ const TOOLS = [
 
   // ---------- Gateway validation tools (SPEC-GTW-TOOL-003) ----------
   ...(SKILL_ENABLED && VALIDATION_TOOLS_ENABLED ? VALIDATION_TOOL_DEFINITIONS : []),
+
+  // ---------- Coding delivery (v13.37.0, TENAX-2026-10-09-01 A1) ----------
+  // Advertised only when the frame runner is configured (TENAX_FRAME_URL and
+  // TENAX_FRAME_READ_TOKEN): without them the tool can only ever answer
+  // frame_not_configured.
+  ...(frameDeliveryConfigured() ? [codingDeliverablePublishToolDefinition] : []),
 
   // ---------- Modular Skill System (v11.0.0) ----------
   // Only advertised when SKILL_MODULAR_ENABLED=true (requires SKILL_FILE_PATH).
@@ -1267,6 +1314,7 @@ async function dispatchToolCallCore(name, args, context = null) {
         case "email_schedule":               return await handleEmailSchedule(args);
         case "email_schedule_cancel":        return await handleEmailScheduleCancel(args);
         case "email_schedule_list":          return await handleEmailScheduleList(args);
+        case "email_schedule_release":       return await handleEmailScheduleRelease(args);
 
         // ---------- Google Calendar (v8.0.0) ----------
         case "calendar_list_events":   return await handleCalendarListEvents(args);
@@ -1337,18 +1385,18 @@ async function dispatchToolCallCore(name, args, context = null) {
 
         // ---------- Ava Skill Volume (v10.7.0) ----------
         case "skill_read":              return await handleSkillRead(args);
-        case "skill_write":             return await handleSkillWrite(args);
-        case "skill_write_addition":    return await handleSkillWriteAddition(args);
-        case "skill_merge_additions":   return await handleSkillMergeAdditions(args);
+        case "skill_write":             return await handleSkillWrite(args, context);
+        case "skill_write_addition":    return await handleSkillWriteAddition(args, context);
+        case "skill_merge_additions":   return await handleSkillMergeAdditions(args, context);
         case "skill_history":           return await handleSkillHistory(args);
-        case "skill_rollback":          return await handleSkillRollback(args);
+        case "skill_rollback":          return await handleSkillRollback(args, context);
         case "skill_audit":             return await handleSkillAudit(args);
         // ---------- Modular Skill System (v11.0.0) ----------
         case "skill_compile":           return await handleSkillCompile(args, context);
         case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
         case "skill_recompile":         return await handleSkillRecompile(args, context);
         case "personality_write": {
-          const _personalityResult = await handlePersonalityWrite(args);
+          const _personalityResult = await handlePersonalityWrite(args, context);
           // Non-blocking WordPress gateway backup (tenant mode only).
           if (SKILL_BASE_DIR) {
             backupPersonalFileToGateway("PERSONALITY.md", `${SKILL_BASE_DIR}/PERSONALITY.md`)
@@ -1357,7 +1405,7 @@ async function dispatchToolCallCore(name, args, context = null) {
           return _personalityResult;
         }
         case "dispatch_rule_add": {
-          const _dispatchResult = await handleDispatchRuleAdd(args);
+          const _dispatchResult = await handleDispatchRuleAdd(args, context);
           // Non-blocking WordPress gateway backup (tenant mode only).
           if (SKILL_BASE_DIR) {
             backupPersonalFileToGateway("DISPATCH_RULES.json", `${SKILL_BASE_DIR}/DISPATCH_RULES.json`)
@@ -1365,7 +1413,8 @@ async function dispatchToolCallCore(name, args, context = null) {
           }
           return _dispatchResult;
         }
-        case "module_write":            return await handleModuleWrite(args);
+        // v13.39.0 (H-3): the per-call identity travels so the ledger can name the actor.
+        case "module_write":            return await handleModuleWrite(args, context);
         // v13.27.0. Read-only, so deliberately NOT in SYSTEM_WRITE_TOOLS: a
         // tenant may read the modules shaping its own session without being
         // able to change them.
@@ -1392,12 +1441,22 @@ async function dispatchToolCallCore(name, args, context = null) {
         case "script_read":             return handleScriptRead(args);
         case "script_write":            return await handleScriptWrite(args);
         case "script_execute":          return await handleScriptExecute(args);
+        // ---------- TENAX-2026-10-15-01 (v13.39.0) ----------
+        case "store_discipline":        return handleStoreDiscipline(args, { rebuilders: derivedIndexRebuilders() });
+        case "module_ledger":           return handleModuleLedger(args);
+        case "skill_selection_report":  return handleSkillSelectionReport(args, getModularPaths().avaDir);
 
         // ---------- Gateway render tools (SPEC-GTW-DOC-001) ----------
         // Routed through one dispatcher rather than four cases so that the
         // feature-flag check cannot be applied to three tools and forgotten on
         // the fourth. dispatchRenderTool returns null for any name it does not
         // own, which cannot happen here but keeps the contract explicit.
+        // ---------- Coding delivery (v13.37.0, TENAX-2026-10-09-01 A1) ----------
+        // Dispatched whether or not it is advertised, so a misconfigured
+        // deployment answers frame_not_configured by name rather than
+        // "Unknown tool".
+        case CODING_DELIVERY_TOOL: return await handleCodingDeliverablePublish(args);
+
         case "document_render":
         case "pdf_render":
         case "xlsx_render":
@@ -1494,7 +1553,30 @@ const SYSTEM_WRITE_TOOLS = new Set([
   'skill_write', 'skill_write_addition', 'skill_merge_additions', 'skill_rollback',
   'module_write', 'script_write', 'archive_write', 'reference_write',
   'dispatch_rule_add',
+  // v13.39.0 (H-2): claims can refuse every other writer of a store.
+  'store_discipline',
 ]);
+
+/**
+ * Rebuild functions for the derived indexes store_discipline can detach and
+ * rebuild (src/utils/derivedIndexes.js). The server supplies them because it
+ * owns the live tool registry the catalogue is built from.
+ *
+ * @returns {Record<string, () => unknown>}
+ */
+function derivedIndexRebuilders() {
+  return {
+    brain_tools_catalog: () => writeToolCatalog(buildEffectiveToolList()),
+    merged_manifest: () => {
+      const p = getModularPaths();
+      const fresh = (path, fallback) => {
+        try { return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : fallback; } catch { return fallback; }
+      };
+      // Recomputed in memory; never written back over any of its inputs.
+      return Boolean(loadMergedManifest(p, fresh).manifest);
+    },
+  };
+}
 
 function createMcpServer(tenantContext) {
   const server = new Server(
@@ -2098,6 +2180,14 @@ app.get(["/health/ready", "/health"], async (req, res) => {
     uptime_s: uptimeSeconds(),
     checks: report.checks,
     memory: memorySnapshot,
+    // v13.40.0 (TENAX-2026-10-17-03 item D): compare with the gateway's
+    // GET /metrics memory_store. The connector decides first, so the two
+    // must agree.
+    memory_store: {
+      capacity_per_scope: MEMORY_CAPACITY.limit,
+      source: MEMORY_CAPACITY.source,
+      variable: MEMORY_CAPACITY_ENV,
+    },
     statsAndMlEnabled: true,
     transport: ["streamable-http", "sse-legacy"],
     linkedinOAuth: !!(config.linkedinClientId && config.linkedinClientSecret),
@@ -2851,6 +2941,16 @@ const DOWNLOADS_DIR            = process.env.DOWNLOADS_DIR || '/data/downloads/'
 const DOWNLOADS_TTL_HOURS      = parseInt(process.env.DOWNLOADS_TTL_HOURS || String(3 * 24), 10);
 
 /**
+ * v13.37.0 -- TENAX-2026-10-09-01 C-CALIBRATION. The window the reaper
+ * actually runs at: DOWNLOADS_TTL_HOURS, raised to the signed-link lifetime
+ * when it is configured below it, so the ordering documented above is
+ * enforced rather than described (src/utils/retentionCalibration.js).
+ */
+const DOWNLOADS_REAPER = calibrateDownloadsTtl(DOWNLOADS_TTL_HOURS, linkExpirySeconds());
+const DOWNLOADS_REAPER_HOURS   = DOWNLOADS_REAPER.hours;
+if (DOWNLOADS_REAPER.raised) log('warn', `[retention] ${DOWNLOADS_REAPER.message}`);
+
+/**
  * Files under /data/downloads that must survive the reaper.
  *
  * ava_brain_data.json is the Neural Core architecture scan. 20-neural-core.js
@@ -2875,7 +2975,7 @@ function sweepExpiredUploads() {
 function sweepExpiredDownloads() {
   return sweepExpiredFiles({
     dir:       DOWNLOADS_DIR,
-    ttlHours:  DOWNLOADS_TTL_HOURS,
+    ttlHours:  DOWNLOADS_REAPER_HOURS,
     protected: DOWNLOADS_PROTECTED,
     label:     'sweep/downloads',
   });
@@ -2903,7 +3003,8 @@ if (UPLOAD_SWEEP_ENABLED) {
   if (typeof _retentionTimer.unref === 'function') _retentionTimer.unref();
   log('info',
     `retention sweeper active: uploads ${DEFAULT_TTL_HOURS}h, ` +
-    `downloads ${Math.round(DOWNLOADS_TTL_HOURS / 24)}d ` +
+    `downloads ${Math.round(DOWNLOADS_TTL_HOURS / 24)}d configured, ` +
+    `${Math.round(DOWNLOADS_REAPER_HOURS / 24)}d effective ` +
     `(protected: ${[...DOWNLOADS_PROTECTED].join(', ') || 'none'}), ` +
     `interval ${Math.round(UPLOAD_SWEEP_INTERVAL_MS / 60000)}min`);
 }
@@ -3170,7 +3271,10 @@ app.post("/restore-modules", async (req, res) => {
   try {
     const body = req.body || {};
     const result = await handleModulesRestoreFromWp(body);
-    if (!result.success) return res.status(500).json(result);
+    // v13.39.0 (H-2): a restore refused because another process holds a
+    // claim on the store is a conflict, not a server fault. The refusal
+    // names the holder and where the payload was captured.
+    if (!result.success) return res.status(result.refusal ? 409 : 500).json(result);
     log("info", `restore-modules: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
     return res.json(result);
   } catch (err) {
@@ -3199,6 +3303,9 @@ app.post("/restore-personality", async (req, res) => {
     const fileContent = typeof body.content === "string" ? body.content : "";
     if (!fileContent) return res.status(400).json({ error: "content is required" });
     const result = await handleModulesRestoreFromWp({ files: { "PERSONALITY.md": fileContent } });
+    // v13.39.0 (H-2): the result was previously ignored, so a failed or
+    // refused write still answered "restored". A refusal is now reported.
+    if (!result.success) return res.status(result.refusal ? 409 : 500).json(result);
     log("info", `restore-personality: written from ${body.source || "wordpress-push"}`);
     return res.json({ success: true, message: "PERSONALITY.md restored to Railway volume." });
   } catch (err) {
@@ -3227,6 +3334,9 @@ app.post("/restore-dispatch-rules", async (req, res) => {
     const fileContent = typeof body.content === "string" ? body.content : "";
     if (!fileContent) return res.status(400).json({ error: "content is required" });
     const result = await handleModulesRestoreFromWp({ files: { "DISPATCH_RULES.json": fileContent } });
+    // v13.39.0 (H-2): the result was previously ignored, so a failed or
+    // refused write still answered "restored". A refusal is now reported.
+    if (!result.success) return res.status(result.refusal ? 409 : 500).json(result);
     log("info", `restore-dispatch-rules: written from ${body.source || "wordpress-push"}`);
     return res.json({ success: true, message: "DISPATCH_RULES.json restored to Railway volume." });
   } catch (err) {
@@ -3253,7 +3363,10 @@ app.post("/restore-archive", async (req, res) => {
   try {
     const body   = req.body || {};
     const result = await handleArchiveRestoreFromWp(body);
-    if (!result.success) return res.status(500).json(result);
+    // v13.39.0 (H-2): a restore refused because another process holds a
+    // claim on the store is a conflict, not a server fault. The refusal
+    // names the holder and where the payload was captured.
+    if (!result.success) return res.status(result.refusal ? 409 : 500).json(result);
     log("info", `restore-archive: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
     return res.json(result);
   } catch (err) {
@@ -3280,7 +3393,10 @@ app.post("/restore-references", async (req, res) => {
   try {
     const body   = req.body || {};
     const result = await handleReferenceRestoreFromWp(body);
-    if (!result.success) return res.status(500).json(result);
+    // v13.39.0 (H-2): a restore refused because another process holds a
+    // claim on the store is a conflict, not a server fault. The refusal
+    // names the holder and where the payload was captured.
+    if (!result.success) return res.status(result.refusal ? 409 : 500).json(result);
     log("info", `restore-references: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
     return res.json(result);
   } catch (err) {
@@ -3307,7 +3423,10 @@ app.post("/restore-scripts", async (req, res) => {
   try {
     const body   = req.body || {};
     const result = await handleScriptRestoreFromWp(body);
-    if (!result.success) return res.status(500).json(result);
+    // v13.39.0 (H-2): a restore refused because another process holds a
+    // claim on the store is a conflict, not a server fault. The refusal
+    // names the holder and where the payload was captured.
+    if (!result.success) return res.status(result.refusal ? 409 : 500).json(result);
     log("info", `restore-scripts: ${result.files_restored} files restored from ${body.source || "wordpress-push"}`);
     return res.json(result);
   } catch (err) {
@@ -3852,6 +3971,7 @@ app.get( '/preview/:filename', async ( req, res ) => {
       // inert data. This eliminates the vulnerability class rather than
       // filtering for it, and the strict filename validation above is a second,
       // independent layer rather than the primary control.
+      assertLaunchAllowed( 'preview.docx_extract', PREVIEW_PYTHON_BIN, [ PREVIEW_EXTRACT_SCRIPT, docxPath ] );
       const stdout = execFileSync(
         PREVIEW_PYTHON_BIN,
         [ PREVIEW_EXTRACT_SCRIPT, docxPath ],
@@ -4380,6 +4500,10 @@ app.post("/ti-skill-compile", async (req, res) => {
       conditions:          parsed.conditions_detected || [],
       person_prior_active: parsed.person_prior_active || false,
       note:                parsed.note             || "",
+      // v13.39.0 (H-7): tokens used against the cap, per-part sizes and the
+      // truncation policy, so the gateway can surface them where the compile
+      // result lands. Additive: a consumer reading only `skill` is unaffected.
+      occupancy:           parsed.occupancy        || null,
     });
 
   } catch (err) {
@@ -4667,6 +4791,9 @@ httpServer.listen(PORT, HOST, () => {
     "info",
     `Memory MCP: ${MEMORY_ENABLED ? "ENABLED" : "disabled (set AVA_MEMORY_WP_URL+AVA_MEMORY_WP_KEY or MEMORY_AUTH_TOKEN to enable)"}`,
   );
+  // v13.40.0 (TENAX-2026-10-17-03): the same line the gateway prints. They
+  // must match: this service refuses a write before the gateway sees it.
+  log(MEMORY_CAPACITY.warning ? "warn" : "info", describeMemoryCapacity(MEMORY_CAPACITY));
 
   log(
     "info",

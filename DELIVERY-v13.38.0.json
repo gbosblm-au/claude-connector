@@ -1,0 +1,61 @@
+{
+  "version": "13.38.0",
+  "previous": "13.37.0",
+  "work_orders": [
+    "TENAX-2026-10-10-02: the connector half of C-READER-ORDER (verifyReaderCredential), C-LINK-CONTENT (checkArchiveContent) and C-LINK-APPEARS (pinned through the real server). Operator runbook: Gateway Service RUNBOOK-TENAX-2026-10-10-02.md."
+  ],
+  "changed_files": [
+    "src/tools/coding-delivery.js (v1.1.0)",
+    "src/utils/zipCentralDirectory.js (v1.1.0)",
+    "src/tests/coding-delivery.test.js",
+    "src/tests/coding-delivery-http.test.js (new)",
+    ".env.example",
+    "package.json (13.37.0 to 13.38.0; package-lock.json left as uploaded at 13.25.0)",
+    "CHANGELOG-v13.38.0.md (new)",
+    "DELIVERY-v13.38.0.json (new)"
+  ],
+  "ancillary_changes": [],
+  "variables": {
+    "added": [],
+    "behaviour_changed": "TENAX_FRAME_READ_TOKEN must be a token the frame reads as role reader with no writes (GET /v1/credential, tenax-frame 1.10.2); otherwise every fetch is refused, by name"
+  },
+  "full_suite": {
+    "runner": "per-file: each test file under src/tests, tests, src/tools, src/tools-memory and src/tools-self-model in its own `node --experimental-test-module-mocks --test` process, plus `npm test`",
+    "before": {
+      "artifact": "13.37.0 as delivered",
+      "files": 62,
+      "tests": 1298,
+      "pass": 1296,
+      "fail": 1,
+      "skipped": 1,
+      "npm_test": "30/30"
+    },
+    "after": {
+      "artifact": "this archive (13.38.0)",
+      "files": 63,
+      "tests": 1305,
+      "pass": 1303,
+      "fail": 1,
+      "skipped": 1,
+      "npm_test": "30/30"
+    },
+    "executed_delta": "+7: coding-delivery 12 to 17, coding-delivery-http +2 (new); every other file identical",
+    "net_new_failures": 0,
+    "carried": "voice-gpl-boundary 'no Piper artifact survives anywhere in the source tree' (carried from 13.37.0)"
+  },
+  "mutations": {
+    "applied": 11,
+    "red": 11
+  },
+  "end_to_end": "Gateway Service 2.253.0 driving this connector's tool against tenax-frame 1.10.2 running: 39/39 with the root 'widget' and 39/39 with 'My Été App'.",
+  "independent_review": "No blocking finding in the connector. Acted on: the per-member sha256 now yields between 4 MiB pieces. Carried (dated in the gateway runbook): the whole-archive sha256 from 13.37.0 is still computed on the request thread.",
+  "not_verified_here": [
+    "a real /data/downloads volume on Railway",
+    "the credential check against the deployed frame"
+  ],
+  "deployment": {
+    "mode": "in-place",
+    "order": "tenax-frame 1.10.2, then Gateway Service 2.253.0 with migration 0060, then this connector; then the runbook's Track 0",
+    "rollback_target": "13.37.0 (it does not ask the frame what its credential is)"
+  }
+}

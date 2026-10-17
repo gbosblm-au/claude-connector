@@ -52,6 +52,8 @@ import {
   statSync,
 } from 'node:fs';
 import { log } from '../utils/logger.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-3): skill-file mutations are ledgered.
+import { appendLedgerEntry, fileDigest, contentDigest, actorFrom } from '../utils/moduleLedger.js';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -149,7 +151,7 @@ function formatWpResult(r) {
 // Canonical write (shared by skill_write, skill_rollback, skill_merge_additions)
 // ---------------------------------------------------------------------------
 
-async function canonicalWrite(content, changeSummary, paths) {
+async function canonicalWrite(content, changeSummary, paths, ledgerCtx = {}) {
   const { filePath, versionDir, metaPath, historyPath, wpSkillUrl, wpSkillKey } = paths;
   const meta             = readMeta(metaPath);
   const prevLineCount    = meta.line_count || 0;
@@ -161,7 +163,16 @@ async function canonicalWrite(content, changeSummary, paths) {
   const lineDelta        = newLineCount - prevLineCount;
   const archivedAs       = archiveCurrent(filePath, versionDir, prevVersionId);
 
+  // v13.39.0 (H-3): the canonical skill file's mutation is ledgered with its
+  // before/after sha256, whoever the caller (skill_write, rollback, merge,
+  // a WordPress restore).
+  const ledgerBefore = fileDigest(filePath);
   writeFileSync(filePath, content, 'utf8');
+  appendLedgerEntry({
+    file: filePath, kind: 'skill_file', action: ledgerCtx.action || 'write',
+    actor: ledgerCtx.actor || 'mcp:direct', reason: changeSummary, tool: ledgerCtx.tool || 'skill_write',
+    before: ledgerBefore, after: contentDigest(content), extra: { version_id: newVersionId },
+  });
 
   const newMeta = { version_id: newVersionId, version_number: newVersionNumber, timestamp: ts, line_count: newLineCount, change_summary: changeSummary, previous_version_id: prevVersionId };
   writeMeta(metaPath, newMeta);
@@ -440,7 +451,7 @@ export async function handleSkillRead(args) {
   };
 }
 
-export async function handleSkillWrite(args) {
+export async function handleSkillWrite(args, context = null) {
   const paths         = getSkillPaths();
   const { filePath, versionDir, pendingPath } = paths;
   const content       = typeof args.content === 'string' ? args.content : '';
@@ -455,7 +466,14 @@ export async function handleSkillWrite(args) {
     const manifestAppendPath = (process.env.SKILL_FILE_PATH || '/data/skill/SKILL.md')
       .replace(/SKILL\.md$/, 'ava/MANIFEST_APPEND.json');
 
+    // v13.39.0 (H-3): MANIFEST_APPEND is a compile input; its mutation is ledgered.
+    const appendBefore = fileDigest(manifestAppendPath);
     writeFileSync(manifestAppendPath, content, 'utf8');
+    appendLedgerEntry({
+      file: manifestAppendPath, kind: 'skill_file', action: 'write', actor: actorFrom(context),
+      reason: changeSummary, tool: 'skill_write', before: appendBefore, after: contentDigest(content),
+      extra: { target: 'manifest_append' },
+    });
 
     // Non-blocking WordPress backup
     const wpSkillUrl = process.env.WP_SKILL_URL || '';
@@ -488,15 +506,21 @@ export async function handleSkillWrite(args) {
   // --- End MANIFEST_APPEND write ---
 
   if (pending) {
+    const pendingBefore = fileDigest(pendingPath);
     writeFileSync(pendingPath, content, 'utf8');
+    appendLedgerEntry({
+      file: pendingPath, kind: 'skill_file', action: 'write', actor: actorFrom(context),
+      reason: changeSummary, tool: 'skill_write', before: pendingBefore, after: contentDigest(content),
+      extra: { target: 'pending' },
+    });
     return { content: [{ type: 'text', text: JSON.stringify({ success: true, target: 'pending', line_count: countLines(content), note: content === '' ? 'SKILL_PENDING.md cleared.' : 'SKILL_PENDING.md updated.' }, null, 2) }] };
   }
 
-  const result = await canonicalWrite(content, changeSummary, paths);
+  const result = await canonicalWrite(content, changeSummary, paths, { action: 'write', tool: 'skill_write', actor: actorFrom(context) });
   return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 }
 
-export async function handleSkillWriteAddition(args) {
+export async function handleSkillWriteAddition(args, context = null) {
   const paths              = getSkillPaths();
   const { filePath, versionDir, additionsPath, additionsMetaPath } = paths;
   const content            = typeof args.content         === 'string' ? args.content.trim()  : '';
@@ -513,7 +537,14 @@ export async function handleSkillWriteAddition(args) {
 
   const newBlock       = formatAdditionBlock(sessionId, content, locationType, locationAnchor, changeSummary);
   const existingContent = existsSync(additionsPath) ? readFileSync(additionsPath, 'utf8') : '';
+  const additionsBefore = fileDigest(additionsPath);
   writeFileSync(additionsPath, existingContent + newBlock, 'utf8');
+  // v13.39.0 (H-3): the staged-additions file is a skill file; its mutation is ledgered.
+  appendLedgerEntry({
+    file: additionsPath, kind: 'skill_file', action: 'append', actor: actorFrom(context),
+    reason: changeSummary, tool: 'skill_write_addition', before: additionsBefore,
+    after: contentDigest(existingContent + newBlock), extra: { session_id: sessionId },
+  });
 
   const meta      = readAdditionsMeta(additionsMetaPath);
   const newCount  = (meta.count || 0) + 1;
@@ -553,7 +584,7 @@ export async function handleSkillWriteAddition(args) {
   };
 }
 
-export async function handleSkillMergeAdditions(args) {
+export async function handleSkillMergeAdditions(args, context = null) {
   const paths              = getSkillPaths();
   const { filePath, versionDir, additionsPath, additionsMetaPath } = paths;
   const changeSummary      = (args.change_summary || 'OSC pre-step: merge pending additions into canonical').slice(0, 200);
@@ -585,10 +616,16 @@ export async function handleSkillMergeAdditions(args) {
   }
 
   const mergeChangeSummary = `${changeSummary} (${appliedCount}/${blocks.length} additions applied)`;
-  const canonicalResult    = await canonicalWrite(mergedContent, mergeChangeSummary, paths);
+  const canonicalResult    = await canonicalWrite(mergedContent, mergeChangeSummary, paths, { action: 'merge', tool: 'skill_merge_additions', actor: actorFrom(context) });
 
   // Clear SKILL_ADDITIONS.md and reset metadata
+  const clearedBefore = fileDigest(additionsPath);
   writeFileSync(additionsPath, '', 'utf8');
+  appendLedgerEntry({
+    file: additionsPath, kind: 'skill_file', action: 'merge', actor: actorFrom(context),
+    reason: `${mergeChangeSummary}: staged additions cleared after merge`, tool: 'skill_merge_additions',
+    before: clearedBefore, after: contentDigest(''),
+  });
   writeAdditionsMeta(additionsMetaPath, { count: 0, last_updated: new Date().toISOString(), last_session_id: null });
 
   log('info', `skill_merge_additions complete: ${appliedCount}/${blocks.length} blocks, canonical now ${canonicalResult.version_id}`);
@@ -623,7 +660,7 @@ export async function handleSkillHistory(args) {
   return { content: [{ type: 'text', text: JSON.stringify({ current_version: currentVersion, versions: allVersions.slice(0, limit), total_versions: allVersions.length, limit_applied: limit }, null, 2) }] };
 }
 
-export async function handleSkillRollback(args) {
+export async function handleSkillRollback(args, context = null) {
   const paths         = getSkillPaths();
   const { filePath, versionDir } = paths;
   const versionId     = (args.version_id || '').trim();
@@ -644,7 +681,7 @@ export async function handleSkillRollback(args) {
   if (!targetFile) return { content: [{ type: 'text', text: JSON.stringify({ error: `Version ${versionId} not found in archive.` }, null, 2) }], isError: true };
 
   const restoredContent = readFileSync(`${versionDir}${targetFile}`, 'utf8');
-  const result = await canonicalWrite(restoredContent, `Rollback to ${versionId}: ${changeSummary}`, paths);
+  const result = await canonicalWrite(restoredContent, `Rollback to ${versionId}: ${changeSummary}`, paths, { action: 'rollback', tool: 'skill_rollback', actor: actorFrom(context) });
   return { content: [{ type: 'text', text: JSON.stringify({ ...result, rolled_back_from: versionId, source_file: targetFile }, null, 2) }] };
 }
 
@@ -670,7 +707,7 @@ export async function handleSkillRestoreFromWp(body) {
   ensureDirs(filePath, versionDir);
 
   try {
-    const result = await canonicalWrite(content, changeSummary, paths);
+    const result = await canonicalWrite(content, changeSummary, paths, { action: 'restore', tool: 'restore-skill', actor: `wordpress-restore:${String(body.source || 'wordpress-push').slice(0, 60)}` });
     log('info', `restore-skill: wrote ${result.version_id} (${result.line_count} lines) from WordPress push`);
     return { success: true, ...result };
   } catch (err) {

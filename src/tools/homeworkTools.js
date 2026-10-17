@@ -17,6 +17,8 @@ import { tmpdir } from "node:os";
 import { log } from "../utils/logger.js";
 
 import { buildScriptEnv } from "../utils/scriptEnv.js";
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from "../utils/processGuard.js";
 const SCRIPTS_BASE = process.env.SCRIPTS_DIR
   ? resolvePath(process.env.SCRIPTS_DIR)
   : resolvePath("/data/skill/ava/scripts");
@@ -93,6 +95,7 @@ export async function handleHomeworkAssessRender(args = {}) {
   try {
     writeFileSync(inputPath, JSON.stringify(payload), "utf8");
 
+    assertLaunchAllowed("homework.python", pythonBin(), [scriptPath, "--input", inputPath, "--output", outputPath]);
     const result = spawnSync(
       pythonBin(),
       [scriptPath, "--input", inputPath, "--output", outputPath],

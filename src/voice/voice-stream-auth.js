@@ -18,13 +18,15 @@
 //     classifyVoiceCredential   the transport credential  (voice-auth.js)
 //     voiceEnabled              the master switch          (voice-gate.js)
 //     resolveIdentity           the caller's identity      (voice-gate.js)
-//     userAllowed               the per-user entitlement   (voice-gate.js)
+//     identityPresent           identity as a predicate    (voice-gate.js)
 //
 // Section 7 says "the gateway's existing voice entitlement check applies at
-// upgrade time", and the only way to be sure it is the SAME check is to call
-// the same function. A second copy of the allowlist logic here would be a
-// second thing to keep in step with the allowlist, and the failure mode of it
-// drifting is a user who can stream but cannot transcribe, or worse.
+// upgrade time". v13.37.0 (TENAX-VOICE-2026-10-07-02): it applies AT THE
+// GATEWAY. The per-user allowlist this module used to consult is retired; the
+// gateway's lib/voice-stream-proxy.js runs its one entitlement predicate
+// before it opens the upstream socket, so a refused user never reaches here.
+// What this module still checks is what it can know: the flags, the
+// transport credential, and that an identity was sent.
 //
 // ===========================================================================
 // THE ORDER OF THE CHECKS IS THE CHEAP-FIRST ORDER
@@ -32,11 +34,11 @@
 //
 // An unauthenticated upgrade should cost as little as possible, because it is
 // the one an attacker sends repeatedly. So: the flag (an env read), then the
-// credential (a constant-time compare), then identity (header parsing), then
-// the allowlist (which may consult a cached remote list).
+// credential (a constant-time compare), then identity (header parsing). None
+// of them makes a network call.
 
 import { classifyVoiceCredential } from './voice-auth.js';
-import { voiceEnabled, resolveIdentity, userAllowed } from './voice-gate.js';
+import { voiceEnabled, resolveIdentity, identityPresent } from './voice-gate.js';
 import { streamingEnabled } from './voice-stream-config.js';
 
 /**
@@ -80,17 +82,10 @@ export async function authenticateUpgrade( req ) {
   }
 
   const identity = resolveIdentity( req );
-  if ( ! identity.userId ) {
+  if ( ! identityPresent( identity ) ) {
     // Section 7: no anonymous streams. A valid transport credential proves the
     // GATEWAY is calling; it says nothing about which user. Both are required.
     return { ok: false, status: 401, reason: 'unauthorised' };
-  }
-
-  if ( ! userAllowed( identity ) ) {
-    // 403 rather than 401: the caller is authenticated and identified, and
-    // retrying with a different credential will not help. A 401 here would
-    // send a well-behaved client into a re-authentication loop it cannot win.
-    return { ok: false, status: 403, reason: 'not_entitled' };
   }
 
   return { ok: true, userId: identity.userId, tenantId: identity.tenantId || '' };
