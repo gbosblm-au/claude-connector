@@ -10,6 +10,10 @@
 //      budget.max_compiled_lines (default 750) of which budget.core_reserve_lines
 //      (default 250) are reserved for CORE. This is the only budget the
 //      dispatcher acts on, and it acts by demoting whole modules.
+//      v13.42.0: budget.frame_lane_lines, when set, is also held back for the
+//      gateway's one drawn module per session, so the allowance is max - core
+//      - lane (skill-modular.js resolveLineBudget); line_budget then reports
+//      frame_lane_lines and specialist_lines.
 //
 //   2. The TOKEN cap: MANIFEST.json budget.max_compiled_tokens when the
 //      manifest carries it, otherwise COMPILE_TOKEN_CAP_DEFAULT = 40,000. The
@@ -100,7 +104,11 @@ export function buildOccupancy( { parts, tokenCap, lineBudget, lineCount, demote
   const tokensUsed = parts.reduce( ( n, p ) => n + p.tokens_est, 0 );
   const overCap = tokensUsed > tokenCap.cap;
   const markers = [];
-  if ( demoted.length ) markers.push( `[compile] ${ demoted.length } module(s) demoted by the line budget (${ lineBudget.max_lines } lines): ${ demoted.join( ', ' ) }` );
+  // v13.42.0: with a frame lane set, the marker says how much of the ceiling
+  // the lane holds back, so "900 lines" is not read as the compile's allowance.
+  const laneNote = lineBudget.frame_lane_lines > 0 ? `, ${ lineBudget.frame_lane_lines } reserved for the frame lane` : '';
+  if ( demoted.length ) markers.push( `[compile] ${ demoted.length } module(s) demoted by the line budget (${ lineBudget.max_lines } lines${ laneNote }): ${ demoted.join( ', ' ) }` );
+  if ( lineBudget.frame_lane_problem ) markers.push( `[compile] ${ lineBudget.frame_lane_problem }` );
   if ( overCap ) markers.push( `[compile] ${ tokensUsed } estimated tokens exceeds the ${ tokenCap.cap }-token cap by ${ tokensUsed - tokenCap.cap }; returned whole, not truncated` );
   return {
     path,
@@ -113,6 +121,8 @@ export function buildOccupancy( { parts, tokenCap, lineBudget, lineCount, demote
     line_budget: {
       max_lines: lineBudget.max_lines,
       core_reserve_lines: lineBudget.core_reserve_lines,
+      ...( lineBudget.frame_lane_lines > 0 ? { frame_lane_lines: lineBudget.frame_lane_lines, specialist_lines: lineBudget.specialist_lines } : {} ),
+      ...( lineBudget.frame_lane_problem ? { frame_lane_problem: lineBudget.frame_lane_problem } : {} ),
       lines_returned: lineCount,
     },
     modules: [ ...parts ].sort( ( a, b ) => b.tokens_est - a.tokens_est || a.id.localeCompare( b.id ) ),

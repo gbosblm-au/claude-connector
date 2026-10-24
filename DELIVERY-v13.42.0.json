@@ -1,0 +1,64 @@
+{
+  "version": "13.42.0",
+  "previous": "13.41.0",
+  "work_orders": [
+    "TENAX-2026-10-24-02 (frame lane), compile half"
+  ],
+  "companion_release": "Gateway Service 2.279.0",
+  "decision": "The compile's specialist allowance is max_compiled_lines - core_reserve_lines - frame_lane_lines (account holder, 2026-10-25). Absent/null/0 lane: unchanged. Malformed lane or one the ceiling cannot hold: not applied, named in occupancy.line_budget.frame_lane_problem and a marker.",
+  "changed_files": {
+    "new": [
+      "src/tests/frame-lane.test.js",
+      "scripts/verify-tenax-2026-10-24-02-mutations.mjs",
+      "CHANGELOG-v13.42.0.md",
+      "DELIVERY-v13.42.0.json"
+    ],
+    "modified": [
+      "src/tools/skill-modular.js",
+      "src/tools/skill-occupancy.js",
+      "package.json"
+    ]
+  },
+  "existing_tests_modified": [],
+  "not_shipped_on_purpose": [
+    "data/google-service-account.json (a private key; rotate it and remove it from git history)",
+    "node_modules",
+    ":memory: (a test artefact written into the working directory)"
+  ],
+  "full_suite": {
+    "runner": "per-file: every *.test.js / *.test.mjs under src/ and tests/ in its own `node --experimental-test-module-mocks --test` process with NODE_ENV=test, plus `npm test`; same runner, same node_modules, Node v22.22.0, on both trees",
+    "before": {
+      "artifact": "13.41.0 as delivered",
+      "files": 75,
+      "tests": 1435,
+      "pass": 1432,
+      "fail": 2,
+      "skipped": 1,
+      "npm_test": "30 passed, 0 failed"
+    },
+    "after": {
+      "artifact": "this tree (13.42.0)",
+      "files": 76,
+      "tests": 1439,
+      "pass": 1436,
+      "fail": 2,
+      "skipped": 1,
+      "npm_test": "30 passed, 0 failed"
+    },
+    "executed_delta": "+4, all in src/tests/frame-lane.test.js (new). Every other file identical in tests, pass, fail, skipped and exit code.",
+    "net_new_failures": 0,
+    "carried": [
+      "src/tests/voice-gpl-boundary.test.js (carried since 13.37.0)",
+      "src/tests/voice.test.js C-10 (carried)"
+    ]
+  },
+  "mutations": {
+    "command": "npm run tenax-2026-10-24-02:mutations",
+    "applied": 5,
+    "claims": 3,
+    "red": "5/5 named mutations demonstrated red, controls green."
+  },
+  "byte_identity": "Independent review: 216 compile and skill_recompile cases (9 budgets x 4 queries x 2 access levels) identical to 13.41.0 with the lane absent, null or 0.",
+  "twin_parity": "Gateway 2.279.0 C-FLANE-PARITY imports resolveLineBudget from this tree and agrees with the draw's resolveFrameLane on all 2,940 budgets; the review's wider sweep, 12,168 budgets, no disagreement.",
+  "boundary": "No trigger, tier, scoring, always_load, load_priority, load_strategy, core-reserve or CORE.md change. Set the lane only with max_compiled_lines raised by the same number, and only once this connector is live."
+}

@@ -503,11 +503,62 @@ function layer4Dependencies(manifest, candidateMap) {
   return additions;
 }
 
+/**
+ * The line budget the compile enforces, read from MANIFEST.json `budget`.
+ *
+ * v13.42.0 (TENAX-2026-10-24-02, the frame lane; Brian's ruling 2026-10-24: a
+ * reserved lane outside the ordinary budget, so other modules cannot consume
+ * it). `frame_lane_lines` is the allocation reserved for the one module the
+ * gateway's skill_load_random may draw per session. The compile never fills
+ * it: its specialist allowance is
+ *
+ *     max_compiled_lines - core_reserve_lines - frame_lane_lines
+ *
+ * so raising max_compiled_lines by exactly the lane leaves every compile's
+ * allowance, and so its selection, as it was (900 / 250 / no lane and
+ * 1250 / 250 / 350 both allow 650). The lane is bounded by the gateway's one
+ * draw per session; it is not a general way to load past the budget.
+ *
+ * Absent, null or 0: no lane, and the allowance is max - core exactly as
+ * before 13.42.0. A value that is not a whole number of lines, or a lane the
+ * ceiling cannot hold (max - core - lane below 0), is NOT applied: the
+ * compile runs as if no lane were set (so a bad edit never shrinks or empties
+ * a compile) and the problem is named in `problem`, which line_budget reports.
+ * The gateway's draw refuses by name on the same two conditions
+ * (Gateway lib/module-draw.js resolveFrameLane), so a lane is never charged
+ * that the compile did not reserve.
+ *
+ * max and core keep their existing `|| default` reading (0 or absent means
+ * the default), unchanged from layer5Budget before 13.42.0.
+ *
+ * @param {object} [budget]  MANIFEST.json budget.
+ * @returns {{ maxLines: number, coreLines: number, frameLaneLines: number, specialistLines: number, problem: string|null }}
+ */
+export function resolveLineBudget(budget) {
+  const b = budget && typeof budget === 'object' ? budget : {};
+  const maxLines = b.max_compiled_lines || 750;
+  const coreLines = b.core_reserve_lines || 250;
+  const raw = b.frame_lane_lines;
+  let lane = 0;
+  let problem = null;
+  // 0 is "no lane" exactly as absent is, whatever the ceiling (a ceiling
+  // below the core reserve is not a lane problem).
+  if (raw !== undefined && raw !== null && raw !== 0) {
+    if (!Number.isInteger(raw) || raw < 0) {
+      problem = `frame_lane_lines is ${JSON.stringify(raw)}; it must be a whole number of lines, 0 or more. No lane is applied.`;
+    } else if (maxLines - coreLines - raw < 0) {
+      problem = `frame_lane_lines ${raw} does not fit: max_compiled_lines ${maxLines} less core_reserve_lines ${coreLines} leaves ${maxLines - coreLines}. No lane is applied; raise max_compiled_lines to at least ${coreLines + raw}.`;
+    } else {
+      lane = raw;
+    }
+  }
+  return { maxLines, coreLines, frameLaneLines: lane, specialistLines: maxLines - coreLines - lane, problem };
+}
+
 function layer5Budget(manifest, finalCandidates, mandatorySet, highConfidenceSet, priorSet = new Set()) {
   const budget = manifest.budget || {};
-  const maxLines = budget.max_compiled_lines || 750;
-  const coreLines = budget.core_reserve_lines || 250;
-  const specialistBudget = maxLines - coreLines;
+  // v13.42.0: the frame lane is reserved out of the ceiling (resolveLineBudget).
+  const specialistBudget = resolveLineBudget(budget).specialistLines;
 
   const moduleMap = {};
   for (const m of (manifest.modules || [])) moduleMap[m.id] = m;
@@ -892,6 +943,11 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   const budgetSet = new Set(budgetSurvivors);
   const survivingSet = new Set(survivingIds);
   const budget = manifest.budget || {};
+  // v13.42.0: the lane and the allowance it leaves are reported only when a
+  // lane is set or refused, so a manifest without one reports exactly what it
+  // did before.
+  const lineBudget = resolveLineBudget(budget);
+  if (lineBudget.problem) log('warn', `skill-modular: ${lineBudget.problem}`);
 
   return {
     compiled,
@@ -907,7 +963,11 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
     always_load:             alwaysLoadIds.filter(id => survivingSet.has(id)),
     demoted_by_budget:       allCandidates.filter(id => !budgetSet.has(id)),
     filtered_by_access:      budgetSurvivors.filter(id => !survivingSet.has(id)),
-    line_budget:             { max_lines: budget.max_compiled_lines || 750, core_reserve_lines: budget.core_reserve_lines || 250 },
+    line_budget:             {
+      max_lines: lineBudget.maxLines, core_reserve_lines: lineBudget.coreLines,
+      ...(lineBudget.frameLaneLines > 0 ? { frame_lane_lines: lineBudget.frameLaneLines, specialist_lines: lineBudget.specialistLines } : {}),
+      ...(lineBudget.problem ? { frame_lane_problem: lineBudget.problem } : {}),
+    },
     token_cap:               compileTokenCap(manifest),
     person_prior_cut:        priorCut,
   };
