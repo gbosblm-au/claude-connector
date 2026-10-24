@@ -195,6 +195,11 @@ export const config = {
   //                          Only set in tenant-mode connector deployments, never in owner deployment.
   // TS_TENANT_ID:            Tenant ID slug (e.g. 'smith-partners').
   //                          Used for Railway file path routing and memory namespace.
+  // TS_CLIENT_USER_ID:       (v13.41.0) The gateway account (ti_users.id) a tenant-mode
+  //                          connector's memory calls act for when the call carries no
+  //                          per-call user (a direct MCP session). Gateway 2.277.0
+  //                          refuses a memory request that names no account. Read by
+  //                          src/utils/callContext.js; see the 13.41.0 changelog.
   // ---------------------------------------------------------------------------
   tsClientMode:        (process.env.TS_CLIENT_MODE           || 'owner').toLowerCase(),
   tsTenantGatewayUrl:  (process.env.TS_TENANT_GATEWAY_URL    || '').replace(/\/$/, ''),

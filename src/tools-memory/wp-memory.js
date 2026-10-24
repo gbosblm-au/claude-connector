@@ -29,6 +29,9 @@ import {
 import { ToolError } from './errors.js';
 // v13.39.0 (TENAX-2026-10-15-01 H-6, H-10): the shared write guard.
 import { guardMemoryWrite, redactDeepForInjection } from './memoryWriteGuard.js';
+// v13.41.0 (Gateway WO-ISO-276-001 A3): the account each tenant-mode memory
+// call acts for, from the per-call context or TS_CLIENT_USER_ID.
+import { resolveMemoryUserId } from '../utils/callContext.js';
 
 /* =========================================================================
    HTTP helper
@@ -95,6 +98,20 @@ async function wpFetch(path, options = {}) {
       try { body = JSON.parse(options.body); } catch (_) {}
     }
     body.api_key = apiKey;
+
+    // v13.41.0 (Gateway WO-ISO-276-001 A3): name the account. Gateway 2.277.0
+    // refuses a memory request without one (it used to fall back to every
+    // tenant-wide and ownerless row). Refused here, before anything is sent,
+    // when no account can be named; the reason says how to name one.
+    const who = resolveMemoryUserId();
+    if (!who.ok) {
+      throw new ToolError(
+        'TENANT_USER_REQUIRED',
+        `Tenant memory refused: ${who.reason}. Set TS_CLIENT_USER_ID to the gateway account this connector acts for, or call through the gateway, which supplies it per call.`,
+        400,
+      );
+    }
+    body.user_id = who.userId;
 
     let res;
     try {

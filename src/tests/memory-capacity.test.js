@@ -140,12 +140,15 @@ describe( 'C-VAR-READS on the WordPress/tenant path: refused here, before the ga
     process.env.TS_CLIENT_MODE = 'tenant';
     process.env.TS_TENANT_GATEWAY_URL = `http://127.0.0.1:${ server.address().port }`;
     process.env.TS_CLIENT_API_KEY = 'test-key-not-a-secret';
+    // v13.41.0: Gateway 2.277.0 refuses a tenant memory call that names no account.
+    process.env.TS_CLIENT_USER_ID = '7';
   } );
   after( async () => {
     await new Promise( ( r ) => server.close( r ) );
     delete process.env.TS_CLIENT_MODE;
     delete process.env.TS_TENANT_GATEWAY_URL;
     delete process.env.TS_CLIENT_API_KEY;
+    delete process.env.TS_CLIENT_USER_ID;
   } );
 
   test( 'a scope at CAP refuses a new key with the variable named, and nothing is sent to the gateway\'s upsert', async () => {

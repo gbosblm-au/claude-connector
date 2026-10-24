@@ -276,6 +276,8 @@ import {
   handleSelfModelQuery,
 } from "./tools/selfModelQuery.js";
 import { selfModelRecordToolCall } from "./tools-self-model/hook.js";
+import { runWithCallContext } from "./utils/callContext.js";
+import { buildSkillExport } from "./utils/skillExport.js";
 import { initSelfModelDb, isSelfModelEnabled } from "./tools-self-model/db.js";
 // v13.40.0 (TENAX-2026-10-17-03 item D): the memory ceiling this process
 // resolved from MEMORY_CAPACITY_PER_SCOPE. The guard file imports nothing, so
@@ -1197,7 +1199,11 @@ function buildEffectiveToolList() {
 
 async function dispatchToolCall(name, args, context = null) {
   const _selfModelStartedAt = Date.now();
-  const result = await dispatchToolCallCore(name, args, context);
+  // v13.41.0 (Gateway WO-ISO-276-001 A3): the call's identity is held for
+  // everything this call awaits (src/utils/callContext.js), so the tenant
+  // memory transport can name the account without a parameter on every
+  // handler. A direct MCP call has no context and the scope holds nulls.
+  const result = await runWithCallContext(context, () => dispatchToolCallCore(name, args, context));
   // Fire-and-forget: the hook has its own try/catch, and this one is the
   // belt to its braces. A Neural Core problem must never surface as a tool
   // failure to the caller.
@@ -4370,42 +4376,19 @@ app.get("/skill-export", (req, res) => {
     });
   }
 
-  const PERSONAL_FILES = new Set(["PERSONALITY.md", "PROFILES.md"]);
-  const files = {};
-
-  function walkDir(absDir) {
-    if (!existsSync(absDir)) return;
-    let entries;
-    try {
-      entries = readdirSync(absDir, { withFileTypes: true });
-    } catch (e) {
-      log("warn", `skill-export: cannot read dir ${absDir}: ${e.message}`);
-      return;
-    }
-    for (const entry of entries) {
-      const absPath = `${absDir}/${entry.name}`;
-      if (entry.isDirectory()) {
-        walkDir(absPath);
-      } else if (entry.isFile()) {
-        // Relative to avaDir — no leading 'ava/' prefix
-        const relPath = absPath.slice(avaDir.length).replace(/^\//, "");
-        if (PERSONAL_FILES.has(entry.name)) continue;
-        if (entry.name.startsWith("."))      continue;
-        if (!/\.(md|json|py|sh|js|ts|txt)$/i.test(entry.name)) continue;
-        try {
-          files[relPath] = readFileSync(absPath, "utf8");
-        } catch (e) {
-          log("warn", `skill-export: cannot read file ${absPath}: ${e.message}`);
-        }
-      }
-    }
-  }
-
+  // v13.41.0: the walk is src/utils/skillExport.js (unchanged rules), and a
+  // tenant-mode connector also exports its client directory as `client`
+  // (the directory its compile reads; Gateway 2.277.0's module draw).
   try {
-    walkDir(avaDir);
-    const fileCount = Object.keys(files).length;
-    log("info", `skill-export: exported ${fileCount} files from ${avaDir}`);
-    return res.json({ files, file_count: fileCount, ava_dir: avaDir });
+    const mp = getModularPaths();
+    const body = buildSkillExport({
+      avaDir,
+      tenant: { isTenantMode: mp.isTenantMode, tenantId: mp.tenantId, clientDir: mp.avaDir.replace(/\/+$/, "") },
+      warn: (m) => log("warn", m),
+    });
+    const fileCount = body.file_count;
+    log("info", `skill-export: exported ${fileCount} files from ${avaDir}${body.client ? `; client ${body.client.tenant_id}: ${body.client.file_count} files from ${body.client.dir}` : ""}`);
+    return res.json(body);
   } catch (err) {
     log("error", `skill-export exception: ${err.message}`);
     return res.status(500).json({ error: err.message });
