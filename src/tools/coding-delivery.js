@@ -1,4 +1,4 @@
-// src/tools/coding-delivery.js  v1.1.0   (claude-connector v13.38.0)
+// src/tools/coding-delivery.js  v1.2.0   (claude-connector v13.43.0)
 // ---------------------------------------------------------------------------
 // coding_deliverable_publish: fetch a delivered tree from the frame runner as
 // one archive, check it is whole, place it in the downloads directory, and
@@ -62,6 +62,15 @@
 // credential as anything else, frame_credential_unverified when the frame
 // cannot say (no such route: a frame before 1.10.2). No link is a better
 // outcome than an accidental operator token.
+//
+// v1.2.0 (13.43.0, TENAX-2026-10-27-03 rev 2 D1, D4, decision D-1a): the
+// SHIPPED directories. tenax-frame 1.11.0 records a tree's dist, build and
+// vendor directories beside its listing (they stay out of the tree hash) and
+// carries them in the archive when asked for their digest. Given `shipped`,
+// this tool asks for it, and the archive must then hold exactly the listing
+// plus the shipped files, each at its recorded size and sha256, with a
+// manifest naming that digest. Without `shipped` the archive is checked as
+// before: the listing and nothing else.
 // ---------------------------------------------------------------------------
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -152,6 +161,7 @@ export const codingDeliverablePublishToolDefinition = {
       predecessor: { type: 'string', description: 'Optional tree hash the changed-file list is computed against.' },
       supersedes: { type: 'string', description: 'Optional sha256 of the archive this one replaces, recorded in the manifest.' },
       run: { type: 'string', description: 'Optional frame run id whose evidence the manifest carries; it must have run this tree.' },
+      shipped: { type: 'string', description: 'Optional digest of the tree\'s shipped directories (dist, build, vendor) as the frame recorded them at upload (tenax-frame 1.11.0); the archive then carries them, or the call is refused.' },
     },
     required: [ 'tree_hash', 'filename' ],
   },
@@ -220,7 +230,12 @@ export function validatePublishInput( args ) {
   if ( run !== null && ( typeof run !== 'string' || ! RUN_ID.test( run ) ) ) {
     return { ok: false, message: 'run must be a frame run id.' };
   }
-  return { ok: true, value: { treeHash, filename, root, predecessor, supersedes, run } };
+  // v1.2.0: the shipped directories' digest, as the frame answered the upload.
+  const shipped = opt( a.shipped );
+  if ( shipped !== null && ( typeof shipped !== 'string' || ! HEX64.test( shipped ) ) ) {
+    return { ok: false, message: 'shipped must be the shipped directories\' digest (64 lowercase hex characters).' };
+  }
+  return { ok: true, value: { treeHash, filename, root, predecessor, supersedes, run, shipped } };
 }
 
 /**
@@ -462,7 +477,7 @@ export async function handleCodingDeliverablePublish( args, deps = {} ) {
   }
   const v = validatePublishInput( args );
   if ( ! v.ok ) return refuse( 'invalid_input', v.message );
-  const { treeHash, filename, root, predecessor, supersedes, run } = v.value;
+  const { treeHash, filename, root, predecessor, supersedes, run, shipped } = v.value;
   const auth = { Authorization: `Bearer ${ cfg.token }` };
 
   // 0. v1.1.0: the credential is a reader that can write nothing, or nothing
@@ -486,6 +501,25 @@ export async function handleCodingDeliverablePublish( args, deps = {} ) {
   if ( ! listing || listing.tree_hash !== treeHash || ! Array.isArray( listing.entries ) ) {
     return refuse( 'frame_error', 'The frame runner\'s listing does not describe the tree that was asked for.' );
   }
+  // v1.2.0: the files the archive must hold. With `shipped`, the listing's
+  // entries and the shipped files the frame recorded at that digest.
+  let expected = listing.entries;
+  if ( shipped ) {
+    const s = listing.shipped;
+    if ( ! s || typeof s !== 'object' ) {
+      return refuse( 'shipped_unavailable', 'The frame runner records no shipped directories for this tree (it is older than tenax-frame 1.11.0, or the tree was installed before it was).' );
+    }
+    if ( s.refused ) return refuse( 'shipped_unavailable', `The frame runner does not ship this tree's shipped directories: ${ s.refused }.` );
+    if ( s.hash !== shipped || ! Array.isArray( s.entries ) ) {
+      return refuse( 'shipped_unavailable', `The frame runner's shipped directories for this tree hash ${ s.hash }, not the ${ shipped } asked for: a later upload replaced them.` );
+    }
+    const listed = new Set( listing.entries.map( ( e ) => e.path ) );
+    const overlap = s.entries.filter( ( e ) => listed.has( e.path ) ).map( ( e ) => e.path );
+    if ( overlap.length ) {
+      return refuse( 'frame_error', `The frame runner names ${ overlap.length } path(s) both as listed and as shipped.`, { detail: { overlap: overlap.slice( 0, 20 ) } } );
+    }
+    expected = [ ...listing.entries, ...s.entries ];
+  }
 
   // 2. The archive.
   const q = new URLSearchParams();
@@ -493,6 +527,7 @@ export async function handleCodingDeliverablePublish( args, deps = {} ) {
   if ( predecessor ) q.set( 'predecessor', predecessor );
   if ( supersedes ) q.set( 'supersedes', supersedes );
   if ( run ) q.set( 'run', run );
+  if ( shipped ) q.set( 'shipped', shipped );
   const qs = q.toString();
   let archive;
   let declaredSha;
@@ -521,16 +556,21 @@ export async function handleCodingDeliverablePublish( args, deps = {} ) {
   }
 
   // 3. Whole, and the manifest says what was asked.
-  const checked = checkArchiveComplete( archive, listing.entries, root );
+  const checked = checkArchiveComplete( archive, expected, root );
   if ( ! checked.ok ) return refuse( checked.kind, checked.message, checked.detail ? { detail: checked.detail } : {} );
   // v1.1.0: and every member is the listed file, by content.
-  const content = await checkArchiveContent( archive, listing.entries, root );
+  const content = await checkArchiveContent( archive, expected, root );
   if ( ! content.ok ) return refuse( content.kind, content.message, content.detail ? { detail: content.detail } : {} );
   const m = checked.manifest;
   if ( m.tree_hash !== treeHash || ( m.predecessor_tree_hash || null ) !== predecessor
     || ( m.supersedes_archive_sha256 || null ) !== supersedes || ( m.archive_root || null ) !== root ) {
     return refuse( 'archive_manifest_mismatch',
       'The archive\'s manifest does not record the tree, predecessor, superseded archive or root that was asked for.' );
+  }
+  // v1.2.0: the manifest names the shipped digest that was asked for, or none.
+  const mShipped = m.shipped && typeof m.shipped === 'object' ? m.shipped : null;
+  if ( ( shipped && ( ! mShipped || mShipped.hash !== shipped ) ) || ( ! shipped && mShipped ) ) {
+    return refuse( 'archive_manifest_mismatch', 'The archive\'s manifest does not record the shipped directories that were asked for.' );
   }
 
   // 4. Placed whole under its published name, then linked.
@@ -582,6 +622,15 @@ export async function handleCodingDeliverablePublish( args, deps = {} ) {
       supersedes_archive_sha256: m.supersedes_archive_sha256 || null,
       changed_files: m.changed_files || null,
       excluded: Array.isArray( m.excluded ) ? m.excluded : [],
+      // v1.2.0: the shipped directories the archive carries, or null; and
+      // what the frame could have shipped, so a caller that asked for none
+      // can say what is missing.
+      shipped: mShipped ? { hash: mShipped.hash, entry_count: mShipped.entry_count, total_bytes: mShipped.total_bytes,
+        directories: Array.isArray( mShipped.directories ) ? mShipped.directories : [] } : null,
+      shipped_available: m.shipped_available && typeof m.shipped_available === 'object' ? {
+        hash: m.shipped_available.hash || null, refused: m.shipped_available.refused || null, entry_count: m.shipped_available.entry_count,
+        total_bytes: m.shipped_available.total_bytes, directories: Array.isArray( m.shipped_available.directories ) ? m.shipped_available.directories : [],
+      } : null,
       run: m.run || null,
       generated_by: m.generated_by || null,
     },
