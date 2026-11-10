@@ -68,6 +68,11 @@ import express               from 'express';
 
 import { log }               from '../utils/logger.js';
 import { getModularPaths }   from '../tools/skill-modular.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-2): a volume restore claims every store
+// family for its duration; see src/utils/storeWriteDiscipline.js.
+import { beginBulkRewrite, CONNECTOR_STORE_FAMILIES } from '../utils/storeWriteDiscipline.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from '../utils/processGuard.js';
 import { runBrainScan, getBrainScanPaths } from '../tools/brain-scan-trigger.js';
 
 // ---------------------------------------------------------------------------
@@ -232,6 +237,7 @@ function runHelper(args) {
 
     let child;
     try {
+      assertLaunchAllowed('volume_snapshot.helper', PYTHON_BIN, [HELPER_PATH, ...args]);
       child = spawn(PYTHON_BIN, [HELPER_PATH, ...args], {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -504,16 +510,64 @@ export function registerVolumeSnapshotRoutes(app) {
         return res.status(500).json({ error: `Cannot write the uploaded archive to ${TMP_DIR}: ${err.message}` });
       }
 
-      const started = Date.now();
-      const result  = await runHelper([
-        'extract',
+      // ---- v13.39.0 (H-2): inspect before any write lands -------------------
+      //
+      // The helper's read-only `inspect` pass lists what the archive holds
+      // (counts, bytes, the source manifest, unsafe members) before `extract`
+      // writes a single file. An archive the inspect pass cannot read is
+      // refused here, with nothing written; its findings travel in the
+      // response so the operator sees what was restored against what was sent.
+      const inspected = await runHelper([
+        'inspect',
         '--archive',              archivePath,
-        '--ava-dir',              paths.avaDir,
-        '--downloads-dir',        paths.downloadsDir,
-        '--include-downloads',    includeDownloads ? '1' : '0',
-        '--exclude-personal',     excludePersonal ? '1' : '0',
         '--max-uncompressed-mb',  String(MAX_UNCOMPRESSED_MB),
       ]);
+      if (!inspected.ok) {
+        safeUnlink(archivePath);
+        log('error', `[volume-restore] inspect pass failed, nothing written: ${inspected.data.error || 'unknown'}`);
+        return res.status(400).json({
+          error:   `Inspect pass failed; nothing was written. ${inspected.data.error || ''}`.trim(),
+          inspect: inspected.data,
+        });
+      }
+
+      // ---- v13.39.0 (H-2): claim every store family for the extraction ------
+      //
+      // A volume restore rewrites all four connector store families at once.
+      // If any is already claimed by another process, nothing is extracted:
+      // the uploaded archive is captured to forensics and the refusal names
+      // the holder. While this restore holds the claims, an interactive write
+      // to any of the stores is refused and captured.
+      const bulk = beginBulkRewrite({
+        families: [...CONNECTOR_STORE_FAMILIES],
+        kind:     'restore',
+        label:    'volume-restore',
+        purpose:  `POST /volume-restore (${body.length} bytes, ${inspected.data.ava_file_count ?? '?'} ava files)`,
+        payload:  [{ family: 'archive', rel: '_volume-restore-upload.tar.gz', content: body }],
+        tool:     'volume-restore',
+        actor:    'POST /volume-restore',
+      });
+      if (!bulk.ok) {
+        safeUnlink(archivePath);
+        log('warn', `[volume-restore] refused: ${bulk.refusal.message}`);
+        return res.status(409).json({ error: bulk.refusal.message, refusal: bulk.refusal, inspect: inspected.data });
+      }
+
+      const started = Date.now();
+      let result;
+      try {
+        result  = await runHelper([
+          'extract',
+          '--archive',              archivePath,
+          '--ava-dir',              paths.avaDir,
+          '--downloads-dir',        paths.downloadsDir,
+          '--include-downloads',    includeDownloads ? '1' : '0',
+          '--exclude-personal',     excludePersonal ? '1' : '0',
+          '--max-uncompressed-mb',  String(MAX_UNCOMPRESSED_MB),
+        ]);
+      } finally {
+        bulk.release();
+      }
 
       safeUnlink(archivePath);
 
@@ -596,6 +650,8 @@ export function registerVolumeSnapshotRoutes(app) {
         exclude_personal:         excludePersonal,
         extract_ms:               extractMs,
         source_manifest:          result.data.source_manifest,
+        // v13.39.0 (H-2): what the read-only inspect pass found before extraction.
+        inspect:                  inspected.data,
         brain_scan:               scan,
         message: `${result.data.files_written} files restored`
           + (result.data.rejected_count ? `, ${result.data.rejected_count} members rejected` : '')

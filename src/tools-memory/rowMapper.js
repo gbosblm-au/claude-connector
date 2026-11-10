@@ -1,7 +1,13 @@
 // src/utils/rowMapper.js
 // Convert a raw SQLite row into the response shape defined in TDD Section 6.
 
-export function rowToEntry(row, { includeValue = true } = {}) {
+// v13.39.0 (TENAX-2026-10-15-01 H-6): redaction before injection. Every read
+// tool that hands memory to a model maps its rows here, so credential-shaped
+// strings stored before the write guard existed are redacted on the way out.
+// The admin export (a backup, not an injection) opts out with redact: false.
+import { redactDeepForInjection } from "./memoryWriteGuard.js";
+
+export function rowToEntry(row, { includeValue = true, redact = true } = {}) {
   if (!row) return null;
   const entry = {
     id: row.id,
@@ -13,9 +19,16 @@ export function rowToEntry(row, { includeValue = true } = {}) {
     ttl: row.ttl ?? null,
     source_session: row.source_session ?? null,
     confidence: typeof row.confidence === "number" ? row.confidence : 1.0,
+    // v13.39.0 (H-10): the re-check obligation travels with the entry. A
+    // past-due date is a prompt to re-verify, never a reason to hide the entry.
+    recheck_class: row.recheck_class ?? null,
+    recheck_at: row.recheck_at ?? null,
+    verified_at: row.verified_at ?? null,
+    verified_source: row.verified_source ?? null,
   };
   if (includeValue) {
-    entry.value = safeParseJson(row.value, row.value);
+    const value = safeParseJson(row.value, row.value);
+    entry.value = redact ? redactDeepForInjection(value) : value;
   }
   return entry;
 }

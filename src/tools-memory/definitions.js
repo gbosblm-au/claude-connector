@@ -52,6 +52,20 @@ export const memoryWriteToolDefinition = {
         type: "string",
         description: "Free-text session label. Recommended: YYYY-MM-DD.",
       },
+      recheck_class: {
+        type: "string",
+        enum: ["artefact", "deployment", "version"],
+        description: "Set when the entry records the state of an artefact, a deployment or a version. The entry then carries a re-check date and is listed by memory_recheck_due once it passes, so it is re-verified by reading the artefact rather than remembered. Inferred from the value when omitted and the value names a version or a deployment. Never removes the entry.",
+      },
+      recheck_after_days: {
+        type: "number",
+        description: "Days until the re-check is due (1-365, default 7). Only used when the entry has a recheck_class.",
+      },
+      verified_source: {
+        type: "string",
+        maxLength: 256,
+        description: "What was read to verify this entry, e.g. 'Gateway-Service/package.json version field'. Stamps verified_at with the write time, so a held note can be traced to a same-day read of its artefact.",
+      },
     },
     required: ["category", "key", "value"],
   },
@@ -174,6 +188,22 @@ export const memoryGetSessionContextToolDefinition = {
   },
 };
 
+// v13.39.0 (TENAX-2026-10-15-01 H-10): the connector mirror of the gateway's
+// past-due listing.
+export const memoryRecheckDueToolDefinition = {
+  name: "memory_recheck_due",
+  description:
+    "List memory entries whose re-check date has passed: entries recording the state of an artefact, a deployment or a version. " +
+    "Each is an obligation to re-verify by reading the artefact (then rewrite the entry with verified_source), never a reason to drop it. " +
+    "Read-only; nothing is removed or demoted.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      limit: { type: "number", minimum: 1, maximum: 200, default: 50 },
+    },
+  },
+};
+
 export const ALL_MEMORY_TOOL_DEFINITIONS = [
   memoryWriteToolDefinition,
   memoryReadToolDefinition,
@@ -181,4 +211,5 @@ export const ALL_MEMORY_TOOL_DEFINITIONS = [
   memoryDeleteToolDefinition,
   memoryListToolDefinition,
   memoryGetSessionContextToolDefinition,
+  memoryRecheckDueToolDefinition,
 ];

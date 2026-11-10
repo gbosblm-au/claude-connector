@@ -105,7 +105,6 @@ await new Promise((r) => elServer.listen(0, '127.0.0.1', r));
 
 Object.assign(process.env, {
   VOICE_ENABLED: 'true',
-  VOICE_TEST_USERS: TEST_USER,
   MCP_API_KEY: TEST_KEY,
   VOICE_KOKORO_PYTHON: WRAPPER,
   VOICE_TTS_WORKER_ENABLED: 'false',
@@ -143,7 +142,7 @@ const HEADERS = {
   'Content-Type': 'application/json',
   'X-Railway-Restore-Token': TEST_KEY,
   Authorization: `Bearer ${TEST_KEY}`,
-  'X-Tenax-User-Id': TEST_USER,
+  'X-Tenax-User-Id': TEST_USER, 'X-Tenax-Voice-Entitlement': 'entitled',
 };
 
 const CONFIG = { api_key: EL_KEY, voice_id: VOICE_ID, model_id: 'eleven_multilingual_v2' };

@@ -46,6 +46,20 @@ export const memoryWriteSchema = z
     ttl_days: z.number().nonnegative().optional().nullable(),
     confidence: z.number().min(0).max(1).default(1.0),
     source_session: z.string().max(256).optional().nullable(),
+    // v13.39.0 (TENAX-2026-10-15-01 H-10): the re-check obligation. The class
+    // is validated against the closed set by the shared write guard, so an
+    // unknown class is refused with the set named rather than by a zod enum
+    // message the twins would phrase differently.
+    recheck_class: z.string().max(40).optional().nullable(),
+    recheck_after_days: z.number().positive().max(365).optional().nullable(),
+    verified_source: z.string().max(256).optional().nullable(),
+  })
+  .strict();
+
+// v13.39.0 (H-10): memory_recheck_due takes no required input.
+export const memoryRecheckDueSchema = z
+  .object({
+    limit: z.number().int().min(1).max(200).default(50),
   })
   .strict();
 
