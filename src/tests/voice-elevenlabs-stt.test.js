@@ -101,7 +101,6 @@ await new Promise((r) => elServer.listen(0, '127.0.0.1', r));
 
 Object.assign(process.env, {
   VOICE_ENABLED: 'true',
-  VOICE_TEST_USERS: TEST_USER,
   MCP_API_KEY: TEST_KEY,
   VOICE_PYTHON_BIN: WRAPPER,
   VOICE_STT_WORKER_ENABLED: 'false',
@@ -162,7 +161,7 @@ async function transcribeRoute({ key, query = '', audio = AUDIO, contentType = '
     'Content-Type': contentType,
     'X-Railway-Restore-Token': TEST_KEY,
     Authorization: `Bearer ${TEST_KEY}`,
-    'X-Tenax-User-Id': TEST_USER,
+    'X-Tenax-User-Id': TEST_USER, 'X-Tenax-Voice-Entitlement': 'entitled',
   };
   if (undefined !== key) headers['X-Tenax-ElevenLabs-Key'] = key;
   const res = await fetch(`${BASE}/voice/transcribe${query}`, { method: 'POST', headers, body: audio });

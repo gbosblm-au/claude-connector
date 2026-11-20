@@ -43,6 +43,18 @@ import { buildScriptEnv as sharedBuildScriptEnv } from '../utils/scriptEnv.js';
 // handing CONNECTOR_URL and DOCUMENT_DOWNLOAD_TOKEN to the model. See the
 // rationale at the top of src/utils/downloadLinks.js.
 import { buildDownloadLinks, snapshotDownloads } from '../utils/downloadLinks.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-4): the self-termination guard. The script,
+// its local imports and the volume's sitecustomize are inspected before any
+// spawn, and the script runs under an in-image boot file that interposes on
+// every Python process-control entry point. Nothing in the tool input can skip
+// either layer: there is no force path.
+import {
+  assertLaunchAllowed,
+  inspectScriptExecution,
+  recordGuardAudit,
+  runtimeRefusalsIn,
+  PROC_GUARD_BOOT,
+} from '../utils/processGuard.js';
 
 const SCRIPTS_BASE = process.env.SCRIPTS_DIR
   ? resolvePath( process.env.SCRIPTS_DIR )
@@ -358,6 +370,40 @@ export async function handleScriptExecute( toolInput ) {
     return { error: `Script not found: ${ script_path }. Run script_list to see available scripts.` };
   }
 
+  // ── H-4: inspect before anything runs ───────────────────────────────────
+  //
+  // Refused with the stated reason and an audit entry. Deliberately read from
+  // nothing in toolInput beyond script_path and args: a `force`, `override` or
+  // `allow_kill` field is not consulted, so no argument can switch this off.
+  const inspection = inspectScriptExecution( { scriptPath: resolvedPath, args, scriptsBase: SCRIPTS_BASE } );
+  if ( ! inspection.allowed ) {
+    const first = inspection.findings[ 0 ];
+    recordGuardAudit( {
+      site: 'script_execute.run', layer: 'inspect', code: first.code, reason: first.reason,
+      script: String( script_path ).slice( 0, 200 ), findings: inspection.findings.slice( 0, 10 ),
+    } );
+    return {
+      error:    `Refused by the process guard: ${ first.reason } (${ first.file }${ first.line ? `:${ first.line }` : '' }). `
+        + 'Scripts run by this connector may not stop, restart or signal the connector, its host or other processes. Nothing was run.',
+      refused:  true,
+      code:     first.code,
+      findings: inspection.findings.slice( 0, 10 ),
+      return_code: -3,
+    };
+  }
+
+  // The runtime layer is part of the build. A build without it fails closed
+  // rather than running scripts unguarded.
+  if ( ! existsSync( PROC_GUARD_BOOT ) ) {
+    recordGuardAudit( { site: 'script_execute.run', layer: 'runtime', code: 'runtime_guard_missing', reason: `boot file absent at ${ PROC_GUARD_BOOT }` } );
+    return {
+      error: 'Refused: the process guard\'s runtime boot file is missing from this build (src/guards/proc_guard_boot.py). Redeploy the connector.',
+      refused: true,
+      code: 'runtime_guard_missing',
+      return_code: -3,
+    };
+  }
+
   // ── Prepare temp paths ──────────────────────────────────────────────────
   const stamp     = `${ Date.now() }_${ Math.random().toString( 36 ).slice( 2, 7 ) }`;
   const outputDir = `/tmp/script_execute_output_${ stamp }`;
@@ -400,7 +446,11 @@ const PYTHON_BIN = existsSync('/mise/shims/python3')
   ? '/mise/shims/python3'
   : 'python3';
 
-result = spawnSync( PYTHON_BIN, cmdArgs, {
+// H-4: the boot file runs first and execs the script under the guard. It
+// sets sys.argv to [script, ...args], so the script sees what it always saw.
+const spawnArgs = [ PROC_GUARD_BOOT, ...cmdArgs ];
+assertLaunchAllowed( 'script_execute.run', PYTHON_BIN, spawnArgs );
+result = spawnSync( PYTHON_BIN, spawnArgs, {
       cwd:       SCRIPTS_BASE,
       timeout:   maxTimeout * 1000,
       maxBuffer: 50 * 1024 * 1024,
@@ -445,6 +495,12 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
     const stdout   = result.stdout?.toString()  || '';
     const stderr   = result.stderr?.toString()  || '';
     const exitCode = result.status;
+
+    // H-4: anything the runtime layer refused leaves an audit entry here.
+    const runtimeRefusals = runtimeRefusalsIn( stderr );
+    for ( const r of runtimeRefusals ) {
+      recordGuardAudit( { site: 'script_execute.run', layer: 'runtime', code: r.code, reason: r.reason, script: String( script_path ).slice( 0, 200 ) } );
+    }
     const signal   = result.signal || null;
     const elapsed  = Date.now() - start;
 
@@ -534,6 +590,8 @@ result = spawnSync( PYTHON_BIN, cmdArgs, {
       // with an unrelated KeyError and the cause is invisible.
       custom_env_applied:  Object.keys( customEnv ).length ? Object.keys( customEnv ) : undefined,
       custom_env_rejected: customEnvRejected.length ? customEnvRejected : undefined,
+      // v13.39.0 (H-4): process-control the runtime guard refused during the run.
+      process_guard_refusals: runtimeRefusals.length ? runtimeRefusals : undefined,
     };
 
   } catch ( err ) {
