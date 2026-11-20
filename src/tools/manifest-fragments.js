@@ -122,7 +122,7 @@ export function loadManifestFragments(avaDir) {
  * modules/{category}/{id}.md, then modules/{id}.md. Returns the relative
  * path or null.
  */
-export function inferModulePath(avaDir, entry) {
+export function inferModulePath(avaDir, entry, exists = existsSync) {
   if (entry.path) return entry.path;
   const id = String(entry.id || '').trim();
   if (!id) return null;
@@ -130,7 +130,7 @@ export function inferModulePath(avaDir, entry) {
   if (entry.category) candidates.push(`modules/${entry.category}/${id}.md`);
   candidates.push(`modules/${id}.md`);
   for (const rel of candidates) {
-    if (existsSync(join(avaDir, rel))) return rel;
+    if (exists(join(avaDir, rel))) return rel;
   }
   return null;
 }
@@ -144,9 +144,13 @@ export function inferModulePath(avaDir, entry) {
  * @param {object} manifest  Mutable manifest ({modules, mandatory_for_triggers, tag_web}).
  * @param {Array}  fragments From loadManifestFragments().fragments.
  * @param {string} avaDir    For path inference.
+ * @param {Function} [exists] v13.38.0: the existence test path inference uses.
+ *        Default existsSync. src/tools/module-files.js passes one that treats a
+ *        file as already gone, to ask what the compile would load after a
+ *        quarantine without moving anything.
  * @returns {{added: string[], skippedExisting: string[], pathInferred: string[], pathMissing: string[]}}
  */
-export function mergeFragmentsIntoManifest(manifest, fragments, avaDir) {
+export function mergeFragmentsIntoManifest(manifest, fragments, avaDir, exists = existsSync) {
   manifest.modules = manifest.modules || [];
   manifest.mandatory_for_triggers = manifest.mandatory_for_triggers || {};
   manifest.tag_web = manifest.tag_web || {};
@@ -160,7 +164,7 @@ export function mergeFragmentsIntoManifest(manifest, fragments, avaDir) {
       if (existingIds.has(id)) { stats.skippedExisting.push(id); continue; }
       const entry = { ...raw, _source_fragment: frag.file };
       if (!entry.path) {
-        const inferred = inferModulePath(avaDir, entry);
+        const inferred = inferModulePath(avaDir, entry, exists);
         if (inferred) { entry.path = inferred; stats.pathInferred.push(id); }
         else { stats.pathMissing.push(id); }
       }
@@ -229,9 +233,19 @@ export function fragmentDispatchToLinkages(fragments) {
  *
  * @param {object} paths  Modular paths ({avaDir, manifestFile, manifestAppendFile}).
  * @param {Function} readJsonFile  The caller's JSON reader (path, fallback) => object.
+ * @param {object} [options]  v13.38.0 (WO-2026-11-20-03), for
+ *        src/tools/module-files.js only; every existing caller passes none and
+ *        gets the previous behaviour exactly.
+ * @param {Array} [options.fragments]  Use these fragments instead of reading
+ *        references/manifest/ (a simulated state: the fragments as they would
+ *        be after a de-registration).
+ * @param {Function} [options.exists]  The existence test for path inference.
+ * @param {boolean} [options.quiet]  Do not log the merge (an audit or a
+ *        simulation is not a compile).
  * @returns {{ manifest: object, fragmentLinkages: Array, fragmentStats: object, fragmentsSkipped: Array }}
  */
-export function loadMergedManifest(paths, readJsonFile) {
+export function loadMergedManifest(paths, readJsonFile, options = {}) {
+  const quiet = options && options.quiet === true;
   const manifest = readJsonFile(paths.manifestFile, { modules: [], mandatory_for_triggers: {}, tag_web: {}, budget: {} });
   manifest.modules = manifest.modules || [];
   manifest.mandatory_for_triggers = manifest.mandatory_for_triggers || {};
@@ -244,7 +258,7 @@ export function loadMergedManifest(paths, readJsonFile) {
     const newModules = appendManifest.modules.filter(m => m && m.id && !existingIds.has(m.id));
     if (newModules.length > 0) {
       manifest.modules = [...manifest.modules, ...newModules];
-      log('info', `loadMergedManifest: MANIFEST_APPEND merged ${newModules.length} new modules: ${newModules.map(m => m.id).join(', ')}`);
+      if (!quiet) log('info', `loadMergedManifest: MANIFEST_APPEND merged ${newModules.length} new modules: ${newModules.map(m => m.id).join(', ')}`);
     }
     if (appendManifest.mandatory_for_triggers) {
       for (const [trigger, moduleIds] of Object.entries(appendManifest.mandatory_for_triggers)) {
@@ -260,8 +274,14 @@ export function loadMergedManifest(paths, readJsonFile) {
   }
 
   // --- Fragment merge ---
-  const { fragments, skipped } = loadManifestFragments(paths.avaDir);
-  const fragmentStats = mergeFragmentsIntoManifest(manifest, fragments, paths.avaDir);
+  const { fragments, skipped } = (options && Array.isArray(options.fragments))
+    ? { fragments: options.fragments, skipped: [] }
+    : loadManifestFragments(paths.avaDir);
+  const fragmentStats = mergeFragmentsIntoManifest(manifest, fragments, paths.avaDir,
+    (options && typeof options.exists === 'function') ? options.exists : existsSync);
+  if (quiet) {
+    return { manifest, fragmentLinkages: fragmentDispatchToLinkages(fragments), fragmentStats, fragmentsSkipped: skipped };
+  }
   if (fragmentStats.added.length) {
     log('info', `loadMergedManifest: fragments merged ${fragmentStats.added.length} modules from references/manifest/: ${fragmentStats.added.join(', ')}`);
   }
@@ -301,7 +321,7 @@ function tokensOf(text) {
  * comma-separated lists, inline arrays, and block list items. PyYAML is not
  * available in the connector image, so this is stdlib-only.
  */
-function parseModuleFrontmatter(content) {
+export function parseModuleFrontmatter(content) {
   const result = { provides: [], triggers: { keywords: [], phrases: [], task_class: [] } };
   const text = String(content || '');
   const normalised = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -351,6 +371,10 @@ function parseModuleFrontmatter(content) {
         result.triggers.task_class = cleaned.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
       } else if (currentKey === 'id') {
         result.id = cleaned;
+      } else if (currentKey === 'version') {
+        // v13.38.0: read for skill_consistency_audit C-I (version drift).
+        // deriveModuleEntry does not use it, so registration is unchanged.
+        result.version = cleaned;
       } else if (currentKey === 'category') {
         result.category = cleaned;
       } else if (currentKey === 'always_load') {

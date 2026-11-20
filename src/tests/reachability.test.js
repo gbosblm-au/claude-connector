@@ -102,6 +102,27 @@ const AUDITED = [
       + 'module set from the volume and the gateway times out.',
     expect: [ 'src/tools/skill-modular.js' ],
   },
+  // v13.38.0 (WO-2026-11-20-03 D3). One resolver, used by the compile and the
+  // audit. Unreached from either, the delete guard protects a copy that is not
+  // the one loaded, which is the failure the order exists to prevent.
+  {
+    name: 'resolveModulePath',
+    definedIn: 'src/tools/module-files.js',
+    why: 'D3: skill_compile, skill_audit and module_delete must ask one resolver which file a module id is.',
+    expect: [ 'src/tools/skill-modular.js', 'src/tools/skill.js' ],
+  },
+  {
+    name: 'handleModuleDelete',
+    definedIn: 'src/tools/module-file-tools.js',
+    why: 'R1: the guarded quarantine. Defined and never dispatched, the tool is advertised and every call is Unknown tool.',
+    expect: [ 'src/server-http.js' ],
+  },
+  {
+    name: 'handleSkillConsistencyAudit',
+    definedIn: 'src/tools/module-consistency.js',
+    why: 'D7: the cross-module audit. Unreached, the checks exist and nothing can run them.',
+    expect: [ 'src/server-http.js' ],
+  },
 ];
 
 /** Directories searched for callers. */
