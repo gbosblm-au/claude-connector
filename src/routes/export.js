@@ -10,6 +10,8 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { log } from '../utils/logger.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from '../utils/processGuard.js';
 
 const EXPORT_BASE = '/data/skill/ava';
 
@@ -37,7 +39,9 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
             count += 1
 print(f'{count} files')
 `;
-      execSync(`python3 -c "${script.replace(/\n/g, '; ')}"`, { timeout: 30000 });
+      const inlineCommand = `python3 -c "${script.replace(/\n/g, '; ')}"`;
+      assertLaunchAllowed('export.python_inline', inlineCommand, [], { shell: true });
+      execSync(inlineCommand, { timeout: 30000 });
 
       if (!fs.existsSync(zipPath)) {
         return res.status(500).json({ error: 'Failed to create ZIP' });

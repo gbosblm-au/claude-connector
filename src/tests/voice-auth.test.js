@@ -113,13 +113,14 @@ const identity   = (userId, tenantId) => {
   if (tenantId) h['X-Tenax-Tenant-Id'] = tenantId;
   return h;
 };
+// v13.37.0 (TENAX-VOICE-2026-10-07-02): the gateway's per-request claim that
+// this user is entitled, which /voice/health renders from.
+const entitled   = (userId, tenantId) => ({ ...identity(userId, tenantId), 'X-Tenax-Voice-Entitlement': 'entitled' });
 
 const VOICE_ON = {
   MCP_API_KEY: MCP_KEY,
   RAILWAY_RESTORE_TOKEN: RESTORE_TOKEN,
   VOICE_ENABLED: 'on',
-  VOICE_ALLOWLIST_SOURCE: 'env',
-  VOICE_TEST_USERS: 'ava:38',
   // Absolute and absent, so the TTS probe answers deterministically here
   // instead of depending on what the test machine happens to have installed.
   VOICE_PIPER_BIN: '/nonexistent/piper',
@@ -199,7 +200,7 @@ test('REGRESSION: the gateway reaches voice with the restore token alone', async
       // Before v12.50.0 it was 401, so connector_ready was false forever and
       // the mic button never mounted.
       const r = await fetch(`${base}/voice/health`, {
-        headers: { ...asGateway(), ...identity('38', 'ava') },
+        headers: { ...asGateway(), ...entitled('38', 'ava') },
       });
       assert.equal(r.status, 200);
 
@@ -230,7 +231,7 @@ test('REGRESSION: an authorised transcribe is no longer refused as unauthenticat
         // What it becomes is a validation answer about the audio (this body is
         // not a real WAV). What it must never again be is 401.
         assert.notEqual(r.status, 401, `${who} must not be told it is unauthenticated`);
-        assert.equal(r.status === 404, false, `${who} is allowlisted and must pass the gate`);
+        assert.equal(r.status === 404, false, `${who} sent an identity and must pass the gate`);
       }
     } finally {
       await close();
@@ -239,7 +240,7 @@ test('REGRESSION: an authorised transcribe is no longer refused as unauthenticat
 });
 
 // ===========================================================================
-test('an uncredentialled caller is refused, allowlisted or not', async () => {
+test('an uncredentialled caller is refused, identified or not', async () => {
   await withEnv(VOICE_ON, async () => {
     const { base, close } = await listenWithAuthGate();
     try {
@@ -278,16 +279,16 @@ test('an uncredentialled upload is drained and answered, not reset mid-stream', 
   });
 });
 
-test('the feature gate still 404s a credentialled but non-allowlisted caller', async () => {
+test('the feature gate still 404s a credentialled caller that sends no identity', async () => {
   await withEnv(VOICE_ON, async () => {
     const { base, close } = await listenWithAuthGate();
     try {
-      // Exemption from the MCP key is not exemption from the gate. Holding the
-      // operator key does not put an arbitrary user on the allowlist, and the
-      // refusal is still the indistinguishable 404, never a 403.
+      // Exemption from the MCP key is not exemption from the gate. A credential
+      // says which MACHINE is calling; with no X-Tenax-User-Id there is no
+      // person, and the refusal is still the indistinguishable 404, never a 403.
       const r = await fetch(`${base}/voice/transcribe`, {
         method: 'POST',
-        headers: { ...asOperator(), ...identity('99', 'ava'), 'Content-Type': 'audio/wav' },
+        headers: { ...asOperator(), 'Content-Type': 'audio/wav' },
         body: Buffer.alloc(1024),
       });
       assert.equal(r.status, 404);
@@ -303,9 +304,8 @@ test('health explains a refusal to the operator and to nobody else', async () =>
   await withEnv(VOICE_ON, async () => {
     const { base, close } = await listenWithAuthGate();
     try {
-      // The reported case: master switch on, tenant-qualified allowlist entry,
-      // and a caller sending only the user header. The body must still look
-      // exactly like "voice is off" ...
+      // Master switch on, an identity, and no entitlement claim from the
+      // gateway. The body must still look exactly like "voice is off" ...
       const r = await fetch(`${base}/voice/health`, {
         headers: { ...asOperator(), ...identity('38') },
       });
@@ -319,14 +319,11 @@ test('health explains a refusal to the operator and to nobody else', async () =>
       const d = body.operator_diagnostics;
       assert.ok(d, 'the operator must be told why');
       assert.equal(d.master_switch, true);
-      assert.equal(d.denied_reason, 'identity_not_allowlisted');
+      assert.equal(d.denied_reason, 'not_entitled_by_gateway');
+      assert.equal(d.entitlement_claimed, false);
       assert.equal(d.identity_seen.user_id, '38');
-      assert.equal(d.identity_seen.tenant_id, null,
-        'the missing tenant header is the whole cause and must be visible');
-
-      // Never the entries themselves: they are account identifiers.
-      assert.equal(JSON.stringify(body).includes('ava:38'), false);
-      assert.equal(d.allowlist.count, 1, 'a count, not a list');
+      assert.equal(d.identity_seen.tenant_id, null);
+      assert.equal(d.allowlist, undefined, 'there is no allowlist to describe');
     } finally {
       await close();
     }
@@ -338,7 +335,7 @@ test('health names the master switch when that is what refused the caller', asyn
     const { base, close } = await listenWithAuthGate();
     try {
       const r = await fetch(`${base}/voice/health`, {
-        headers: { ...asOperator(), ...identity('38', 'ava') },
+        headers: { ...asOperator(), ...entitled('38', 'ava') },
       });
       const body = await r.json();
       assert.equal(body.enabled, false, 'the kill switch still wins over everything');
@@ -373,7 +370,7 @@ test('the TTS probe survives the pinned engine, which has no --version', async (
     const { base, close } = await listenWithAuthGate();
     try {
       const body = await (await fetch(`${base}/voice/health`, {
-        headers: { ...asOperator(), ...identity('38', 'ava') },
+        headers: { ...asOperator(), ...entitled('38', 'ava') },
       })).json();
 
       // VOICE_PIPER_BIN points at nothing here, so the probe must say WHICH
@@ -400,7 +397,7 @@ test('the STT probe reports the helper\'s own error instead of "probe failed"', 
     const { base, close } = await listenWithAuthGate();
     try {
       const body = await (await fetch(`${base}/voice/health`, {
-        headers: { ...asOperator(), ...identity('38', 'ava') },
+        headers: { ...asOperator(), ...entitled('38', 'ava') },
       })).json();
 
       // voice_stt.py writes its {error, code} to STDOUT and exits non-zero. The

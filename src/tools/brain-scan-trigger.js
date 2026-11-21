@@ -58,6 +58,8 @@ import { join, resolve as resolvePath, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { buildScriptEnv } from '../utils/scriptEnv.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from '../utils/processGuard.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -251,6 +253,7 @@ export async function runBrainScan(options = {}) {
     };
 
     try {
+      assertLaunchAllowed('brain_scan.python', PYTHON_BIN, args);
       child = spawn(PYTHON_BIN, args, {
         cwd: SCRIPTS_DIR,
         // v12.28.0 (TNX-C-004): this module spawned Python with the connector's

@@ -22,7 +22,7 @@
 //   POST /voice/synthesize -> 401  -> passed through to the browser
 //
 // The mic button therefore never rendered, no matter what VOICE_ENABLED and
-// VOICE_TEST_USERS were set to. The symptom looked like a feature flag being
+// the allowlist of the day were set to. The symptom looked like a feature flag being
 // ignored; the cause was a credential the caller cannot present.
 //
 // The fix mirrors the pattern already used by /volume-restore, /restore-skill,
@@ -49,8 +49,9 @@
 //
 // Neither credential says anything about WHICH USER is calling. That remains
 // the job of voice-gate.js, reading X-Tenax-User-Id / X-Tenax-Tenant-Id. This
-// module answers "may this MACHINE talk to the voice routes at all"; the gate
-// answers "may this PERSON use voice". Both must pass.
+// module answers "may this MACHINE talk to the voice routes at all"; whether
+// this PERSON may use voice is the gateway's per-request entitlement (v13.37.0,
+// TENAX-VOICE-2026-10-07-02), decided before it forwards anything.
 //
 // ===========================================================================
 // WHY THE BODY IS DRAINED BEFORE A 401

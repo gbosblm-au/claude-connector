@@ -21,6 +21,8 @@ import { getSelfModelDb, getSelfModelDbPath, isSelfModelEnabled } from "../tools
 import { log } from "../utils/logger.js";
 
 import { buildScriptEnv } from "../utils/scriptEnv.js";
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from "../utils/processGuard.js";
 const SCRIPTS_BASE = process.env.SCRIPTS_DIR
   ? resolvePath(process.env.SCRIPTS_DIR)
   : resolvePath("/data/skill/ava/scripts");
@@ -80,6 +82,7 @@ export async function handleNudgeAnalyze(args = {}) {
   const dbPath = getSelfModelDbPath();
 
   try {
+    assertLaunchAllowed("nudge.python", pythonBin(), [prioritizerPath, "--analyze", "--db", dbPath]);
     const result = spawnSync(
       pythonBin(),
       [prioritizerPath, "--analyze", "--db", dbPath],
