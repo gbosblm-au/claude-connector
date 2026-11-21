@@ -61,7 +61,13 @@ import { resolveContained } from '../utils/pathContainment.js';
 // SPEC-TNX-150BLOCK: hard block on oversized interactive writes.
 import { checkChunkLimit } from '../utils/chunkGuard.js';
 import { log } from '../utils/logger.js';
-import { deriveModuleEntry, writeModuleFragment } from './manifest-fragments.js';
+import { deriveModuleEntry, writeModuleFragment, loadMergedManifest } from './manifest-fragments.js';
+// TENAX-2026-10-15-01 H-2 (store write discipline), H-3 (module ledger) and the
+// module intake. Restored: these imports were dropped when the WO-2026-11-21-01
+// patch was merged into this branch, while the code that calls them was kept.
+import { guardStoreWrite, beginBulkRewrite } from '../utils/storeWriteDiscipline.js';
+import { appendLedgerEntry, fileDigest, contentDigest, actorFrom } from '../utils/moduleLedger.js';
+import { runIntake, readIntakeRecord, writeIntakeRecord, registerModuleWithIntake } from './module-intake.js';
 // v13.39.0 (WO-2026-11-21-01 R1-R5): module_write asks the shared resolver,
 // the one skill_compile uses, before it opens any file.
 import { moduleWriteGuard, modularPathsForAvaDir, REFUSAL as MODULE_REFUSAL } from './module-files.js';

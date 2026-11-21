@@ -52,6 +52,9 @@ import {
   statSync,
 } from 'node:fs';
 import { log } from '../utils/logger.js';
+// TENAX-2026-10-15-01 H-3: skill-file mutations are ledgered. Restored: dropped
+// when the WO-2026-11-21-01 patch was merged into this branch.
+import { appendLedgerEntry, fileDigest, contentDigest, actorFrom } from '../utils/moduleLedger.js';
 // v13.38.0 (WO-2026-11-20-03 R4, R5, D6, D10): skill_audit groups the files by
 // module id through the one resolver the compile also uses.
 import {

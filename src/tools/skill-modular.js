@@ -1686,6 +1686,11 @@ export async function handleModulesRestoreFromWp(body) {
   const files = body.files || {};
   const results = {};
 
+  // R15: a path in the event log's own form ("modules/<...>": forward slashes,
+  // no doubled separators, no leading "./" or "/"), so a spelling variant such
+  // as "//modules/x.md" cannot slip past the quarantine check or the claim.
+  const logFormOf = (s) => s.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.\/)+/, '').replace(/^\/+/, '');
+
   // v13.39.0 (WO-2026-11-21-01 R15): a mirror push must not undo a quarantine.
   // Before restoring any path under modules/, read the module file event log
   // and skip a path whose most recent event is 'quarantined' with no later
@@ -1703,6 +1708,35 @@ export async function handleModulesRestoreFromWp(body) {
     log('error', `restore-modules: the module file event log could not be read (${err.message}); modules/ paths will be skipped`);
   }
 
+  // TENAX-2026-10-15-01 H-2: a WordPress push rewrites the stores it touches,
+  // so it claims each of them (modules/, references/, archive/, scripts/) for
+  // its duration, exactly as the content restores do (skill-content.js
+  // buildRestoreHandler). A path in no store family, such as CORE.md, claims
+  // nothing. If another holder has claimed a family, nothing is written: the
+  // payload is captured to forensics and the refusal names the holder.
+  // Restored: this claim and its release were lost when the WO-2026-11-21-01
+  // patch was merged into this branch.
+  const pushed = Object.entries(files).filter(([, c]) => typeof c === 'string');
+  // The same normalisation the loop below compares in (logFormOf), so a path
+  // claims the family it is actually written into.
+  const familyOf = (rel) => {
+    const top = logFormOf(rel.replace(/\.\./g, '').replace(/^[\/\\]/, '')).split('/')[0];
+    return CONNECTOR_STORE_FAMILIES.includes(top) ? top : null;
+  };
+  const bulk = beginBulkRewrite({
+    families: pushed.map(([rel]) => familyOf(rel)).filter(Boolean),
+    kind:     'restore',
+    label:    'wordpress-restore',
+    purpose:  `restore-modules from ${String(body.source || 'wordpress-push').slice(0, 60)} (${pushed.length} files)`,
+    payload:  pushed.filter(([rel]) => familyOf(rel)).map(([rel, c]) => ({ family: familyOf(rel), rel, content: c })),
+    tool:     'restore-modules',
+    actor:    String(body.source || 'wordpress-push').slice(0, 60),
+  });
+  if (!bulk.ok) {
+    log('warn', `restore-modules: REFUSED, ${bulk.refusal.message}`);
+    return { success: false, error: bulk.refusal.message, refusal: bulk.refusal, files_restored: 0, files_failed: pushed.length, files_skipped: 0, skipped: [], ava_dir: paths.avaDir, tenant_mode: paths.isTenantMode, results };
+  }
+  try {
   for (const [relativePath, fileContent] of Object.entries(files)) {
     if (typeof fileContent !== 'string') continue;
     // Sanitise path - no .. traversal, no leading slash
@@ -1711,7 +1745,7 @@ export async function handleModulesRestoreFromWp(body) {
 
     // R15: compare in the event log's own form ("modules/<...>", no "./", no
     // doubled separators), so a spelling variant cannot slip past the check.
-    const logForm = safe.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.\/)+/, '');
+    const logForm = logFormOf(safe);
     // D15 / R11: the record and the quarantine are not mirror targets. A push
     // that wrote module-history/ could rewrite the record of a purge; one that
     // wrote quarantine/ could plant a file a later restore would move back.
@@ -1764,6 +1798,9 @@ export async function handleModulesRestoreFromWp(body) {
       results[relativePath] = { success: false, error: err.message, path: fullPath };
       log('error', `restore-modules: FAILED to write ${fullPath}: ${err.message}`);
     }
+  }
+  } finally {
+    bulk.release();
   }
 
   const successCount = Object.values(results).filter(r => r.success).length;
