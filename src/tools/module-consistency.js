@@ -37,6 +37,18 @@
 //   R18 C-H grouped by module pair, ranked, top 20, generic triggers apart.
 //   R19 C-I drift count, the worst 10, and field_unmaintained.
 //   G2  C-A manifest entries without a file grouped by source fragment.
+//
+// v13.39.x (WO-2026-11-21-02), still reporting only:
+//   S1  C-L "derived registration quality" (advisory, never blocks): stopword
+//       phrases, path-segment keywords, stale version, line count off by more
+//       than 20 per cent, provides values with a space, and U+FFFD or a double
+//       space in a fragment string.
+//   S2  C-F judges each duplicate: a defect when more than one registration was
+//       created by module_write (or module_write added one beside a frozen
+//       manifest's), told apart from registrations that predate the tool.
+//   R1-R4 registration_repair_report (on request): every fragment registration
+//       that looks auto-derived, with a proposed corrected entry. It proposes;
+//       it never applies. Each repair is Brian's decision, one module at a time.
 // ---------------------------------------------------------------------------
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -51,13 +63,24 @@ import {
 } from './module-files.js';
 import { groupedModuleAudit } from './skill.js';
 import { getModularPaths } from './skill-modular.js';
+import {
+  inferModulePath,
+  pathSegmentsOf,
+  keywordLintReason,
+  phraseLintReasons,
+  phraseEndsWithStopword,
+  deriveRegistration,
+  readRegistrationFrontmatter,
+  REGISTERED_BY_MODULE_WRITE,
+} from './manifest-fragments.js';
+import { readAllLedgerEntries } from '../utils/moduleLedger.js';
 
 /** The compile inputs whose canonical copy sits at the top of avaDir. */
 const COMPILE_INPUTS = Object.freeze(['CORE.md', 'MANIFEST.json', 'DISPATCH_RULES.json']);
 
 /** Check names by section (D9). */
 export const DETERMINISTIC_CHECKS = Object.freeze(['C-A', 'C-B', 'C-C', 'C-D', 'C-F']);
-export const ADVISORY_CHECKS = Object.freeze(['C-E', 'C-G', 'C-H', 'C-I']);
+export const ADVISORY_CHECKS = Object.freeze(['C-E', 'C-G', 'C-H', 'C-I', 'C-L']);
 export const JUDGMENT_CHECKS = Object.freeze(['C-J', 'C-K']);
 /** R10: deterministic checks whose unregistered findings are blocking by default. */
 export const BLOCKING_BY_DEFAULT = Object.freeze(['C-A', 'C-C', 'C-D']);
@@ -263,30 +286,85 @@ function checkD(snapshot) {
   };
 }
 
-/** C-F: one id registered in more than one place. */
+/** The key set module_write's derived entry had before WO-2026-11-21-02 (S2 attribution of old registrations). */
+const LEGACY_DERIVED_KEYS = Object.freeze(['id', 'title', 'version', 'category', 'path', 'load_priority', 'triggers',
+  'depends_on', 'provides', 'load_strategy', 'line_count_estimate', 'always_load']);
+
+/** module_write's fragment registrations, from the H-3 ledger: "<module id>|<fragment file>". */
+function ledgerFragmentRegistrations() {
+  const out = new Set();
+  let entries = [];
+  try { entries = readAllLedgerEntries(); } catch { return out; }
+  for (const e of entries) {
+    if (!e || e.kind !== 'fragment' || e.action !== 'register' || !e.extra || !e.extra.module_id || typeof e.path !== 'string') continue;
+    out.add(`${e.extra.module_id}|${e.path.split('/').pop()}`);
+  }
+  return out;
+}
+
+/**
+ * S2: who created a registration. MANIFEST.json and MANIFEST_APPEND.json are
+ * never written by module_write. A fragment entry is module_write's when it
+ * carries the registered_by marker, when the H-3 ledger records module_write
+ * registering this id in this fragment, or (for entries older than both) when
+ * its key set is exactly the derived entry's. Anything else predates the tool
+ * or was written by hand.
+ */
+function registrationAuthor(reg, ledgerRegs) {
+  if (reg.kind !== 'manifest_fragment') {
+    return { created_by: 'not_module_write', evidence: `${reg.source} is never written by module_write` };
+  }
+  const e = reg.entry || {};
+  if (e.registered_by === REGISTERED_BY_MODULE_WRITE) return { created_by: 'module_write', evidence: 'registered_by marker', confidence: 'high' };
+  const file = reg.source.replace(/^references\/manifest\//, '');
+  if (ledgerRegs.has(`${reg.id}|${file}`)) return { created_by: 'module_write', evidence: 'H-3 ledger: module_write registered this id in this fragment', confidence: 'high' };
+  const keys = Object.keys(e).filter((k) => !k.startsWith('_'));
+  if (LEGACY_DERIVED_KEYS.every((k) => keys.includes(k)) && keys.every((k) => LEGACY_DERIVED_KEYS.includes(k))) {
+    return { created_by: 'module_write', evidence: 'exactly the key set of module_write\'s derived entry before WO-2026-11-21-02 (inferred: no marker and no ledger record)', confidence: 'medium' };
+  }
+  return { created_by: 'predates_tool_or_hand_made', evidence: 'no registered_by marker, no ledger record, and not the derived-entry key set' };
+}
+
+/** C-F: one id registered in more than one place, judged (S2). */
 function checkF(snapshot, resolutions) {
   const byId = new Map();
   for (const r of snapshot.registrations) {
     if (!byId.has(r.id)) byId.set(r.id, []);
     byId.get(r.id).push(r);
   }
+  const ledgerRegs = ledgerFragmentRegistrations();
   const findings = [];
   for (const [id, regs] of [...byId.entries()].sort((x, y) => x[0].localeCompare(y[0]))) {
     const sources = [...new Set(regs.map((r) => r.source))];
     if (sources.length < 2 && regs.length < 2) continue;
     const res = resolutions.find((r) => r.id === id) || {};
+    const attributed = regs.map((r) => ({ source: r.source, path: r.path, declared_path: r.declared_path, ...registrationAuthor(r, ledgerRegs) }));
+    const byTool = attributed.filter((a) => a.created_by === 'module_write').length;
+    const frozen = regs.some((r) => r.kind === 'manifest' || r.kind === 'manifest_append');
+    const judgement = byTool > 1 ? 'defect_minted_on_write'
+      : (byTool === 1 && frozen) ? 'defect_fragment_beside_frozen_manifest'
+        : 'predates_tool';
     findings.push({
       id,
-      registrations: regs.map((r) => ({ source: r.source, path: r.path, declared_path: r.declared_path })),
+      registrations: attributed,
       fragments: regs.filter((r) => r.kind === 'manifest_fragment').map((r) => r.source),
       winning_source: res.resolved_from || null,
-      note: 'Removing one registration leaves the module present through the others.',
+      registrations_by_module_write: byTool,
+      defect: judgement !== 'predates_tool',
+      judgement,
+      judgement_reason: judgement === 'defect_minted_on_write'
+        ? `${byTool} registrations of this id were created by module_write: a write minted a further registration instead of updating the existing one (WO-2026-11-21-02 D2). module_write now updates in place (Q2) or refuses (Q3).`
+        : judgement === 'defect_fragment_beside_frozen_manifest'
+          ? 'module_write added a fragment registration for an id a frozen manifest already registers; it now writes none (Q4).'
+          : 'at most one registration was created by module_write and none sits beside a frozen manifest: the duplication predates the tool or was made by hand.',
+      note: 'Reported, never removed: removing a duplicate registration is a dispatch-layer amendment and a per-id human decision (WO-2026-11-21-02 section 6). The question is why a write created a second registration, not whether removing one is safe.',
     });
   }
   return {
     name: 'Duplicate manifest registration of one id across sources',
     severity: 'medium',
     pass: findings.length === 0,
+    defects: findings.filter((f) => f.defect).length,
     findings,
   };
 }
@@ -517,6 +595,174 @@ function checkI(snapshot, resolutions) {
     },
     findings: [...worst, ...versionFindings],
     version_drift_count: versionFindings.length,
+  };
+}
+
+/** C-L: string fields where a name is expected (a double space there is a lost character). */
+const NAME_KEYS = new Set(['id', 'title', 'category', 'keywords', 'phrases', 'task_class', 'provides', 'depends_on', 'module_to_add']);
+
+/** A fragment entry's path: declared, else the one the merge infers. */
+function entryPathOf(snapshot, entry) {
+  return entry.path || inferModulePath(snapshot.paths.avaDir, entry, snapshot.exists || existsSync) || null;
+}
+
+/**
+ * C-L (S1): derived registration quality, over every module entry in every
+ * references/manifest fragment and every string in those fragments. Advisory:
+ * it never blocks and is never added to the deterministic results.
+ */
+export function checkL(snapshot) {
+  const findings = [];
+  const fragments = snapshot.registrations.fragments || [];
+  let entries = 0;
+  for (const frag of fragments) {
+    const source = `references/manifest/${frag.file}`;
+    for (const m of frag.modules) {
+      entries += 1;
+      const id = String(m.id);
+      const path = entryPathOf(snapshot, m);
+      const segments = path ? pathSegmentsOf(path) : new Set();
+      const t = m.triggers && typeof m.triggers === 'object' ? m.triggers : {};
+      for (const p of (Array.isArray(t.phrases) ? t.phrases : [])) {
+        if (typeof p === 'string' && phraseEndsWithStopword(p)) findings.push({ kind: 'stopword_phrase', source, id, value: p, detail: 'the phrase ends in a stopword' });
+      }
+      for (const k of (Array.isArray(t.keywords) ? t.keywords : [])) {
+        if (typeof k !== 'string') continue;
+        const why = keywordLintReason(k, segments);
+        if (why && why !== 'empty') findings.push({ kind: segments.has(k.trim().toLowerCase()) ? 'path_segment_keyword' : 'forbidden_keyword', source, id, value: k, path, detail: why });
+      }
+      const f = path ? snapshot.scan.files.find((x) => x.path === path) : null;
+      if (f) {
+        const fmVersion = f.frontmatter && f.frontmatter.version;
+        if (m.version !== undefined && m.version !== null && fmVersion && String(m.version) !== String(fmVersion)) {
+          findings.push({ kind: 'stale_version', source, id, value: String(m.version), frontmatter_version: String(fmVersion), path, detail: 'the registration\'s version differs from the module\'s frontmatter' });
+        }
+        if (typeof m.line_count_estimate === 'number' && f.lines > 0 && Math.abs(m.line_count_estimate - f.lines) / f.lines > 0.2) {
+          findings.push({ kind: 'line_count_drift', source, id, value: m.line_count_estimate, actual_lines: f.lines, path,
+            detail: `line_count_estimate ${m.line_count_estimate} differs from the file's ${f.lines} lines by more than 20 per cent` });
+        }
+      }
+      for (const v of (Array.isArray(m.provides) ? m.provides : [])) {
+        if (typeof v === 'string' && /\s/.test(v.trim())) findings.push({ kind: 'provides_not_a_token', source, id, value: v, detail: 'a provides value with a space: a heading or a phrase, not a capability token' });
+      }
+    }
+    // Every string in the fragment: a replacement character anywhere, a double space where a name is expected.
+    const walk = (value, where, key) => {
+      if (typeof value === 'string') {
+        if (value.includes('\uFFFD')) findings.push({ kind: 'replacement_character', source, where, value, detail: 'contains U+FFFD: a character was lost when this was written' });
+        else if (NAME_KEYS.has(key) && value.includes('  ')) findings.push({ kind: 'double_space', source, where, value, detail: 'a double space where a name is expected: a character may have been dropped' });
+      } else if (Array.isArray(value)) {
+        value.forEach((v, i) => walk(v, `${where}[${i}]`, key));
+      } else if (value && typeof value === 'object') {
+        for (const [k, v] of Object.entries(value)) walk(v, where ? `${where}.${k}` : k, k);
+      }
+    };
+    walk({ modules: frag.modules, references: frag.references, dispatch_rules: frag.dispatch_rules,
+      mandatory_for_triggers: frag.mandatory_for_triggers, tag_web: frag.tag_web }, '', null);
+  }
+  const byKind = {};
+  for (const x of findings) byKind[x.kind] = (byKind[x.kind] || 0) + 1;
+  return {
+    name: 'Derived registration quality',
+    severity: 'low',
+    advisory: true,
+    blocks: false,
+    scope: 'every module entry in references/manifest/*.json, and every string in those fragments',
+    fragments_read: fragments.length,
+    entries_read: entries,
+    finding_count: findings.length,
+    by_kind: byKind,
+    findings,
+    note: 'Advisory: C-L never blocks. Phrase and keyword findings use the rules module_write now applies on write (WO-2026-11-21-02 P4, P5); a keyword is a path segment when it equals a directory on the module\'s path or its file name.',
+  };
+}
+
+/**
+ * R1-R4: the registration repair report. Read-only: it proposes and never applies.
+ *
+ *   R1  selected: every fragment registration with triggers_source absent or
+ *       "derived", or with a phrase failing the P5 lint.
+ *   R2  proposed: the entry module_write would now derive from the module's own
+ *       frontmatter (frontmatter triggers where there are any, otherwise empty
+ *       with a warning).
+ *   R3  each module needs Brian's approval, put to him once with this evidence.
+ *   R4  an entry that already passes every rule (a hand correction) is listed
+ *       with no change proposed, so the report never proposes reverting one.
+ */
+export function registrationRepairReport(snapshot, cl = checkL(snapshot)) {
+  const rows = [];
+  const regs = snapshot.registrations;
+  for (const r of regs) {
+    if (r.kind !== 'manifest_fragment') continue;
+    const e = r.entry || {};
+    const ts = e.triggers_source;
+    const t = e.triggers && typeof e.triggers === 'object' ? e.triggers : {};
+    const phrases = (Array.isArray(t.phrases) ? t.phrases : []).filter((p) => typeof p === 'string');
+    const phraseFailures = phrases.map((p) => ({ phrase: p, reasons: phraseLintReasons(p, phrases) })).filter((x) => x.reasons.length);
+    if (!(ts === undefined || ts === null || ts === 'derived' || phraseFailures.length)) continue;
+
+    const path = entryPathOf(snapshot, e);
+    const segments = path ? pathSegmentsOf(path) : new Set();
+    const keywordFailures = (Array.isArray(t.keywords) ? t.keywords : []).filter((k) => typeof k === 'string')
+      .map((k) => ({ keyword: k, reason: keywordLintReason(k, segments) })).filter((x) => x.reason);
+    const quality = cl.findings.filter((x) => x.source === r.source && x.id === r.id);
+    const defects = phraseFailures.length + keywordFailures.length + quality.length;
+    const frozen = regs.filter((x) => x.id === r.id && (x.kind === 'manifest' || x.kind === 'manifest_append')).map((x) => x.source);
+    const atPath = regs.filter((x) => x.id === r.id && x.kind === 'manifest_fragment' && entryPathOf(snapshot, x.entry || {}) === path);
+    const updatedByModuleWrite = !frozen.length && atPath.length > 0 && atPath[0].source === r.source;
+    const f = path ? snapshot.scan.files.find((x) => x.path === path) : null;
+
+    let proposed = null;
+    let proposalNote;
+    if (!defects) {
+      proposalNote = 'No change proposed: the entry passes every P4, P5 and C-L rule (a hand correction, R4, or a clean entry without the marker).';
+    } else if (!f) {
+      proposalNote = `No proposal: no module file at ${path || '(no path)'}, so there is no frontmatter to derive from.`;
+    } else {
+      const d = deriveRegistration(path.replace(/^modules\//, ''), f.text, {}, {});
+      const fm = readRegistrationFrontmatter(f.text);
+      proposed = {
+        triggers: d.entry.triggers,
+        triggers_source: d.entry.triggers_source,
+        provides: d.entry.provides,
+        title: d.entry.title,
+        ...(d.entry.version !== undefined ? { version: d.entry.version } : {}),
+        line_count_estimate: d.entry.line_count_estimate,
+        warnings: d.warnings.map((w) => w.message),
+        ...(d.refusal ? { refusal: d.refusal.message } : {}),
+      };
+      proposalNote = fm.has_triggers
+        ? 'Proposed from the module\'s frontmatter triggers.'
+        : 'The module has no frontmatter triggers: proposed with an empty trigger set (reachable by explicit load only), and a warning.';
+    }
+    rows.push({
+      id: r.id,
+      source: r.source,
+      path,
+      status: defects ? 'auto_derived_defects' : 'passes_lint_without_marker',
+      triggers_source: ts === undefined ? null : ts,
+      phrase_failures: phraseFailures,
+      keyword_failures: keywordFailures,
+      quality_findings: quality.map((x) => ({ kind: x.kind, value: x.value, detail: x.detail })),
+      current: { triggers: e.triggers || null, provides: e.provides || null, title: e.title || null, version: e.version ?? null, line_count_estimate: e.line_count_estimate ?? null },
+      proposed,
+      proposal_note: proposalNote,
+      ...(frozen.length ? { frozen_manifest: frozen, frozen_note: 'This id is registered in a frozen manifest, which the compile reads first; this fragment entry is shadowed. module_write writes no fragment for it (Q4), so applying a change here is an external edit.' } : {}),
+      approval_required: Boolean(defects),
+      apply_route: !defects ? null
+        : updatedByModuleWrite
+          ? 'After Brian approves this module: module_write with force: true on the module\'s current content, passing manifest_entry: { triggers, provides } as proposed (an explicit empty triggers object registers it with none). The registration is updated in place.'
+          : (frozen.length ? 'External: see frozen_note.' : 'This is not the registration module_write updates for this id and path (another comes first): a duplicate, whose removal is a per-id dispatch decision outside this order.'),
+    });
+  }
+  return {
+    read_only: true,
+    approval: 'No repair is applied without Brian\'s approval for that module (R3): triggers are dispatch-layer content, and a dispatch change is put to him once, as a question, with this evidence.',
+    selection: 'fragment registrations with triggers_source absent or "derived", or with a phrase failing the P5 lint (R1)',
+    selected: rows.length,
+    with_defects: rows.filter((x) => x.status === 'auto_derived_defects').length,
+    without_defects: rows.filter((x) => x.status === 'passes_lint_without_marker').length,
+    modules: rows,
   };
 }
 
@@ -849,6 +1095,8 @@ export function runConsistencyAudit(args = {}, paths = getModularPaths()) {
   if (on('C-G')) advisory['C-G'] = checkG(snapshot, resolutions);
   if (on('C-H')) advisory['C-H'] = checkH(snapshot, resolutions);
   if (on('C-I')) advisory['C-I'] = checkI(snapshot, resolutions);
+  const cl = (on('C-L') || args.registration_repair_report === true) ? checkL(snapshot) : null;
+  if (on('C-L')) advisory['C-L'] = cl;
 
   const judgment = {};
   if (on('C-J')) judgment['C-J'] = checkJ(snapshot, resolutions);
@@ -887,6 +1135,7 @@ export function runConsistencyAudit(args = {}, paths = getModularPaths()) {
     advisory,
     judgment,
     registered_module_ids: resolutions.filter((r) => r.registered).map((r) => r.id),
+    ...(args.registration_repair_report === true ? { registration_repair_report: registrationRepairReport(snapshot, cl) } : {}),
     note: 'Deterministic findings and advisory findings are separate sections and are never added together (D9). '
       + 'This tool changes nothing (D8); quarantining a file is module_delete, a separate and guarded call.',
   };
@@ -903,7 +1152,12 @@ export const skillConsistencyAuditToolDefinition = {
     + 'C-F one id registered in more than one place. Advisory, never added to the deterministic results: C-E the '
     + 'always-load total in bytes and estimated tokens against the ceiling; C-G provides against body content '
     + '(self-calibrated, dropped above 20% on a 10-module sample); C-H trigger collisions; C-I line_count_estimate and '
-    + 'version drift. Judgment: C-J one-sided disagreement records; C-K provenance contradictions from '
+    + 'version drift; C-L derived registration quality (stopword phrases, path-segment keywords, stale version, line count off '
+    + 'by more than 20%, provides with a space, U+FFFD or a double space in a fragment string). C-F also judges each duplicate: '
+    + 'a defect when more than one registration was created by module_write, told apart from registrations that predate the '
+    + 'tool. registration_repair_report: true adds a read-only report of auto-derived fragment registrations with a proposed '
+    + 'corrected entry for each; nothing is applied without Brian\'s per-module approval. '
+    + 'Judgment: C-J one-sided disagreement records; C-K provenance contradictions from '
     + 'vault_provenance_audit. Every run reports what it read; a run that read nothing reports unverified, never clean. '
     + 'deterministic.status is exactly one of clean (every requested check ran and passed), findings, not_run (no '
     + 'requested check executed, e.g. checks: ["C-E"]) or unverified (the floor failed), with requested, ran and '
@@ -918,6 +1172,7 @@ export const skillConsistencyAuditToolDefinition = {
     type: 'object',
     properties: {
       checks: { type: 'array', items: { type: 'string' }, description: 'Optional subset, e.g. ["C-A","C-B"]. Default: every check.' },
+      registration_repair_report: { type: 'boolean', description: 'Add the read-only registration repair report (WO-2026-11-21-02 R1-R4): every fragment registration that looks auto-derived, with a proposed corrected entry. Proposes only; each repair needs Brian\'s approval for that module. Default false.' },
     },
     required: [],
   },

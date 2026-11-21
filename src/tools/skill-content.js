@@ -61,7 +61,8 @@ import { resolveContained } from '../utils/pathContainment.js';
 // SPEC-TNX-150BLOCK: hard block on oversized interactive writes.
 import { checkChunkLimit } from '../utils/chunkGuard.js';
 import { log } from '../utils/logger.js';
-import { deriveModuleEntry, writeModuleFragment, loadMergedManifest } from './manifest-fragments.js';
+// WO-2026-11-21-02 phase P: the registration comes from the frontmatter or manifest_entry only.
+import { deriveRegistration, loadMergedManifest } from './manifest-fragments.js';
 // TENAX-2026-10-15-01 H-2 (store write discipline), H-3 (module ledger) and the
 // module intake. Restored: these imports were dropped when the WO-2026-11-21-01
 // patch was merged into this branch, while the code that calls them was kept.
@@ -70,7 +71,8 @@ import { appendLedgerEntry, fileDigest, contentDigest, actorFrom } from '../util
 import { runIntake, readIntakeRecord, writeIntakeRecord, registerModuleWithIntake } from './module-intake.js';
 // v13.39.0 (WO-2026-11-21-01 R1-R5): module_write asks the shared resolver,
 // the one skill_compile uses, before it opens any file.
-import { moduleWriteGuard, modularPathsForAvaDir, REFUSAL as MODULE_REFUSAL } from './module-files.js';
+// WO-2026-11-21-02 phase Q: and plans the registration over the same snapshot.
+import { moduleWriteGuard, registrationPlan, modularPathsForAvaDir, REFUSAL as MODULE_REFUSAL } from './module-files.js';
 
 // ---------------------------------------------------------------------------
 // Typed validation error
@@ -509,8 +511,22 @@ export const moduleWriteToolDefinition = {
     'v12.21.0: writing a .md module AUTOMATICALLY registers it in a manifest fragment under ' +
     'references/manifest/ (per MANIFEST_DIRECTORY_PROTOCOL.md), so skill_compile, skill_recompile, ' +
     'skill_load_specialist, and brain_scan catalog it immediately — no manual MANIFEST.json edit and ' +
-    'no manifest_rebuild.py run is required. Pass manifest_entry to control triggers/metadata; ' +
-    'otherwise a dispatchable entry is derived from the path and content. ' +
+    'no manifest_rebuild.py run is required. ' +
+    'REGISTRATION CONTENT (WO-2026-11-21-02): nothing is derived from the module body, its headings or its path. ' +
+    'triggers come from the frontmatter triggers: block (keywords, phrases, task_class) if present and non-empty, used verbatim, ' +
+    'else from manifest_entry.triggers, else the module is registered with NO triggers (triggers_source "none") and a warning: ' +
+    'it is then reachable by explicit specialist load only, not by dispatch. provides comes from frontmatter provides: (else ' +
+    'manifest_entry.provides, else empty with a warning); title from frontmatter title: (else manifest_entry.title, else the id); ' +
+    'version from frontmatter version: at every write; line_count_estimate from the file written. A keyword that is a segment ' +
+    'of the module\'s own path, or module/skill/note, is dropped; a phrase is dropped unless it has two or more words, at least ' +
+    '12 characters, no stopword at either end and is not part of another phrase on the module. Every drop is listed in ' +
+    'registration_warnings. A string that does not survive UTF-8 unchanged refuses the write (registration_encoding_loss). ' +
+    'An update with no triggers or provides supplied keeps the existing registration\'s triggers and provides unchanged. ' +
+    'REGISTRATION PLACE: an id already registered at this path is updated in place, never registered again; an id registered ' +
+    'in MANIFEST.json or MANIFEST_APPEND.json gets no fragment registration (the reply names the frozen manifest; updating it is ' +
+    'an external decision); an id registered at a different path is REFUSED (code id_registered_elsewhere) naming every ' +
+    'registration and its path, unless acknowledge_existing_registration names the fragment registration to update; a new id ' +
+    'goes into its category\'s existing fragment. ' +
     'Only .md module files are registered as dispatchable modules; a .json module file is written as data ' +
     'and is intentionally NOT registered, so skill_compile / skill_load_specialist will not dispatch it. ' +
     'Backs up the updated file to WordPress after a successful write.\n\n' +
@@ -535,11 +551,12 @@ export const moduleWriteToolDefinition = {
       content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change (used for WP backup metadata). Optional.' },
       force:       { type: 'boolean', description: 'Set to true to confirm overwrite of an EXISTING file. Only accepted after Brian has been notified and has explicitly confirmed the overwrite. Do NOT pass true speculatively. Default: false.' },
-      manifest_entry: { type: 'object', description: 'Optional manifest module entry (MANIFEST_APPEND schema: id, title, category, triggers{keywords,phrases,task_class}, provides, depends_on, load_priority, load_strategy, always_load). Fields you supply override the derived defaults; id and path are always ensured. Omit to auto-derive from the file path and content.' },
+      manifest_entry: { type: 'object', description: 'Optional manifest module entry (MANIFEST_APPEND schema: id, title, category, triggers{keywords,phrases,task_class}, provides, depends_on, load_priority, load_strategy, always_load). Used verbatim where the frontmatter does not supply the field: frontmatter triggers, provides, title and version take precedence. path and line_count_estimate are always set from the file written. Pass triggers: { keywords: [], phrases: [], task_class: [] } to register explicitly with no triggers. Nothing is derived from the body.' },
       dispatch_rule:  { type: 'object', description: 'Optional dispatch rule to register alongside the module in the same fragment (fragment schema: id, trigger_description, trigger_patterns{keywords,phrases,task_class}, module_to_add, confidence). Omit to register the module without a routing rule.' },
       skip_manifest:  { type: 'boolean', description: 'Set true to write the module file WITHOUT registering a manifest fragment (e.g. editing a body whose registration already exists and should not be touched). Default: false — registration is automatic.' },
       dry_run:        { type: 'boolean', description: 'Set true to get the verdict without writing anything: the same duplicate_id_path or path_holds_other_id refusal a real call would return, or what a real call would do (create, overwrite, or be blocked by the overwrite guard). Default: false.' },
       acknowledge_resolved_path: { type: 'string', description: 'Only after a duplicate_id_path refusal: the resolved_path it named (e.g. "modules/meta/x.md"). The write then goes to that resolved file instead of the requested path. Must match exactly; the overwrite guard still applies.' },
+      acknowledge_existing_registration: { type: 'string', description: 'Only after an id_registered_elsewhere refusal: the source of the fragment registration to update, exactly as the refusal lists it (e.g. "references/manifest/100-existential.json"). That registration is updated in place to the path being written; no new registration is created and the others are left as they are. Refused where another FILE still holds the id; quarantine it first with module_delete.' },
     },
     required: ['file', 'content'],
   },
@@ -733,6 +750,7 @@ export async function handleModuleWrite(args, context = null) {
       content,
       manifestEntryId: manifest_entry && typeof manifest_entry === 'object' ? manifest_entry.id : null,
       acknowledgeResolvedPath: firstStringKey(args, 'acknowledge_resolved_path'),
+      acknowledgeExistingRegistration: firstStringKey(args, 'acknowledge_existing_registration'),
       paths: modularPathsForAvaDir(paths.avaDir),
     });
   } catch (err) {
@@ -748,8 +766,82 @@ export async function handleModuleWrite(args, context = null) {
     resolutions: writeGuard.resolutions,
     ...(writeGuard.note ? { note: writeGuard.note } : {}),
   };
-  if (writeGuard.refusals.length) {
-    log('warn', `[module_write] REFUSED modules/${cleanPath}: ${writeGuard.refusals.map((r) => r.code).join(', ')}${dryRun ? ' (dry run)' : ''}`);
+
+  // ── WO-2026-11-21-02: derive the registration and plan it, before writing ─
+  //
+  // Phase P derives the entry from the frontmatter or manifest_entry only (no
+  // body scraping) and refuses a string that did not survive UTF-8 (P9).
+  // Phase Q enumerates every existing registration of the id over the snapshot
+  // the guard just read, which is the compile's resolver over the same tree,
+  // and decides: update in place (Q2), refuse id_registered_elsewhere (Q3),
+  // write no fragment for a frozen-manifest id (Q4), or create in the
+  // category's existing fragment (Q5). Both run here, before any file
+  // operation, in the dry run and the real call alike.
+  const targetClean = writeGuard.redirected ? writeGuard.target_rel.slice('modules/'.length) : cleanPath;
+  const isMarkdownModule = /\.md$/i.test(targetClean);
+  const willRegister = !skip_manifest && isMarkdownModule;
+  const ackRegistration = firstStringKey(args, 'acknowledge_existing_registration') || null;
+  let derived = null;
+  let regPlan = null;
+  const preRefusals = [];
+  if (isMarkdownModule) {
+    try {
+      derived = deriveRegistration(targetClean, content, manifest_entry || {});
+    } catch (err) {
+      log('error', `[module_write] manifest entry derivation FAILED for modules/${targetClean}: ${err.message}`);
+      derived = null;
+    }
+    // P9 and the registration warnings concern what goes into a register, so
+    // they apply only when a fragment registration is written: not to a
+    // skip_manifest body edit, and not to a frozen-manifest id (Q4).
+    if (derived && willRegister) {
+      if (writeGuard.snapshot) {
+        try {
+          regPlan = registrationPlan({
+            snapshot: writeGuard.snapshot, id: derived.entry.id, targetRel: `modules/${targetClean}`,
+            category: derived.entry.category, acknowledgeExistingRegistration: ackRegistration,
+          });
+        } catch (err) {
+          regPlan = { action: 'refused', write_fragment: false, registrations: [], refusal: { code: MODULE_REFUSAL.WRITE_GUARD_UNVERIFIED,
+            message: `The registration plan could not be computed (${err.message}), so a duplicate registration cannot be ruled out. Nothing was written.` } };
+        }
+        if (regPlan.refusal) {
+          preRefusals.push(regPlan.refusal);
+        } else if (regPlan.action !== 'frozen' && derived.refusal) {
+          preRefusals.push(derived.refusal);
+        } else if (regPlan.existing_entry) {
+          // Q2: derive against the registration being updated, so what no
+          // source names is kept rather than reset (manifest-fragments.js).
+          derived = deriveRegistration(targetClean, content, manifest_entry || {}, { existing: regPlan.existing_entry });
+          if (derived.refusal) preRefusals.push(derived.refusal);
+        }
+      } else if (!writeGuard.refusals.length) {
+        preRefusals.push({ code: MODULE_REFUSAL.WRITE_GUARD_UNVERIFIED,
+          message: 'The duplicate guard returned no snapshot, so existing registrations could not be enumerated. Nothing was written.' });
+      }
+    }
+  }
+  const planSummary = regPlan && !regPlan.refusal ? {
+    action: regPlan.action,
+    target_fragment: regPlan.target_file ? `references/manifest/${regPlan.target_file}` : (regPlan.action === 'create' ? 'a new fragment for the category' : null),
+    registrations: regPlan.registrations,
+    ...(regPlan.frozen_sources ? { frozen_sources: regPlan.frozen_sources } : {}),
+    ...(regPlan.acknowledged ? { acknowledged: regPlan.acknowledged, previous_path: regPlan.previous_path } : {}),
+    ...(regPlan.other_registrations_at_this_path ? { other_registrations_at_this_path: regPlan.other_registrations_at_this_path } : {}),
+    triggers_source: derived && derived.entry ? (derived.entry.triggers_source ?? null) : null,
+  } : null;
+  const registrationWarnings = derived && willRegister && !(regPlan && regPlan.action === 'frozen') ? derived.warnings : [];
+
+  // A registration-only conflict (the id's registration names another path
+  // whose file does not exist) is reported by its registration code first; a
+  // file conflict keeps duplicate_id_path first, as WO-2026-11-21-01 R2 has it.
+  const guardDuplicates = writeGuard.refusals.filter((r) => r.code === MODULE_REFUSAL.DUPLICATE_ID_PATH);
+  const registrationFirst = preRefusals.some((r) => r.code === MODULE_REFUSAL.ID_REGISTERED_ELSEWHERE || r.code === MODULE_REFUSAL.ACK_REGISTRATION_REJECTED)
+    && guardDuplicates.length === writeGuard.refusals.length && guardDuplicates.every((r) => r.registration_only);
+  const refusals = registrationFirst ? [...preRefusals, ...writeGuard.refusals] : [...writeGuard.refusals, ...preRefusals];
+
+  if (refusals.length) {
+    log('warn', `[module_write] REFUSED modules/${cleanPath}: ${refusals.map((r) => r.code).join(', ')}${dryRun ? ' (dry run)' : ''}`);
     return {
       content: [{
         type: 'text',
@@ -757,8 +849,8 @@ export async function handleModuleWrite(args, context = null) {
           blocked:         true,
           written:         false,
           dry_run:         dryRun,
-          code:            writeGuard.refusals[0].code,
-          refusals:        writeGuard.refusals,
+          code:            refusals[0].code,
+          refusals,
           write_guard:     guardSummary,
           requested_file:  file ?? null,
           normalised_file: cleanPath,
@@ -845,6 +937,8 @@ export async function handleModuleWrite(args, context = null) {
           requested_file:  file ?? null,
           normalised_file: cleanPath,
           write_guard:     guardSummary,
+          registration:    planSummary,
+          registration_warnings: registrationWarnings,
         }, null, 2),
       }],
     };
@@ -927,26 +1021,17 @@ export async function handleModuleWrite(args, context = null) {
   //   H-3  audit ledger: every mutation (body and fragment) appends before/
   //        after sha256, actor, reason and time.
   // -------------------------------------------------------------------------
-  const isMarkdownModule = /\.md$/i.test(cleanPath);
-  const willRegister = !skip_manifest && isMarkdownModule;
   const actor = actorFrom(context);
   const claimId = firstStringKey(args, 'claim_id') || null;
 
-  let entry = null;
-  if (isMarkdownModule) {
-    try {
-      entry = deriveModuleEntry(cleanPath, content, manifest_entry || {});
-    } catch (err) {
-      log('error', `[module_write] manifest entry derivation FAILED for modules/${cleanPath}: ${err.message}`);
-      entry = null;
-    }
-  }
+  // Derived above, with the registration plan (WO-2026-11-21-02).
+  const entry = derived ? derived.entry : null;
 
   const refusalResult = (payload) => ({ content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true });
 
   const modulesGuard = guardStoreWrite({ family: 'modules', target: cleanPath, content, tool: 'module_write', actor, claimId });
   if (!modulesGuard.allowed) return refusalResult(modulesGuard.refusal);
-  if (willRegister) {
+  if (willRegister && (!regPlan || regPlan.write_fragment)) {
     const refsGuard = guardStoreWrite({
       family: 'references', target: 'manifest/(registration)', content: JSON.stringify({ module: entry, dispatch_rule }, null, 2),
       tool: 'module_write', actor, claimId,
@@ -973,6 +1058,11 @@ export async function handleModuleWrite(args, context = null) {
       }, freshJson).manifest;
     } catch (err) {
       log('warn', `[module_write] intake could not read the merged manifest (${err.message}); dependency checks run against an empty registry`);
+    }
+    if (regPlan && regPlan.action === 'update_acknowledged' && entry) {
+      // Q3: the acknowledged registration is moved to this path by this write,
+      // so the independence gate judges the registry as the write leaves it.
+      mergedManifest = { ...mergedManifest, modules: (mergedManifest.modules || []).map((m) => (m && m.id === entry.id ? { ...m, path: entry.path } : m)) };
     }
     intake = runIntake({ cleanPath, content, entry, manifest: mergedManifest, isNew, actor });
     const written = writeIntakeRecord(cleanPath, intake);
@@ -1029,6 +1119,16 @@ export async function handleModuleWrite(args, context = null) {
     manifestResult = { registered: false, reason: 'non-.md module file — data files are not registered as dispatchable modules' };
   } else if (!entry) {
     manifestResult = { registered: false, error: 'manifest entry could not be derived', required_action: 'Pass manifest_entry explicitly and re-run module_write.' };
+  } else if (regPlan && regPlan.action === 'frozen') {
+    // Q4: no fragment registration for an id a frozen manifest registers.
+    manifestResult = {
+      registered:      false,
+      code:            MODULE_REFUSAL.FROZEN_REGISTRATION,
+      frozen_manifest: regPlan.frozen_sources,
+      registrations:   regPlan.registrations,
+      module_id:       entry.id,
+      reason:          regPlan.message,
+    };
   } else {
     try {
       const fragmentDir = join(paths.avaDir, 'references', 'manifest');
@@ -1036,7 +1136,8 @@ export async function handleModuleWrite(args, context = null) {
       if (existsSync(fragmentDir)) {
         for (const name of readdirSync(fragmentDir)) fragmentsBefore.set(name, fileDigest(join(fragmentDir, name)));
       }
-      const reg = registerModuleWithIntake({ avaDir: paths.avaDir, cleanPath, content, entry, dispatchRule: dispatch_rule });
+      const reg = registerModuleWithIntake({ avaDir: paths.avaDir, cleanPath, content, entry, dispatchRule: dispatch_rule,
+        fragmentOptions: regPlan && regPlan.target_file ? { targetFile: regPlan.target_file } : {} });
       if (!reg.ok) {
         log('error', `[module_write] registration REFUSED for modules/${cleanPath}: ${reg.reason}`);
         manifestResult = { registered: false, code: reg.code, error: reg.reason };
@@ -1057,6 +1158,10 @@ export async function handleModuleWrite(args, context = null) {
           module_id:       entry.id,
           module_path:     entry.path,
           dispatch_rule:   dispatch_rule ? 'registered' : 'none',
+          // WO-2026-11-21-02: what the plan decided, and where the triggers came from.
+          registration_action: regPlan ? regPlan.action : null,
+          triggers_source: entry.triggers_source ?? null,
+          ...(regPlan && regPlan.acknowledged ? { acknowledged: regPlan.acknowledged, previous_path: regPlan.previous_path } : {}),
         };
       }
     } catch (err) {
@@ -1108,11 +1213,15 @@ export async function handleModuleWrite(args, context = null) {
         normalised_file: cleanPath,
         resolved_path:   fullPath,
         manifest_registration: manifestResult,
+        // WO-2026-11-21-02 P3, P5, P6: every registration warning, by module id.
+        registration_warnings: registrationWarnings,
         write_guard: guardSummary,
         wp_backup:  formatWpResult(wpResult),
-        note: manifestResult.registered
+        note: (manifestResult.registered
           ? `Module ${isNew ? 'created' : 'overwritten'} AND registered in ${manifestResult.fragment_file}. skill_compile, skill_recompile, skill_load_specialist, and brain_scan catalog it automatically — no MANIFEST.json edit or manifest_rebuild.py run is needed.`
-          : `Module ${isNew ? 'created' : 'overwritten'}. Manifest registration: ${manifestResult.reason || manifestResult.error || 'not performed'}.`,
+          : `Module ${isNew ? 'created' : 'overwritten'}. Manifest registration: ${manifestResult.reason || manifestResult.error || 'not performed'}.`)
+          + (registrationWarnings.some((w) => w.code === 'registered_without_triggers')
+            ? ` WARNING: ${entry ? entry.id : 'this module'} is registered WITHOUT dispatch triggers and will not be selected by trigger until they are supplied; see registration_warnings.` : ''),
       }, null, 2),
     }],
   };

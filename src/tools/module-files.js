@@ -90,6 +90,7 @@ import {
   fragmentsDirFor,
   inferModulePath,
   parseModuleFrontmatter,
+  findCategoryFragment,
 } from './manifest-fragments.js';
 
 // ---------------------------------------------------------------------------
@@ -120,6 +121,9 @@ export const REFUSAL = Object.freeze({
   DUPLICATE_ID_PATH:      'duplicate_id_path',           // R2: a second file for an id that already resolves
   PATH_HOLDS_OTHER_ID:    'path_holds_other_id',         // R3: force must not turn one id into another
   WRITE_GUARD_UNVERIFIED: 'write_guard_unverified',      // R1: the resolver could not give a complete answer; fail closed
+  // v13.39.x (WO-2026-11-21-02): module_write registration refusals.
+  ID_REGISTERED_ELSEWHERE: 'id_registered_elsewhere',    // Q3: a registration of this id names another path
+  ACK_REGISTRATION_REJECTED: 'acknowledge_existing_registration_rejected', // Q3: the acknowledgement names no registration of this id
 });
 
 /**
@@ -589,10 +593,18 @@ function incomingFileId(relPath, content) {
  * @param {string} a.content        The body to be written.
  * @param {string} [a.manifestEntryId]   manifest_entry.id, when supplied.
  * @param {string} [a.acknowledgeResolvedPath]
+ * @param {string} [a.acknowledgeExistingRegistration]  WO-2026-11-21-02 Q3: the
+ *        registration source to update. When it names the registration an R2
+ *        refusal is based on, and that registration's file does not exist and no
+ *        other file declares the id, the write creates no second file: the R2
+ *        refusal for that id is lifted and registrationPlan updates the named
+ *        registration in place. Where a file exists, R2 still refuses.
  * @param {object} [a.paths]        The modular paths of the tree being written.
  * @returns {object} { applies, verdict, ids, target_rel, redirected, refusals, resolutions }
+ *          and, not enumerable, `snapshot`: the snapshot it read, so module_write's
+ *          registration plan reads the same tree without a second walk.
  */
-export function moduleWriteGuard({ requestedRel, content, manifestEntryId = null, acknowledgeResolvedPath = null, paths = getModularPaths() }) {
+export function moduleWriteGuard({ requestedRel, content, manifestEntryId = null, acknowledgeResolvedPath = null, acknowledgeExistingRegistration = null, paths = getModularPaths() }) {
   const requested = asModulesRel(requestedRel);
   if (!/\.md$/i.test(requested)) {
     return { applies: false, verdict: 'not_a_module', ids: [], target_rel: requested, redirected: false, refusals: [], resolutions: [],
@@ -615,6 +627,8 @@ export function moduleWriteGuard({ requestedRel, content, manifestEntryId = null
 
   const resolutions = ids.map((id) => resolveModulePath(id, { snapshot }));
   const ack = acknowledgeResolvedPath ? asModulesRel(acknowledgeResolvedPath) : null;
+  const ackSource = typeof acknowledgeExistingRegistration === 'string' && acknowledgeExistingRegistration.trim()
+    ? acknowledgeExistingRegistration.trim().replace(/\\/g, '/') : null;
   const duplicate = [];
   for (const r of resolutions) {
     // Where the id lives now: the file the resolver returns, else the path its
@@ -624,6 +638,10 @@ export function moduleWriteGuard({ requestedRel, content, manifestEntryId = null
     const occupied = r.candidates.filter((c) => c.exists).map((c) => c.path);
     const conflict = target ? requested !== target : (occupied.length > 0 && !occupied.includes(requested));
     if (!conflict) continue;
+    // Q3 route: the conflict is a registration whose file is missing, no other
+    // file holds the id, and the caller named that registration to update.
+    const registrationOnly = Boolean(target) && !r.resolved_path && occupied.every((p) => p === requested);
+    if (registrationOnly && ackSource && r.resolved_from && (r.resolved_from === ackSource || r.resolved_from === `references/manifest/${ackSource}`)) continue;
     duplicate.push({
       code: REFUSAL.DUPLICATE_ID_PATH,
       message: target
@@ -632,6 +650,8 @@ export function moduleWriteGuard({ requestedRel, content, manifestEntryId = null
       id: r.id,
       resolved_path: target,
       resolved_by: r.resolved_by,
+      resolved_from: r.resolved_from || null,
+      registration_only: registrationOnly,
       resolves_to_existing_file: Boolean(r.resolved_path),
       requested_path: requested,
       candidates: r.candidates.map((c) => ({ path: c.path, exists: c.exists, sha256: c.sha256, size_bytes: c.size_bytes, lines: c.lines,
@@ -686,7 +706,7 @@ export function moduleWriteGuard({ requestedRel, content, manifestEntryId = null
   const verdict = refusals.length ? 'refused'
     : redirected ? 'redirected_to_resolved'
       : resolutions.every((r) => !r.registered && !r.candidates.some((c) => c.exists)) ? 'new_id' : 'resolved_here';
-  return {
+  const result = {
     applies: true,
     verdict,
     ids,
@@ -696,6 +716,167 @@ export function moduleWriteGuard({ requestedRel, content, manifestEntryId = null
     refusals,
     resolutions: resolutions.map((r) => ({ id: r.id, resolved_path: r.resolved_path, registered_path: r.registered_path, resolved_by: r.resolved_by,
       candidate_count: r.candidate_count, ambiguous: r.ambiguous })),
+  };
+  Object.defineProperty(result, 'snapshot', { value: snapshot, enumerable: false });
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Q1-Q5 (WO-2026-11-21-02): the registration layer of the same guard
+// ---------------------------------------------------------------------------
+
+/** "references/manifest/x.json" or "x.json" -> both spellings, for matching an acknowledgement. */
+function ackForms(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const s = raw.trim().replace(/\\/g, '/');
+  const file = s.replace(/^references\/manifest\//, '');
+  return new Set([s, file, `references/manifest/${file}`]);
+}
+
+/**
+ * Before module_write writes a fragment registration: every existing
+ * registration of the id, from every source (the ones the merge shadows
+ * included), with the path each one names, declared or as the merge would
+ * infer it (Q1). The snapshot is the one moduleWriteGuard read, so this is the
+ * resolver skill_compile uses, over the same tree. Pure: reads only.
+ *
+ *   Q4  registered in MANIFEST.json or MANIFEST_APPEND.json: no fragment
+ *       registration is written (action "frozen"); updating a frozen manifest
+ *       is an external decision, as module_delete's
+ *       registered_in_frozen_manifest says.
+ *   Q3  a fragment registration naming another path: refused,
+ *       id_registered_elsewhere, naming every registration and its path,
+ *       unless acknowledge_existing_registration names the fragment
+ *       registration to update (action "update_acknowledged").
+ *   Q2  a fragment registration at this path: updated in place (action
+ *       "update_in_place"), the first in the merge's filename order, which is
+ *       the one the compile reads.
+ *   Q5  none: created (action "create") in the category's existing fragment
+ *       (fragmentSourceOf), else a new one.
+ *
+ * @param {object} a
+ * @param {object} a.snapshot   buildModuleSnapshot() (moduleWriteGuard(...).snapshot).
+ * @param {string} a.id         The id the registration will carry.
+ * @param {string} a.targetRel  "modules/<...>.md", the path being written.
+ * @param {string} [a.category] The entry's category (Q5).
+ * @param {string} [a.acknowledgeExistingRegistration]
+ * @returns {object} { action, write_fragment, target_file, existing_entry, registrations, refusal, ... }
+ */
+export function registrationPlan({ snapshot, id, targetRel, category = 'general', acknowledgeExistingRegistration = null }) {
+  const target = asModulesRel(targetRel);
+  const { paths, registrations } = snapshot;
+  const exists = snapshot.exists || existsSync;
+  const regs = registrations.filter((r) => r.id === id).map((r) => {
+    const inferred = r.declared_path ? null : inferModulePath(paths.avaDir, r.entry, exists);
+    return {
+      source: r.source,
+      kind: r.kind,
+      path: r.path,
+      declared_path: r.declared_path,
+      ...(inferred ? { inferred_path: inferred } : {}),
+      effective_path: r.path || inferred || null,
+      fragment_file: r.kind === 'manifest_fragment' ? r.source.replace(/^references\/manifest\//, '') : null,
+      entry: r.entry,
+    };
+  });
+  const listed = regs.map(({ entry, ...rest }) => rest);
+  const base = { id, target_path: target, registrations: listed, registration_count: listed.length };
+
+  const frozen = regs.filter((r) => r.kind === 'manifest' || r.kind === 'manifest_append');
+  if (frozen.length) {
+    const sources = [...new Set(frozen.map((r) => r.source))];
+    return {
+      ...base,
+      action: 'frozen',
+      write_fragment: false,
+      frozen_sources: sources,
+      refusal: null,
+      message: `Module ${id} is registered in a frozen manifest (${sources.join(', ')}). module_write creates no fragment registration for it: `
+        + 'updating a frozen manifest is an external decision, made one id at a time outside this tooling. The module file itself was written.',
+    };
+  }
+
+  const frags = regs.filter((r) => r.kind === 'manifest_fragment');
+  const elsewhere = frags.filter((r) => r.effective_path && r.effective_path !== target);
+  const here = frags.filter((r) => !r.effective_path || r.effective_path === target);
+  const forms = ackForms(acknowledgeExistingRegistration);
+  const routes = [
+    ...frags.map((r) => ({ route: 'acknowledge_existing_registration', value: r.source,
+      how: `Call module_write again with acknowledge_existing_registration: "${r.source}". That registration is updated in place to ${target}; no new registration is created. The other registrations stay as they are: removing a duplicate registration is a per-id dispatch decision (WO-2026-11-21-02 section 6).` })),
+    ...(elsewhere.length ? [{ route: 'quarantine_existing', tool: 'module_delete', file: elsewhere[0].effective_path,
+      how: 'Quarantine the other file first (module_delete, dry run first); module_delete removes its fragment registration with it.' }] : []),
+  ];
+
+  if (forms) {
+    const named = frags.find((r) => forms.has(r.source));
+    if (named) {
+      return {
+        ...base,
+        action: 'update_acknowledged',
+        write_fragment: true,
+        target_file: named.fragment_file,
+        existing_entry: named.entry,
+        acknowledged: named.source,
+        previous_path: named.effective_path,
+        refusal: null,
+      };
+    }
+    return {
+      ...base,
+      action: 'refused',
+      write_fragment: false,
+      refusal: {
+        code: REFUSAL.ACK_REGISTRATION_REJECTED,
+        message: `acknowledge_existing_registration "${acknowledgeExistingRegistration}" names no fragment registration of ${id}. `
+          + (frags.length ? `Its fragment registrations are: ${frags.map((r) => r.source).join(', ')}.` : 'It has no fragment registration.') + ' Nothing was written.',
+        id,
+        requested_path: target,
+        acknowledge_existing_registration_rejected: acknowledgeExistingRegistration,
+        acknowledge_rule: 'acknowledge_existing_registration must name one fragment registration of this id exactly, as "references/manifest/<file>" or "<file>".',
+        registrations: listed,
+        routes,
+      },
+    };
+  }
+
+  if (elsewhere.length) {
+    return {
+      ...base,
+      action: 'refused',
+      write_fragment: false,
+      refusal: {
+        code: REFUSAL.ID_REGISTERED_ELSEWHERE,
+        message: `Module ${id} is already registered at another path (${elsewhere.map((r) => `${r.source}: ${r.effective_path}`).join('; ')}). `
+          + `Writing ${target} would mint a further registration of the same id. Nothing was written.`,
+        id,
+        requested_path: target,
+        registrations: listed,
+        routes,
+      },
+    };
+  }
+
+  if (here.length) {
+    return {
+      ...base,
+      action: 'update_in_place',
+      write_fragment: true,
+      target_file: here[0].fragment_file,
+      existing_entry: here[0].entry,
+      ...(here.length > 1 ? { other_registrations_at_this_path: here.slice(1).map((r) => r.source),
+        note: 'More registrations of this id name this path; the first (the one the compile reads) is updated, and the others are reported by skill_consistency_audit C-F.' } : {}),
+      refusal: null,
+    };
+  }
+
+  const categoryFragment = findCategoryFragment(paths.avaDir, category);
+  return {
+    ...base,
+    action: 'create',
+    write_fragment: true,
+    target_file: categoryFragment,
+    existing_entry: null,
+    refusal: null,
   };
 }
 

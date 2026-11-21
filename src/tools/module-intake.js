@@ -11,9 +11,14 @@
 //
 // THE CHECKLIST
 // -------------
-//   triggers               the derived manifest entry has keywords, phrases or a
-//                          task class (or is always_load): a module nothing can
-//                          dispatch is a registration mistake
+//   triggers               the manifest entry has keywords, phrases or a task
+//                          class (or is always_load). WO-2026-11-21-02 section 7
+//                          (closed by Brian): a module with none is registered
+//                          with an empty trigger set and a warning, reachable by
+//                          explicit load and not by dispatch. This check
+//                          therefore WARNS on an empty set and never refuses it;
+//                          before that order, registration invented triggers
+//                          from the body, so the empty case never arose.
 //   commands_referenced    commands the body tells the reader to run (fenced
 //                          shell/python blocks, "$ ..." lines, script_execute
 //                          calls). Recorded. A command that stops, restarts or
@@ -178,7 +183,7 @@ export function runIntake( { cleanPath, content, entry, manifest, isNew, actor }
     const t = entry.triggers || {};
     const n = ( t.keywords || [] ).length + ( t.phrases || [] ).length + ( t.task_class || [] ).length;
     if ( n > 0 || entry.always_load ) checks.push( { name: 'triggers', status: 'pass', detail: entry.always_load ? 'always_load' : `${ n } trigger terms` } );
-    else checks.push( { name: 'triggers', status: 'fail', detail: 'no keywords, phrases or task_class, and not always_load: nothing could dispatch this module' } );
+    else checks.push( { name: 'triggers', status: 'warn', detail: 'no keywords, phrases or task_class, and not always_load: registered without dispatch triggers (triggers_source none), reachable by explicit specialist load only and not selected by trigger until they are supplied (WO-2026-11-21-02 P3, section 7)' } );
   }
 
   // 2. commands referenced
@@ -313,9 +318,12 @@ export function readIntakeRecord( cleanPath ) {
  * @param {string} o.content
  * @param {object} o.entry
  * @param {object|null} [o.dispatchRule]
+ * @param {object} [o.fragmentOptions]  WO-2026-11-21-02 Q2/Q5: { targetFile }, the
+ *        fragment module_write's registration plan chose (passed through to
+ *        writeModuleFragment).
  * @returns {{ ok: true, fragment: object } | { ok: false, code: string, reason: string }}
  */
-export function registerModuleWithIntake( { avaDir, cleanPath, content, entry, dispatchRule = null } ) {
+export function registerModuleWithIntake( { avaDir, cleanPath, content, entry, dispatchRule = null, fragmentOptions = {} } ) {
   const record = readIntakeRecord( cleanPath );
   if ( ! record ) {
     return { ok: false, code: 'intake_record_missing', reason: `No intake record for modules/${ cleanPath }; a module is not registered without one.` };
@@ -326,7 +334,7 @@ export function registerModuleWithIntake( { avaDir, cleanPath, content, entry, d
   if ( ! record.passed ) {
     return { ok: false, code: 'intake_failed', reason: `The intake record for modules/${ cleanPath } failed: ${ ( record.failed || [] ).join( ', ' ) }.` };
   }
-  return { ok: true, fragment: writeModuleFragment( avaDir, entry, dispatchRule ) };
+  return { ok: true, fragment: writeModuleFragment( avaDir, entry, dispatchRule, fragmentOptions ) };
 }
 
 export default {

@@ -63,20 +63,16 @@ test( 'body mining terminates', () => {
     `body mining took ${ elapsed }ms; before the /g fix it never terminated` );
 } );
 
-test( 'every H2 is found, not just the first, and not the first forever', () => {
-  // The two failure modes the missing flag sits between: matching once and
-  // looping, or matching once and stopping. Both give the wrong task classes.
+test( 'no H2 heading becomes a task class or a capability (WO-2026-11-21-02 P1, P6, P10)', () => {
+  // This test used to require every H2 to become a task class. WO-2026-11-21-02
+  // removed body derivation entirely: headings are document structure, not
+  // registry content. task_class and provides come only from the frontmatter
+  // or manifest_entry, and are empty here.
   const entry = deriveModuleEntry( 'philosophy/probe.md', moduleWithHeadings( 5 ), {} );
-  const classes = entry.triggers.task_class;
-
-  assert.ok( classes.length >= 5,
-    `expected all 5 headings, got ${ classes.length }: ${ classes.join( ', ' ) }` );
-  assert.ok( classes.includes( 'section 1' ) );
-  assert.ok( classes.includes( 'section 5' ),
-    'the last heading proves the scan advanced through the body' );
-
-  // Deduplicated, so a loop that ran even briefly would not hide here.
-  assert.equal( new Set( classes ).size, classes.size || classes.length );
+  assert.deepEqual( entry.triggers.task_class, [] );
+  assert.deepEqual( entry.provides, [] );
+  assert.equal( entry.triggers_source, 'none' );
+  assert.ok( ! JSON.stringify( entry ).toLowerCase().includes( 'section 1' ), 'no heading text anywhere in the entry' );
 } );
 
 test( 'a module with one heading does not loop', () => {
@@ -116,7 +112,10 @@ test( 'every exec loop in this module uses a global regex', () => {
     join( ROOT, 'src', 'tools', 'manifest-fragments.js' ), 'utf8' );
 
   const loops = [ ...src.matchAll( /while\s*\(\s*\(\s*(\w+)\s*=\s*(\w+)\.exec\(/g ) ];
-  assert.ok( loops.length > 0, 'no exec loops found to check' );
+  // WO-2026-11-21-02 removed the H2-mining loop with the rest of body
+  // derivation, so there may be no exec loop left to check. That the mining
+  // code is gone is asserted here instead of a non-zero loop count.
+  assert.doesNotMatch( src, /function mineBodyContent\b/, 'body mining was removed (P1)' );
 
   for ( const [ , , patternName ] of loops ) {
     const declaration = new RegExp( `const ${ patternName }\\s*=\\s*/.*?/([gimsuy]*)` );

@@ -7,6 +7,9 @@
 //   C-INTAKE-RESCAN        a content change re-runs the checks
 //   C-INTAKE-NAMED-REFUSAL a failed check refuses the write and the refusal
 //                          names the check
+//   triggers (WO-2026-11-21-02 section 7, closed by Brian) an empty trigger set
+//                          is registered with a warning, not refused; it was a
+//                          refusal case here before that order
 //   advisory lint          the three H-9 shapes warn and never refuse
 //   record unwritable      a record that cannot be written refuses the write
 //
@@ -102,14 +105,21 @@ describe( 'H-11 module intake gate', () => {
     assert.equal( I.readIntakeHistory( 'meta/garden.md', 1 )[ 0 ].passed, false, 'the refused attempt is in the history' );
   } );
 
+  test( 'triggers: an empty trigger set registers with a warning and is not refused (WO-2026-11-21-02 section 7)', async () => {
+    const r = body( await SC.handleModuleWrite( { file: 'meta/untriggered.md', content: '# Untriggered\nBody.\n', change_note: 'probe',
+      manifest_entry: { triggers: { keywords: [], phrases: [], task_class: [] } } } ) );
+    assert.equal( r.success, true, JSON.stringify( r ) );
+    assert.equal( r.manifest_registration.registered, true );
+    assert.equal( r.manifest_registration.triggers_source, 'none' );
+    assert.ok( r.registration_warnings.some( ( w ) => w.code === 'registered_without_triggers' && w.module_id === 'untriggered' ) );
+    const rec = I.readIntakeRecord( 'meta/untriggered.md' );
+    assert.equal( rec.passed, true );
+    const t = rec.checks.find( ( c ) => c.name === 'triggers' );
+    assert.equal( t.status, 'warn' );
+    assert.match( t.detail, /registered without dispatch triggers/ );
+  } );
+
   const REFUSALS = [
-    {
-      check: 'triggers',
-      file: 'meta/untriggered.md',
-      content: '# Untriggered\nBody.\n',
-      manifest_entry: { triggers: { keywords: [], phrases: [], task_class: [] } },
-      detail: /nothing could dispatch this module/,
-    },
     {
       check: 'commands_referenced',
       file: 'meta/killer.md',
