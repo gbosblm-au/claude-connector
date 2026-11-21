@@ -50,6 +50,24 @@ export function initDb(dbPath) {
   `);
 
   // -----------------------------------------------------------------------
+  // v13.39.0 (TENAX-2026-10-15-01 H-10): re-check columns, added in place on
+  // an existing database. ADD COLUMN with a NULL default touches no row, so an
+  // existing store is unchanged until an entry is written with a re-check.
+  // -----------------------------------------------------------------------
+  {
+    const have = new Set(db.prepare("PRAGMA table_info(memories)").all().map((c) => c.name));
+    for (const [name, ddl] of [
+      ['recheck_class',   'TEXT DEFAULT NULL'],
+      ['recheck_at',      'TEXT DEFAULT NULL'],
+      ['verified_at',     'TEXT DEFAULT NULL'],
+      ['verified_source', 'TEXT DEFAULT NULL'],
+    ]) {
+      if (!have.has(name)) db.exec(`ALTER TABLE memories ADD COLUMN ${name} ${ddl}`);
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_memories_recheck ON memories(recheck_at)');
+  }
+
+  // -----------------------------------------------------------------------
   // Indexes (TDD Section 5.3)
   // -----------------------------------------------------------------------
   db.exec(`

@@ -190,3 +190,62 @@ describe( 'retention calibration: documentation matches the code', () => {
       'misconfiguration is visible in the logs at boot' );
   } );
 } );
+
+// ---------------------------------------------------------------------------
+// v13.37.0 -- TENAX-2026-10-09-01. C-CALIBRATION and C-NEG-STALE-LINK: the
+// ordering reaper >= link is ENFORCED, not only documented. The coding delivery
+// tool publishes into the same directory under the same reaper, so a reaper
+// shorter than the link would turn a delivered project's link into a 404.
+// ---------------------------------------------------------------------------
+
+describe( 'retention calibration: reaper >= link is enforced (v13.37.0)', () => {
+  test( 'C-CALIBRATION: a reaper configured below the link lifetime runs at the link lifetime, and says so', async () => {
+    const { calibrateDownloadsTtl, fileOutlivesLink } = await import( '../utils/retentionCalibration.js' );
+    const { linkExpirySeconds } = await import( '../utils/signedUrls.js' );
+
+    for ( const configured of [ 1, 24, 71 ] ) {
+      const c = calibrateDownloadsTtl( configured, linkExpirySeconds() );
+      assert.equal( c.raised, true, `${ configured }h was not raised` );
+      assert.equal( c.hours, TARGET_HOURS );
+      assert.ok( fileOutlivesLink( c.hours, linkExpirySeconds() ) );
+      assert.match( c.message, /DOWNLOADS_TTL_HOURS=\d+ is shorter than the 72h signed-link lifetime/ );
+    }
+    // Equal or longer is left alone.
+    for ( const configured of [ 72, 96, 24 * 14 ] ) {
+      const c = calibrateDownloadsTtl( configured, linkExpirySeconds() );
+      assert.deepEqual( [ c.raised, c.hours, c.message ], [ false, configured, null ] );
+    }
+    // A link lifetime that is not a whole number of hours rounds UP, never down.
+    assert.equal( calibrateDownloadsTtl( 1, 3601 ).hours, 2 );
+    // An operator who shortens the link gets no forced change to the reaper.
+    process.env.LINK_EXPIRY_SECONDS = '600';
+    assert.equal( calibrateDownloadsTtl( 72, linkExpirySeconds() ).raised, false );
+  } );
+
+  test( 'C-NEG-STALE-LINK: no configuration leaves a file reaped while its link still verifies', async () => {
+    const { calibrateDownloadsTtl } = await import( '../utils/retentionCalibration.js' );
+    const { buildSignedQuery, verifySignedRequest, linkExpirySeconds } = await import( '../utils/signedUrls.js' );
+
+    const minted = 1_800_000_000;
+    const { exp, sig } = buildSignedQuery( { filename: 'widget-d1.zip', now: minted } );
+    for ( const configured of [ 1, 12, 48, 72 ] ) {
+      const reaperHours = calibrateDownloadsTtl( configured, linkExpirySeconds() ).hours;
+      const reapedAt = minted + reaperHours * 3600;
+      // The instant before the reaper may take the file, the link must already
+      // have stopped verifying (or be exactly at its end): otherwise the user
+      // holds a link that verifies and a file that is gone -- a 404.
+      const atReap = verifySignedRequest( { filename: 'widget-d1.zip', exp, sig, now: reapedAt + 1 } );
+      assert.equal( atReap.ok, false, `DOWNLOADS_TTL_HOURS=${ configured }: the link still verifies when the file is reaped` );
+      assert.equal( atReap.reason, 'expired' );
+    }
+  } );
+
+  test( 'the reaper sweeps at the calibrated window, not the raw configured one', () => {
+    const code = readFileSync( join( HERE, '..', 'server-http.js' ), 'utf8' )
+      .replace( /\/\*[\s\S]*?\*\//g, '' ).replace( /^\s*\/\/.*$/gm, '' );
+    assert.match( code, /const DOWNLOADS_REAPER = calibrateDownloadsTtl\(DOWNLOADS_TTL_HOURS, linkExpirySeconds\(\)\);/ );
+    const sweep = code.slice( code.indexOf( 'function sweepExpiredDownloads()' ) );
+    assert.match( sweep.slice( 0, 300 ), /ttlHours:\s+DOWNLOADS_REAPER_HOURS,/ );
+    assert.match( code, /if \(DOWNLOADS_REAPER\.raised\) log\('warn'/ );
+  } );
+} );

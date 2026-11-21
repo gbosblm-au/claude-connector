@@ -60,9 +60,6 @@
 // off, so the UI can learn the feature is unavailable in one cheap call rather
 // than probing a route that 404s.
 
-import { currentAllowlist, ensureAllowlistFresh, allowlistState, allowlistSource }
-  from './voice-allowlist.js';
-
 const TRUE_VALUES = new Set(['true', '1', 'yes', 'on']);
 
 /**
@@ -74,7 +71,7 @@ const TRUE_VALUES = new Set(['true', '1', 'yes', 'on']);
  * SNAPSHOT_ENABLED, where a typo would leave the feature ON.
  *
  * This is the KILL SWITCH. When it is not exactly true, voice is off for
- * everyone including allowlisted test users, and no identity is ever consulted.
+ * everyone including an overridden student, and no identity is ever consulted.
  *
  * @returns {boolean}
  */
@@ -85,97 +82,63 @@ export function voiceEnabled() {
 }
 
 // ===========================================================================
-// LAYER B -- the per-user allowlist (keyhole)
+// LAYER B -- identity, and the gateway's entitlement claim
 // ===========================================================================
 //
-// ---------------------------------------------------------------------------
-// OPEN ITEM: WHICH IDENTITY FIELD.  Settled here, with the reasoning.
-// ---------------------------------------------------------------------------
+// v13.37.0 (TENAX-VOICE-2026-10-07-02). The per-user allowlist is RETIRED, not
+// repaired. Until 13.36.0 this layer read VOICE_TEST_USERS (or a copy fetched
+// from the gateway) and admitted the identities on it, a permission list with
+// two homes bridged by an operator pasting a generated string. Voice is now
+// available to every account except students without an override (decisions
+// D1 and D2), and that is a fact about the account row, which lives on the
+// gateway. So the gateway decides it, per request, with one function
+// (lib/voice-entitlement.js there), and the connector keeps no list at all.
 //
-// The specification flags this as "decide before build ... scoping the gate to
-// the wrong field locks the operator out of their own testing". Three
-// candidates exist in this connector, and only one of them is safe:
+// What is left here:
 //
-//   1. req.tsTenantId (middleware/tenantAuth.js)
-//      REJECTED. It is a TENANT id, not a user id. In tenant mode every user of
-//      a tenant shares one value, so allowlisting it would admit every user of
-//      that tenant -- which is exactly the leak this gate exists to close.
+//   Identity    X-Tenax-User-Id, set by the gateway from the verified JWT. Its
+//               PRESENCE is an explicit predicate (identityPresent): a request
+//               with no user id is refused, as before.
 //
-//   2. getCurrentUser() -- the process-level session context seeded by
-//      ts_gateway_session_init (tools-self-model/hook.js).
-//      REJECTED, and this is the important one. It is a PROCESS-WIDE SINGLETON.
-//      The self-model's own comment says per-call context is used because it is
-//      "concurrency-safe: the identity travels with the individual call, so
-//      simultaneous sessions from different users never overwrite one another",
-//      and the singleton is only a fallback for direct MCP calls.
+//   The claim   X-Tenax-Voice-Entitlement, set by the gateway from the same
+//               function that refuses at the stream. It decides what
+//               /voice/health RENDERS for this user and nothing else. "A
+//               header is a claim and not an authority: the connector renders
+//               from it, never enforces with it, and the gateway still
+//               refuses at the stream." (section 5). The routes do not read
+//               it; the gateway does not forward a request it has refused.
 //
-//      As a recorder that is a small attribution inaccuracy. As a SECURITY GATE
-//      it is a hole: whoever ran session-init most recently sets the identity
-//      that every subsequent voice request is judged against, so a
-//      non-allowlisted user's request could be evaluated as the operator's. A
-//      gate built on it would appear to work in single-user testing and fail
-//      open under exactly the shared conditions it was written for.
-//
-//   3. The per-call user_id the gateway already sends. CHOSEN.
-//      /tool-call carries { tenant_id, user_id } in its body, and this is the
-//      value the specification recommends: "the same identity value the
-//      UI/gateway exposes when it records a session".
-//
-// The gap this leaves, stated plainly: /voice/transcribe and /voice/synthesize
-// are DIRECT HTTP ROUTES, not proxied tool calls, so no per-call context is
-// injected into them today. The identity therefore has to be supplied on the
-// voice request itself -- X-Tenax-User-Id, matching the user_id the gateway
-// already knows. Absent identity FAILS CLOSED (404), so a caller that does not
-// send it gets the same answer as a caller who is not allowlisted.
+// The transport credential (voice-auth.js) is what makes the headers worth
+// reading: only the gateway's restore token or the operator's MCP key reaches
+// these routes, and a browser holds neither.
 //
 // ---------------------------------------------------------------------------
-// TENANT-QUALIFIED ENTRIES
+// WHICH IDENTITY FIELD (settled in 12.47.0, unchanged)
 // ---------------------------------------------------------------------------
 //
-// Observed user_id values are small integers ("8" in the self-model tests). On
-// a multi-tenant connector, user 8 of tenant A is a different person from user
-// 8 of tenant B, and a bare "8" in the allowlist would admit both.
-//
-// So an entry may be written either way:
-//
-//   8                    matches user_id 8 in ANY tenant
-//   ts_50f3be57:8        matches user_id 8 ONLY in tenant ts_50f3be57
-//
-// The qualified form is the safer one and is what should be used on any
-// deployment serving more than one tenant.
+// Not req.tsTenantId (a TENANT id: every user of a tenant shares it), and not
+// the process-level session context seeded by ts_gateway_session_init (a
+// process-wide singleton: whoever ran session-init last would set the identity
+// every request is judged against). The per-call user id the gateway sends.
 
 /** Identity headers, matching the field names the gateway already uses. */
 export const USER_ID_HEADER = 'x-tenax-user-id';
 export const TENANT_ID_HEADER = 'x-tenax-tenant-id';
 
 /**
- * The allowlist, parsed from VOICE_TEST_USERS.
- *
- * Empty by default, so voice is unreachable until an identity is added --
- * turning the master switch on alone opens nothing.
- *
- * Entries are trimmed but NOT case-folded and NOT pattern-matched. The
- * specification is explicit: "no substring match, no case folding -- an
- * identity must match a listed value verbatim so a typo cannot accidentally
- * include someone." A prefix match on "8" would admit "80" and "8-guest".
- *
- * @returns {string[]}
+ * The gateway's per-request entitlement claim (v13.37.0). `entitled` means the
+ * gateway's predicate allowed this user; anything else, including absence,
+ * renders as not entitled.
  */
-export function testUsers() {
-  // Delegated to voice-allowlist.js, which owns WHERE the list comes from --
-  // VOICE_TEST_USERS, or a live read from the gateway. This function owns what
-  // an entry MEANS, and that is identical either way, so the two modes cannot
-  // disagree about who is allowed. Empty entries are dropped there, which
-  // matters: an empty string would match a caller who sent no identity at all.
-  return currentAllowlist();
-}
+export const ENTITLEMENT_HEADER = 'x-tenax-voice-entitlement';
+export const ENTITLED = 'entitled';
 
 /**
  * Read the calling identity off a request.
  *
- * Deliberately does NOT fall back to the process-level session context. See the
- * rejection of candidate 2 above: that singleton is not concurrency-safe, and a
- * gate that consults it can judge one user's request against another's identity.
+ * Deliberately does NOT fall back to the process-level session context: that
+ * singleton is not concurrency-safe, and a gate that consults it can judge one
+ * user's request against another's identity.
  *
  * @param {object} req
  * @returns {{userId: string|null, tenantId: string|null, source: string}}
@@ -211,54 +174,58 @@ export function resolveIdentity(req) {
 }
 
 /**
- * Is this identity on the allowlist? (Layer B alone -- ignores the master switch.)
+ * Is there an identity on this request? An explicit predicate (section 5:
+ * "Identity presence as an explicit predicate, not an inherited side effect
+ * of a lookup"). No identity is never "allowed by default".
  *
- * @param {{userId: string|null, tenantId: string|null}} identity
+ * @param {{userId: string|null}} identity
  * @returns {boolean}
  */
-export function userAllowed(identity) {
-  const list = testUsers();
-  if (!list.length) return false;
-
-  const userId = identity && identity.userId ? String(identity.userId).trim() : '';
-  // No identity is not "allowed by default". Fail closed.
-  if (!userId) return false;
-
-  const tenantId = identity && identity.tenantId ? String(identity.tenantId).trim() : '';
-
-  for (const entry of list) {
-    const colon = entry.indexOf(':');
-    if (colon === -1) {
-      if (entry === userId) return true;
-      continue;
-    }
-    // Tenant-qualified. BOTH halves must match: a qualified entry is a narrower
-    // grant than a bare one, and matching only the user half would silently
-    // widen it back out to every tenant.
-    const wantTenant = entry.slice(0, colon).trim();
-    const wantUser = entry.slice(colon + 1).trim();
-    if (!wantTenant || !wantUser) continue;
-    if (wantUser === userId && wantTenant === tenantId) return true;
-  }
-  return false;
+export function identityPresent(identity) {
+  return !!(identity && typeof identity.userId === 'string' && identity.userId.trim() !== '');
 }
 
 /**
- * Both layers. Voice is reachable only when the master switch is on AND the
- * caller is allowlisted.
+ * Did the gateway claim this user is entitled? For RENDERING only.
+ *
+ * Exact match on one value: a header sent twice, a typo, or anything other
+ * than `entitled` reads as not entitled, which renders nothing.
+ *
+ * @param {object} req
+ * @returns {boolean}
+ */
+export function entitlementClaimed(req) {
+  const v = req && req.headers ? req.headers[ENTITLEMENT_HEADER] : undefined;
+  if (typeof v !== 'string') return false;
+  return v.trim().toLowerCase() === ENTITLED;
+}
+
+/**
+ * May this request reach a voice route? The master switch, then identity.
  *
  * The master switch is evaluated FIRST and short-circuits, so when voice is
- * globally off no identity is read at all -- matching the specification's
- * "the master switch still gates every route ... before identity is even
- * consulted". Two independent failures must both happen for an unauthorised
- * caller to get through.
+ * globally off no identity is read at all, and nothing here ever makes a
+ * network or database call: an emergency stop must never wait on anything
+ * (claim C-08). Entitlement is not read here: the gateway enforced it before
+ * forwarding (TENAX-VOICE-2026-10-07-02 section 5).
  *
  * @param {object} req
  * @returns {boolean}
  */
 export function voiceAvailableFor(req) {
   if (!voiceEnabled()) return false;
-  return userAllowed(resolveIdentity(req));
+  return identityPresent(resolveIdentity(req));
+}
+
+/**
+ * Should the voice UI render for this request? The routes' answer AND the
+ * gateway's entitlement claim. Read by /voice/health and gateState only.
+ *
+ * @param {object} req
+ * @returns {boolean}
+ */
+export function voiceRenderableFor(req) {
+  return voiceAvailableFor(req) && entitlementClaimed(req);
 }
 
 /**
@@ -306,22 +273,23 @@ export function gateState(engine, req) {
   // Per-user, not global (Section 4.2: "The UI is told per-user, not
   // globally"). A UI handed a global `enabled` would render a mic button for
   // every user on a connector where one operator is testing.
-  const identity = on ? resolveIdentity(req) : { userId: null, tenantId: null, source: 'none' };
-  const forThisUser = on && userAllowed(identity);
+  // v13.37.0: rendered from the gateway's entitlement claim, never computed
+  // here from a list.
+  const forThisUser = on && voiceRenderableFor(req);
 
   return {
     enabled: on,
     // Section 2.2 / 4.2. This is the flag the UI must actually branch on.
     voice_enabled_for_this_user: forThisUser,
     // Render the voice UI at all. Keyed on the PER-USER answer, so a
-    // non-allowlisted user emits nothing even while the master switch is on --
+    // user the gateway did not entitle emits nothing while the master switch is on --
     // the same "absent from the DOM, not merely hidden" discipline, scoped to
     // the requesting user.
     render_voice_ui: forThisUser,
     // Section 7: "If the gate is on but the engine fails to initialise, the UI
     // shows a degraded voice state". Degraded is NOT the same as off -- off
     // emits nothing, degraded emits a disabled control that explains itself.
-    // Readiness is reported per-user too. A non-allowlisted user seeing
+    // Readiness is reported per-user too. A user who is not entitled seeing
     // stt_ready:true would have grounds to render something, which is the leak
     // this gate exists to close.
     degraded: forThisUser ? !!e.degraded : false,
@@ -356,12 +324,10 @@ export function requireVoiceEnabled(res) {
 /**
  * Guard on BOTH layers. This is what the voice routes use.
  *
- * Every refusal -- master switch off, no identity, unknown identity, identity
- * not allowlisted -- produces the byte-identical 404 the global gate produced
- * before this change. Section 4.1: "never as 'route exists but you are not
- * allowed'". A distinct status or message for "not allowlisted" would tell an
- * unauthorised caller that the feature exists and that they are simply on the
- * wrong side of it.
+ * Every refusal -- master switch off, no identity -- produces the
+ * byte-identical 404 the global gate produced. Section 4.1: "never as 'route
+ * exists but you are not allowed'". A user the gateway did not entitle never
+ * reaches here: the gateway refuses before forwarding.
  *
  * @param {object} req
  * @param {object} res
@@ -373,33 +339,9 @@ export function requireVoiceForUser(req, res) {
   return false;
 }
 
-/**
- * The request-path gate. Async, because in gateway mode the allowlist may need
- * refreshing before the answer can be trusted.
- *
- * The master switch is checked FIRST and short-circuits, so a disabled
- * deployment never makes a network call -- an emergency stop must never wait on
- * the system it might be stopping.
- *
- * @param {object} req
- * @returns {Promise<boolean>}
- */
-export async function voiceAvailableForAsync(req) {
-  if (!voiceEnabled()) return false;
-  await ensureAllowlistFresh();
-  return userAllowed(resolveIdentity(req));
-}
-
-/** Where the allowlist is read from, and how stale it is. For /voice/health. */
-export function allowlistDiagnostics() { return allowlistState(); }
-
-/** 'env' or 'gateway'. */
-export function currentAllowlistSource() { return allowlistSource(); }
-
 export default {
   voiceEnabled, benchmarkState, gateState,
   requireVoiceEnabled, requireVoiceForUser,
-  testUsers, resolveIdentity, userAllowed, voiceAvailableFor,
-  voiceAvailableForAsync, allowlistDiagnostics, currentAllowlistSource,
-  USER_ID_HEADER, TENANT_ID_HEADER,
+  resolveIdentity, identityPresent, entitlementClaimed, voiceAvailableFor, voiceRenderableFor,
+  USER_ID_HEADER, TENANT_ID_HEADER, ENTITLEMENT_HEADER, ENTITLED,
 };

@@ -161,11 +161,26 @@ export async function handleMemoryGetSessionContext(rawArgs) {
     }
   }
 
+  // v13.39.0 (TENAX-2026-10-15-01 H-10): past-due re-checks surface at
+  // session open, as the gateway's /memory/session-context surfaces them.
+  // Read-only; ten at most; nothing is removed or demoted.
+  const recheckDue = db
+    .prepare(
+      `SELECT * FROM memories
+        WHERE recheck_at IS NOT NULL AND recheck_at <= ?
+          AND (ttl IS NULL OR ttl > ?)
+        ORDER BY recheck_at ASC
+        LIMIT 10`,
+    )
+    .all(now, now)
+    .map((row) => rowToEntry(row, { includeValue: true }));
+
   return {
     context,
     assembled_at:   now,
     entry_count:    entryCount,
     context_hint:   context_hint ?? null,
     conversations_mode: context_hint ? "relevance" : "recency",
+    recheck_due:    recheckDue,
   };
 }

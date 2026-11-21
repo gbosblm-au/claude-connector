@@ -45,6 +45,8 @@
 
 import { spawn }      from 'node:child_process';
 import { existsSync } from 'node:fs';
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from '../utils/processGuard.js';
 
 /**
  * @typedef {object} WorkerSpec
@@ -421,6 +423,7 @@ export function createStdioWorker(spec) {
 
       let child;
       try {
+        assertLaunchAllowed('voice.stdio_worker', interpreter, args);
         child = spawn(interpreter, args, {
           cwd: existsSync(cwd) ? cwd : undefined,
           // A MINIMAL environment, assembled here rather than inherited. Node's

@@ -52,6 +52,17 @@ import {
   cachedLineCount,
   invalidateSkillFile,
 } from './skill-file-cache.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-2): bulk rewrites claim the store families
+// they touch; see src/utils/storeWriteDiscipline.js.
+import { beginBulkRewrite, CONNECTOR_STORE_FAMILIES } from '../utils/storeWriteDiscipline.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-7): occupancy measured at assembly.
+import { measurePart, compileTokenCap, buildOccupancy } from './skill-occupancy.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-8): selection telemetry. The WRITER only: the
+// dispatch layer never imports the reader (static guard in
+// src/tests/selection-telemetry.test.js).
+import { recordSelection } from './selection-telemetry.js';
+// v13.39.0 (TENAX-2026-10-15-01 H-3): skill-file mutations are ledgered.
+import { appendLedgerEntry, fileDigest, contentDigest, actorFrom } from '../utils/moduleLedger.js';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -495,11 +506,62 @@ function layer4Dependencies(manifest, candidateMap) {
   return additions;
 }
 
+/**
+ * The line budget the compile enforces, read from MANIFEST.json `budget`.
+ *
+ * v13.42.0 (TENAX-2026-10-24-02, the frame lane; Brian's ruling 2026-10-24: a
+ * reserved lane outside the ordinary budget, so other modules cannot consume
+ * it). `frame_lane_lines` is the allocation reserved for the one module the
+ * gateway's skill_load_random may draw per session. The compile never fills
+ * it: its specialist allowance is
+ *
+ *     max_compiled_lines - core_reserve_lines - frame_lane_lines
+ *
+ * so raising max_compiled_lines by exactly the lane leaves every compile's
+ * allowance, and so its selection, as it was (900 / 250 / no lane and
+ * 1250 / 250 / 350 both allow 650). The lane is bounded by the gateway's one
+ * draw per session; it is not a general way to load past the budget.
+ *
+ * Absent, null or 0: no lane, and the allowance is max - core exactly as
+ * before 13.42.0. A value that is not a whole number of lines, or a lane the
+ * ceiling cannot hold (max - core - lane below 0), is NOT applied: the
+ * compile runs as if no lane were set (so a bad edit never shrinks or empties
+ * a compile) and the problem is named in `problem`, which line_budget reports.
+ * The gateway's draw refuses by name on the same two conditions
+ * (Gateway lib/module-draw.js resolveFrameLane), so a lane is never charged
+ * that the compile did not reserve.
+ *
+ * max and core keep their existing `|| default` reading (0 or absent means
+ * the default), unchanged from layer5Budget before 13.42.0.
+ *
+ * @param {object} [budget]  MANIFEST.json budget.
+ * @returns {{ maxLines: number, coreLines: number, frameLaneLines: number, specialistLines: number, problem: string|null }}
+ */
+export function resolveLineBudget(budget) {
+  const b = budget && typeof budget === 'object' ? budget : {};
+  const maxLines = b.max_compiled_lines || 750;
+  const coreLines = b.core_reserve_lines || 250;
+  const raw = b.frame_lane_lines;
+  let lane = 0;
+  let problem = null;
+  // 0 is "no lane" exactly as absent is, whatever the ceiling (a ceiling
+  // below the core reserve is not a lane problem).
+  if (raw !== undefined && raw !== null && raw !== 0) {
+    if (!Number.isInteger(raw) || raw < 0) {
+      problem = `frame_lane_lines is ${JSON.stringify(raw)}; it must be a whole number of lines, 0 or more. No lane is applied.`;
+    } else if (maxLines - coreLines - raw < 0) {
+      problem = `frame_lane_lines ${raw} does not fit: max_compiled_lines ${maxLines} less core_reserve_lines ${coreLines} leaves ${maxLines - coreLines}. No lane is applied; raise max_compiled_lines to at least ${coreLines + raw}.`;
+    } else {
+      lane = raw;
+    }
+  }
+  return { maxLines, coreLines, frameLaneLines: lane, specialistLines: maxLines - coreLines - lane, problem };
+}
+
 function layer5Budget(manifest, finalCandidates, mandatorySet, highConfidenceSet, priorSet = new Set()) {
   const budget = manifest.budget || {};
-  const maxLines = budget.max_compiled_lines || 750;
-  const coreLines = budget.core_reserve_lines || 250;
-  const specialistBudget = maxLines - coreLines;
+  // v13.42.0: the frame lane is reserved out of the ceiling (resolveLineBudget).
+  const specialistBudget = resolveLineBudget(budget).specialistLines;
 
   const moduleMap = {};
   for (const m of (manifest.modules || [])) moduleMap[m.id] = m;
@@ -747,6 +809,9 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   // Layer 6 - budget enforcement (prior-boosted = tier-2 protected)
   const allCandidates = Object.keys(candidateMap);
   let survivingIds = layer5Budget(manifest, allCandidates, mandatorySet, highConfidenceSet, activePriorSet);
+  // v13.39.0 (H-7, H-8): observation only. What the budget demoted is recorded
+  // so the report can name it; the selection itself is not touched.
+  const budgetSurvivors = [...survivingIds];
 
   // -----------------------------------------------------------------------
   // Module Access Level Filter  (injected after budget, before load)
@@ -823,6 +888,13 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
     ? [core, '\n\n' + personalityContent]
     : [core];
 
+  // v13.39.0 (H-7): every part is measured as it is appended, so body sizes
+  // are counted at assembly and the occupancy total is the sum of what was
+  // actually concatenated. Observation only: nothing here changes selection
+  // or content.
+  const assembly = [measurePart('CORE', 'core', core, 'CORE.md')];
+  if (personalityContent) assembly.push(measurePart('PERSONALITY', 'personality', '\n\n' + personalityContent, 'PERSONALITY.md'));
+
   // Load non-self-check modules
   //
   // v13.38.0 (WO-2026-11-20-03 D3): the file for each id comes from
@@ -837,6 +909,7 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
     if (modulePath && existsSync(modulePath)) {
       const content = cachedReadFile(modulePath);
       parts.push('\n\n' + content);
+      assembly.push(measurePart(id, 'module', '\n\n' + content, module.path));
     } else {
       log('warn', `skill-modular: module file not found: ${modulePath}`);
     }
@@ -854,6 +927,35 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
   const priorLoaded = priorModuleList.filter(id => survivingIds.includes(id));
   const priorCut    = priorModuleList.filter(id => !survivingIds.includes(id));
   if (priorCut.length > 0) log('info', `skill-modular: prior modules cut by budget: ${priorCut.join(', ')}`);
+  // v13.39.0 (H-8): the tier that admitted each loaded module, in a fixed
+  // precedence, read from the sets the layers above already computed. Nothing
+  // below feeds back into selection.
+  const alwaysLoadIds = (manifest.modules || []).filter(m => m && m.always_load).map(m => m.id);
+  const alwaysLoadSet = new Set(alwaysLoadIds);
+  const lexicalSet = new Set(Object.keys(layer1Scores));
+  const learnedSet = new Set(learnedAdditions);
+  const tierOf = (id) => {
+    if (id === selfCheckId) return 'self_check';
+    if (alwaysLoadSet.has(id)) return 'always_load';
+    if (mandatorySet.has(id)) return 'mandatory';
+    if (highConfidenceSet.has(id)) return 'high_confidence';
+    if (activePriorSet.has(id) && priorActive && !priorOverride) return 'person_prior';
+    if (lexicalSet.has(id)) return 'lexical';
+    if (Object.prototype.hasOwnProperty.call(layer2, id)) return 'tag_web';
+    if (Object.prototype.hasOwnProperty.call(layer3, id)) return 'adjacency';
+    if (Object.prototype.hasOwnProperty.call(layer4, id)) return 'dependency';
+    if (learnedSet.has(id)) return 'learned_linkage';
+    return 'other';
+  };
+  const budgetSet = new Set(budgetSurvivors);
+  const survivingSet = new Set(survivingIds);
+  const budget = manifest.budget || {};
+  // v13.42.0: the lane and the allowance it leaves are reported only when a
+  // lane is set or refused, so a manifest without one reports exactly what it
+  // did before.
+  const lineBudget = resolveLineBudget(budget);
+  if (lineBudget.problem) log('warn', `skill-modular: ${lineBudget.problem}`);
+
   return {
     compiled,
     modules_loaded:          [...orderedIds, selfCheckId],
@@ -862,6 +964,19 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
     specialist_count:        orderedIds.length,
     person_prior_modules:    priorLoaded,
     person_prior_overridden: priorOverride || false,
+    // v13.39.0 (H-7, H-8): additive, observation-only fields.
+    assembly,
+    selection:               [...orderedIds, selfCheckId].map(id => ({ id, tier: tierOf(id) })),
+    always_load:             alwaysLoadIds.filter(id => survivingSet.has(id)),
+    demoted_by_budget:       allCandidates.filter(id => !budgetSet.has(id)),
+    filtered_by_access:      budgetSurvivors.filter(id => !survivingSet.has(id)),
+    line_budget:             {
+      max_lines: lineBudget.maxLines, core_reserve_lines: lineBudget.coreLines,
+      ...(lineBudget.frameLaneLines > 0 ? { frame_lane_lines: lineBudget.frameLaneLines, specialist_lines: lineBudget.specialistLines } : {}),
+      ...(lineBudget.problem ? { frame_lane_problem: lineBudget.problem } : {}),
+    },
+    token_cap:               compileTokenCap(manifest),
+    person_prior_cut:        priorCut,
   };
 }
 
@@ -999,6 +1114,21 @@ export const dispatchRuleAddToolDefinition = {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * The person-prior outcome for the selection record (H-8), from the closed set
+ * in selection-telemetry.js.
+ *
+ * @returns {string}
+ */
+function priorOutcomeFor(personName, priorEnvEnabled, personPrior, result) {
+  if (!personName) return 'no_person';
+  if (!priorEnvEnabled) return 'disabled';
+  if (!personPrior.active) return 'no_data';
+  if (result.person_prior_overridden) return 'overridden';
+  if ((result.person_prior_cut || []).length) return 'active_partly_cut';
+  return 'active';
+}
+
 export async function handleSkillCompile(args, context = null) {
   const paths = getModularPaths();
 
@@ -1043,6 +1173,21 @@ export async function handleSkillCompile(args, context = null) {
 
     log('info', `skill_compile: session ${sessionId}: ${result.specialist_count} specialists, ${result.line_count} lines. ${priorNote}`);
 
+    // v13.39.0 (H-7): tokens used against the cap, counted at assembly, with
+    // every part's size and the truncation policy. Observation only.
+    const occupancy = buildOccupancy({
+      parts: result.assembly, tokenCap: result.token_cap, lineBudget: result.line_budget,
+      lineCount: result.line_count, demoted: result.demoted_by_budget, filtered: result.filtered_by_access, path: 'compile',
+    });
+    log('info', `skill_compile: occupancy ${occupancy.tokens_used}/${occupancy.cap} est. tokens (${occupancy.pct_of_cap}%), ${occupancy.modules.length} parts${occupancy.truncation.markers.length ? `; ${occupancy.truncation.markers.join(' ; ')}` : ''}`);
+
+    // v13.39.0 (H-8): the selection record. Never allowed to cost the compile.
+    recordSelection(paths.avaDir, {
+      path: 'compile', sessionId, person: personName || null, conditions: result.conditions_detected,
+      modules: result.selection, alwaysLoad: result.always_load,
+      prior: priorOutcomeFor(personName, priorEnvEnabled, personPrior, result),
+    });
+
     return {
       content: [{
         type: 'text',
@@ -1061,6 +1206,7 @@ export async function handleSkillCompile(args, context = null) {
           additions_count: 0,
           additions_content: '',
           additions_note: 'No pending additions in modular mode. Use skill_write_addition for IFA cycle additions to canonical SKILL.md.',
+          occupancy,
         }, null, 2),
       }],
     };
@@ -1146,7 +1292,7 @@ export async function handleSkillLoadSpecialist(args) {
   };
 }
 
-export async function handlePersonalityWrite(args) {
+export async function handlePersonalityWrite(args, context = null) {
   const paths = getModularPaths();
   ensureModularDirs(paths);
 
@@ -1196,7 +1342,14 @@ export async function handlePersonalityWrite(args) {
   // Update last-modified date
   content = content.replace(/\*Last Section A update:.*\*/, `*Last Section A update: ${dateStr}*`);
 
+  // v13.39.0 (H-3): PERSONALITY.md is a compile input; its mutation is ledgered.
+  const personalityBefore = fileDigest(paths.personalityFile);
   writeFileSync(paths.personalityFile, content, 'utf8');
+  appendLedgerEntry({
+    file: paths.personalityFile, kind: 'skill_file', action: 'write', actor: actorFrom(context),
+    reason: `personality_write ${mode}: ${label}`, tool: 'personality_write',
+    before: personalityBefore, after: contentDigest(content),
+  });
   // v13.20.0. mtime validation would catch this on the next compile anyway;
   // invalidating explicitly removes the dependence on stat granularity, which
   // matters most for the author who writes a module and immediately asks a
@@ -1232,7 +1385,7 @@ export async function handlePersonalityWrite(args) {
   };
 }
 
-export async function handleDispatchRuleAdd(args) {
+export async function handleDispatchRuleAdd(args, context = null) {
   const paths = getModularPaths();
   ensureModularDirs(paths);
 
@@ -1298,7 +1451,15 @@ export async function handleDispatchRuleAdd(args) {
     dispatchRules.learned_linkages.rules.push(newRule);
   }
 
-  writeFileSync(paths.dispatchRulesFile, JSON.stringify(dispatchRules, null, 2), 'utf8');
+  // v13.39.0 (H-3): DISPATCH_RULES.json is a dispatch-layer input; its mutation is ledgered.
+  const rulesBefore = fileDigest(paths.dispatchRulesFile);
+  const rulesText = JSON.stringify(dispatchRules, null, 2);
+  writeFileSync(paths.dispatchRulesFile, rulesText, 'utf8');
+  appendLedgerEntry({
+    file: paths.dispatchRulesFile, kind: 'skill_file', action: 'write', actor: actorFrom(context),
+    reason: `dispatch_rule_add ${ruleId} -> ${moduleToAdd}: ${triggerDescription}`.slice(0, 1000), tool: 'dispatch_rule_add',
+    before: rulesBefore, after: contentDigest(rulesText),
+  });
   invalidateSkillFile(paths.dispatchRulesFile);
   log('info', `dispatch_rule_add: ${existingIdx >= 0 ? 'updated' : 'added'} rule ${ruleId} -> ${moduleToAdd}`);
 
@@ -1432,6 +1593,18 @@ export async function handleSkillRecompile(args, context = null) {
   const currentSet = new Set(currentModules);
   const newModules = result.modules_loaded.filter(id => !currentSet.has(id));
 
+  // v13.39.0 (H-8): the recompile's selection is recorded like a compile's:
+  // the dispatcher's full selection for the new query in `modules`, and the
+  // subset this call actually returned (not already loaded) in `delta`.
+  // Never allowed to cost the call.
+  recordSelection(paths.avaDir, {
+    path: 'recompile', sessionId: typeof args.session_id === 'string' ? args.session_id : null,
+    person: personName || null, conditions: result.conditions_detected,
+    modules: result.selection, alwaysLoad: result.always_load,
+    prior: priorOutcomeFor(personName, priorEnvEnabled, personPrior, result),
+    delta: newModules,
+  });
+
   if (newModules.length === 0) {
     log('info', `skill_recompile: no new modules for query "${newQuery.slice(0, 60)}..." — all ${result.modules_loaded.length} selected modules already loaded`);
     return {
@@ -1443,6 +1616,8 @@ export async function handleSkillRecompile(args, context = null) {
           modules_count:        0,
           all_selected_modules: result.modules_loaded,
           conditions_detected:  result.conditions_detected,
+          // v13.39.0 (H-7): an empty delta still reports its occupancy.
+          occupancy:            buildOccupancy({ parts: [], tokenCap: result.token_cap, lineBudget: result.line_budget, lineCount: 0, demoted: result.demoted_by_budget, filtered: result.filtered_by_access, path: 'recompile' }),
           note: 'All modules selected by the dispatcher for this topic are already loaded in the current session context. No additional content needed. Proceed with the current skill context.',
         }, null, 2),
       }],
@@ -1455,6 +1630,8 @@ export async function handleSkillRecompile(args, context = null) {
   for (const m of (manifest.modules || [])) moduleMap[m.id] = m;
 
   const parts = [];
+  // v13.39.0 (H-7): the delta's parts, measured as they are appended.
+  const deltaAssembly = [];
   for (const id of newModules) {
     const module = moduleMap[id];
     if (!module) continue;
@@ -1464,7 +1641,9 @@ export async function handleSkillRecompile(args, context = null) {
       modulePath = paths.ownerAvaDir + module.path;
     }
     if (existsSync(modulePath)) {
-      parts.push('\n\n' + readFileSync(modulePath, 'utf8'));
+      const deltaText = '\n\n' + readFileSync(modulePath, 'utf8');
+      parts.push(deltaText);
+      deltaAssembly.push(measurePart(id, id === 'meta-self-check' ? 'self_check' : 'module', deltaText, module.path));
     } else {
       log('warn', `skill_recompile: module file not found: ${modulePath}`);
     }
@@ -1483,6 +1662,8 @@ export async function handleSkillRecompile(args, context = null) {
         all_selected_modules: result.modules_loaded,
         conditions_detected:  result.conditions_detected,
         line_count:           countLines(deltaContent),
+        // v13.39.0 (H-7): the delta's size against the cap, per module.
+        occupancy:            buildOccupancy({ parts: deltaAssembly, tokenCap: result.token_cap, lineBudget: result.line_budget, lineCount: countLines(deltaContent), demoted: result.demoted_by_budget, filtered: result.filtered_by_access, path: 'recompile' }),
         note: `Recompile delta: ${newModules.length} new module(s) loaded for the new topic. Append this content to your active session context. These modules supersede any conflicting guidance from modules loaded earlier this session.`,
       }, null, 2),
     }],
@@ -1560,7 +1741,15 @@ export async function handleModulesRestoreFromWp(body) {
     if (dir) mkdirSync(dir, { recursive: true });
 
     try {
+      const restoreBefore = fileDigest(fullPath);
       writeFileSync(fullPath, fileContent, 'utf8');
+      // v13.39.0 (H-3): a WordPress push is a mutation of every file it writes.
+      appendLedgerEntry({
+        file: fullPath, kind: safe.startsWith('modules/') ? 'module' : 'skill_file', action: 'restore',
+        actor: `wordpress-restore:${String(body.source || 'wordpress-push').slice(0, 60)}`,
+        reason: String(body.change_summary || 'WordPress push').slice(0, 200), tool: 'restore-modules',
+        before: restoreBefore, after: contentDigest(fileContent),
+      });
       invalidateSkillFile(fullPath);
       // Post-write verification: confirm file is actually on disk
       const verified = existsSync(fullPath);
@@ -1575,6 +1764,9 @@ export async function handleModulesRestoreFromWp(body) {
       results[relativePath] = { success: false, error: err.message, path: fullPath };
       log('error', `restore-modules: FAILED to write ${fullPath}: ${err.message}`);
     }
+  }
+  } finally {
+    bulk.release();
   }
 
   const successCount = Object.values(results).filter(r => r.success).length;

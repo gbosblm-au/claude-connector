@@ -441,7 +441,7 @@ function readContentFile(dirPath, filePath) {
   return readFileSync(fullPath, 'utf8');
 }
 
-async function writeContentFile(dirPath, section, filePath, content, changeNote) {
+async function writeContentFile(dirPath, section, filePath, content, changeNote, opts = {}) {
   // v12.28.0 (TNX-C-005): the read path carried a traversal guard (FIX 8) but
   // the WRITE path carried none, which is the more consequential of the two.
   // Applying the same containment check here closes the asymmetry.
@@ -455,6 +455,21 @@ async function writeContentFile(dirPath, section, filePath, content, changeNote)
   if (!fullPath) {
     throw new ToolValidationError(`Path escapes content directory, or resolves through a symbolic link: ${filePath}`);
   }
+
+  // v13.39.0 (H-2): the section IS the store family (archive, references,
+  // scripts). Checked after containment, so a refused write is only ever a
+  // well-formed one, and before any byte lands, so a refusal applies nothing.
+  // A refusal is returned, not thrown: it is an answer the caller acts on.
+  const guard = guardStoreWrite({
+    family:  section,
+    target:  filePath,
+    content,
+    tool:    opts.tool || `${section}_write`,
+    actor:   opts.actor || 'tool-call',
+    claimId: opts.claimId || null,
+  });
+  if (!guard.allowed) return guard.refusal;
+
   const fileDir  = dirname(fullPath);
   if (!existsSync(fileDir)) mkdirSync(fileDir, { recursive: true });
   const isNew = !existsSync(fullPath);
@@ -553,6 +568,7 @@ export const archiveWriteToolDefinition = {
       filename:    { type: 'string', description: 'Filename within the archive directory. Must end with .md or .txt. No path separators.' },
       content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change. Optional.' },
+      claim_id:    { type: 'string', description: 'Optional. The claim_id of an active store claim you hold (store_claim declare). Only the holder of a claim may write a claimed store; any other write is refused, names the holder, and is captured to forensics.' },
     },
     required: ['filename', 'content'],
   },
@@ -592,6 +608,7 @@ export const referenceWriteToolDefinition = {
       filename:    { type: 'string', description: 'Relative path within references/. May include up to 3 subdirectory levels. E.g. "erp/new-guide.md" or "erp/platform-specific/new-platform.md".' },
       content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change. Optional.' },
+      claim_id:    { type: 'string', description: 'Optional. The claim_id of an active store claim you hold (store_claim declare). Only the holder of a claim may write a claimed store; any other write is refused, names the holder, and is captured to forensics.' },
     },
     required: ['filename', 'content'],
   },
@@ -631,6 +648,7 @@ export const scriptWriteToolDefinition = {
       filename:    { type: 'string', description: 'Relative path within scripts/ including subdirectory (e.g. "music-analysis/new_script.py"). Accepted extensions: .py, .sh, .js, .mjs, .cjs, .ts, .txt, .md, .json.' },
       content:     { type: 'string', description: 'Full content to write to the file.' },
       change_note: { type: 'string', description: 'Brief description of the change. Optional.' },
+      claim_id:    { type: 'string', description: 'Optional. The claim_id of an active store claim you hold (store_claim declare). Only the holder of a claim may write a claimed store; any other write is refused, names the holder, and is captured to forensics.' },
     },
     required: ['filename', 'content'],
   },
@@ -640,7 +658,7 @@ export const scriptWriteToolDefinition = {
 // Handlers
 // ---------------------------------------------------------------------------
 
-export async function handleModuleWrite(args) {
+export async function handleModuleWrite(args, context = null) {
   const { content, change_note, force = false, manifest_entry = null, dispatch_rule = null, skip_manifest = false } = args;
   // FIX 1: accept file / filename / path interchangeably (gateway key drift).
   const file = firstStringKey(args, 'file', 'filename', 'path');
@@ -888,9 +906,98 @@ export async function handleModuleWrite(args) {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // v13.39.0 (TENAX-2026-10-15-01): three gates on the module write path, in
+  // order, before a byte of the body lands.
+  //
+  //   H-2  store-write discipline: the modules store (and, when the write will
+  //        register, the references store that holds the manifest fragment)
+  //        may have a declared writer. A write by anyone else is refused,
+  //        names the holder, and is captured to forensics.
+  //   H-11 intake gate: the checklist runs on a new module and on any content
+  //        change, and its record is written BEFORE the body. A failed check
+  //        refuses the write by name; a record that cannot be written refuses
+  //        it too, because registration requires one.
+  //   H-3  audit ledger: every mutation (body and fragment) appends before/
+  //        after sha256, actor, reason and time.
+  // -------------------------------------------------------------------------
+  const isMarkdownModule = /\.md$/i.test(cleanPath);
+  const willRegister = !skip_manifest && isMarkdownModule;
+  const actor = actorFrom(context);
+  const claimId = firstStringKey(args, 'claim_id') || null;
+
+  let entry = null;
+  if (isMarkdownModule) {
+    try {
+      entry = deriveModuleEntry(cleanPath, content, manifest_entry || {});
+    } catch (err) {
+      log('error', `[module_write] manifest entry derivation FAILED for modules/${cleanPath}: ${err.message}`);
+      entry = null;
+    }
+  }
+
+  const refusalResult = (payload) => ({ content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true });
+
+  const modulesGuard = guardStoreWrite({ family: 'modules', target: cleanPath, content, tool: 'module_write', actor, claimId });
+  if (!modulesGuard.allowed) return refusalResult(modulesGuard.refusal);
+  if (willRegister) {
+    const refsGuard = guardStoreWrite({
+      family: 'references', target: 'manifest/(registration)', content: JSON.stringify({ module: entry, dispatch_rule }, null, 2),
+      tool: 'module_write', actor, claimId,
+    });
+    if (!refsGuard.allowed) return refusalResult(refsGuard.refusal);
+  }
+
+  const beforeDigest = isNew ? { sha256: null, bytes: null } : fileDigest(fullPath);
+  const afterDigest  = contentDigest(content);
+  const contentChanged = beforeDigest.sha256 !== afterDigest.sha256;
+  const existingIntake = readIntakeRecord(cleanPath);
+
+  let intake = existingIntake;
+  if (isNew || contentChanged || !existingIntake || existingIntake.content_sha256 !== afterDigest.sha256) {
+    let mergedManifest = { modules: [] };
+    try {
+      const freshJson = (path, fallback) => {
+        try { return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : fallback; } catch { return fallback; }
+      };
+      mergedManifest = loadMergedManifest({
+        avaDir: paths.avaDir,
+        manifestFile: paths.avaDir + 'MANIFEST.json',
+        manifestAppendFile: paths.avaDir + 'MANIFEST_APPEND.json',
+      }, freshJson).manifest;
+    } catch (err) {
+      log('warn', `[module_write] intake could not read the merged manifest (${err.message}); dependency checks run against an empty registry`);
+    }
+    intake = runIntake({ cleanPath, content, entry, manifest: mergedManifest, isNew, actor });
+    const written = writeIntakeRecord(cleanPath, intake);
+    if (!written.ok) {
+      return refusalResult({
+        refused: true,
+        code: 'intake_record_unwritable',
+        message: `Refused: the intake record for modules/${cleanPath} could not be written (${written.error}). A module is not written or registered without one. Nothing was changed.`,
+      });
+    }
+    if (!intake.passed) {
+      log('warn', `[module_write] intake REFUSED modules/${cleanPath}: ${intake.failed.join(', ')}`);
+      return refusalResult({
+        refused: true,
+        code: 'intake_check_failed',
+        failed_checks: intake.failed,
+        message: `Refused by the module intake gate: ${intake.checks.filter((c) => c.status === 'fail').map((c) => `${c.name}: ${c.detail}`).join(' | ')}. Nothing was written.`,
+        intake,
+      });
+    }
+  }
+
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   if (!isNew) log('warn', `[module_write] Overwriting existing file (force=true confirmed): modules/${cleanPath}`);
   writeFileSync(fullPath, content, 'utf8');
+
+  const bodyLedger = appendLedgerEntry({
+    file: fullPath, kind: 'module', action: isNew ? 'create' : 'overwrite', actor,
+    reason: change_note || '', tool: 'module_write', before: beforeDigest, after: afterDigest,
+    extra: entry ? { module_id: entry.id } : null,
+  });
 
   // -------------------------------------------------------------------------
   // v12.21.0: STRUCTURAL MANIFEST REGISTRATION.
@@ -905,26 +1012,47 @@ export async function handleModuleWrite(args) {
   //
   // Only .md module bodies are registered (a .json module file is data, not a
   // dispatchable module). skip_manifest opts out for body-only edits.
+  //
+  // v13.39.0 (H-11): registration goes through registerModuleWithIntake, which
+  // refuses without a passing intake record taken over this exact content.
   // -------------------------------------------------------------------------
   let manifestResult = { registered: false, reason: 'skipped' };
-  const isMarkdownModule = /\.md$/i.test(cleanPath);
   if (skip_manifest) {
     manifestResult = { registered: false, reason: 'skip_manifest=true — existing registration left untouched' };
   } else if (!isMarkdownModule) {
     manifestResult = { registered: false, reason: 'non-.md module file — data files are not registered as dispatchable modules' };
+  } else if (!entry) {
+    manifestResult = { registered: false, error: 'manifest entry could not be derived', required_action: 'Pass manifest_entry explicitly and re-run module_write.' };
   } else {
     try {
-      const entry = deriveModuleEntry(cleanPath, content, manifest_entry || {});
-      const frag  = writeModuleFragment(paths.avaDir, entry, dispatch_rule);
-      manifestResult = {
-        registered:      true,
-        fragment_file:   `references/manifest/${frag.file}`,
-        fragment_action: frag.action,
-        module_action:   frag.module_action,
-        module_id:       entry.id,
-        module_path:     entry.path,
-        dispatch_rule:   dispatch_rule ? 'registered' : 'none',
-      };
+      const fragmentDir = join(paths.avaDir, 'references', 'manifest');
+      const fragmentsBefore = new Map();
+      if (existsSync(fragmentDir)) {
+        for (const name of readdirSync(fragmentDir)) fragmentsBefore.set(name, fileDigest(join(fragmentDir, name)));
+      }
+      const reg = registerModuleWithIntake({ avaDir: paths.avaDir, cleanPath, content, entry, dispatchRule: dispatch_rule });
+      if (!reg.ok) {
+        log('error', `[module_write] registration REFUSED for modules/${cleanPath}: ${reg.reason}`);
+        manifestResult = { registered: false, code: reg.code, error: reg.reason };
+      } else {
+        const frag = reg.fragment;
+        appendLedgerEntry({
+          file: frag.path, kind: 'fragment', action: 'register', actor,
+          reason: change_note || '', tool: 'module_write',
+          before: fragmentsBefore.get(frag.file) || { sha256: null, bytes: null },
+          after: fileDigest(frag.path),
+          extra: { module_id: entry.id, module_path: entry.path, module_action: frag.module_action },
+        });
+        manifestResult = {
+          registered:      true,
+          fragment_file:   `references/manifest/${frag.file}`,
+          fragment_action: frag.action,
+          module_action:   frag.module_action,
+          module_id:       entry.id,
+          module_path:     entry.path,
+          dispatch_rule:   dispatch_rule ? 'registered' : 'none',
+        };
+      }
     } catch (err) {
       // A registration failure must never lose the module body write, but it
       // must also never pass silently — that silence is the original bug.
@@ -1013,7 +1141,9 @@ export async function handleArchiveWrite(args) {
     requireContent(content);
     const clean  = validateFilename(filename);
     const paths  = getContentPaths();
-    const result = await writeContentFile(paths.archiveDir, 'archive', clean, content, change_note);
+    const result = await writeContentFile(paths.archiveDir, 'archive', clean, content, change_note,
+      { tool: 'archive_write', claimId: firstStringKey(args, 'claim_id') || null });
+    if (result && result.refused) return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: true };
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     if (err instanceof ToolValidationError) {
@@ -1078,7 +1208,9 @@ export async function handleReferenceWrite(args) {
     }
     const clean  = validateContentPath(filename, ['md', 'txt', 'json']);
     const paths  = getContentPaths();
-    const result = await writeContentFile(paths.referencesDir, 'references', clean, content, change_note);
+    const result = await writeContentFile(paths.referencesDir, 'references', clean, content, change_note,
+      { tool: 'reference_write', claimId: firstStringKey(args, 'claim_id') || null });
+    if (result && result.refused) return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: true };
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     if (err instanceof ToolValidationError) {
@@ -1143,7 +1275,9 @@ export async function handleScriptWrite(args) {
     }
     const clean  = validateContentPath(filename, ['py', 'sh', 'js', 'mjs', 'cjs', 'ts', 'txt', 'md', 'json']);
     const paths  = getContentPaths();
-    const result = await writeContentFile(paths.scriptsDir, 'scripts', clean, content, change_note);
+    const result = await writeContentFile(paths.scriptsDir, 'scripts', clean, content, change_note,
+      { tool: 'script_write', claimId: firstStringKey(args, 'claim_id') || null });
+    if (result && result.refused) return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: true };
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     if (err instanceof ToolValidationError) {
@@ -1174,6 +1308,25 @@ function buildRestoreHandler(sectionLabel, getDirFn, validateFn) {
     const results  = {};
     let   success  = 0;
     let   failures = 0;
+
+    // v13.39.0 (H-2): a restore REWRITES the store, so it declares a claim on
+    // it for its duration. If another process already holds one, nothing is
+    // written: the whole pushed payload is captured to forensics and the
+    // refusal names the holder. While this restore holds the claim, an
+    // interactive write to the same store is refused and captured in turn.
+    const bulk = beginBulkRewrite({
+      families: [sectionLabel],
+      kind:     'restore',
+      label:    'wordpress-restore',
+      purpose:  `restore-${sectionLabel} from ${String(body.source || 'wordpress-push').slice(0, 60)} (${fileEntries.length} files)`,
+      payload:  fileEntries.map(([rel, c]) => ({ family: sectionLabel, rel, content: typeof c === 'string' ? c : String(c) })),
+      tool:     `restore-${sectionLabel}`,
+      actor:    String(body.source || 'wordpress-push').slice(0, 60),
+    });
+    if (!bulk.ok) {
+      return { success: false, section: sectionLabel, error: bulk.refusal.message, refusal: bulk.refusal, files_restored: 0, files_failed: fileEntries.length };
+    }
+    try {
     for (const [rawName, content] of fileEntries) {
       try {
         const clean    = validateFn(rawName);
@@ -1188,6 +1341,9 @@ function buildRestoreHandler(sectionLabel, getDirFn, validateFn) {
         failures++;
         log('warn', `restore-${sectionLabel}: failed to write "${rawName}": ${err.message}`);
       }
+    }
+    } finally {
+      bulk.release();
     }
     return { success: true, section: sectionLabel, files_restored: success, files_failed: failures, results, source: body.source || 'wordpress-push', timestamp: new Date().toISOString() };
   };

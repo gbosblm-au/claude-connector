@@ -192,10 +192,11 @@ const SELF_AUTHENTICATED_ROUTES = [
   // constant-time comparison and 401s otherwise. Exactly the pattern the
   // /restore-* and /volume-* routes above already follow.
   //
-  // Exemption from the MCP key is not exemption from the feature gate. Both
-  // layers of voice-gate.js -- the VOICE_ENABLED master switch and the
-  // per-user VOICE_TEST_USERS allowlist -- still run on every request, and
-  // still answer 404 rather than 403 to anyone they refuse.
+  // Exemption from the MCP key is not exemption from the feature gate.
+  // voice-gate.js -- the VOICE_ENABLED master switch and the identity check --
+  // still runs on every request, and still answers 404 rather than 403 to
+  // anyone it refuses. (v13.37.0: the per-user allowlist is retired; who is
+  // entitled is decided on the gateway, TENAX-VOICE-2026-10-07-02.)
   //
   // These are `exact`, not a `/voice/` prefix. A prefix entry would exempt
   // every future /voice/* route from authentication by default, which is the

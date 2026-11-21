@@ -22,6 +22,8 @@ import { getSelfModelDb, getSelfModelDbPath, isSelfModelEnabled } from "../tools
 import { log } from "../utils/logger.js";
 
 import { buildScriptEnv } from "../utils/scriptEnv.js";
+// v13.39.0 (TENAX-2026-10-15-01 H-4): every process launch passes the self-termination guard.
+import { assertLaunchAllowed } from "../utils/processGuard.js";
 const SCRIPTS_BASE = process.env.SCRIPTS_DIR
   ? resolvePath(process.env.SCRIPTS_DIR)
   : resolvePath("/data/skill/ava/scripts");
@@ -48,6 +50,7 @@ function runScript(scriptName, scriptArgs, timeoutSeconds = 30) {
       message: `${scriptName} not found in ${SCRIPTS_BASE}. Deploy the Phase 4 scripts to the volume.` };
   }
   const dbPath = getSelfModelDbPath();
+  assertLaunchAllowed("socratic.python", pythonBin(), [scriptPath, ...scriptArgs, "--db", dbPath]);
   const result = spawnSync(
     pythonBin(),
     [scriptPath, ...scriptArgs, "--db", dbPath],
