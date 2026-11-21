@@ -37,6 +37,9 @@ import {
 } from 'node:fs';
 import { log } from '../utils/logger.js';
 import { loadMergedManifest } from './manifest-fragments.js';
+// v13.38.0 (WO-2026-11-20-03 D3): the one resolver of "which file is module
+// X", shared with skill_audit, skill_consistency_audit and module_delete.
+import { resolveModulePath, quarantinedPathIndex } from './module-files.js';
 import {
   resolveSessionIdentity,
   gatewayConfigured,
@@ -821,11 +824,17 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
     : [core];
 
   // Load non-self-check modules
+  //
+  // v13.38.0 (WO-2026-11-20-03 D3): the file for each id comes from
+  // resolveModulePath, the resolver skill_audit and module_delete also use, so
+  // the copy a delete protects is by construction the copy loaded here. Its
+  // compile form applies this loop's own rule (the last merged entry for the
+  // id, avaDir + entry.path); the selection above is untouched.
   for (const id of orderedIds) {
     const module = moduleMap[id];
     if (!module) continue;
-    const modulePath = paths.avaDir + module.path;
-    if (existsSync(modulePath)) {
+    const modulePath = resolveModulePath(id, { paths, manifest }).resolved_path_absolute;
+    if (modulePath && existsSync(modulePath)) {
       const content = cachedReadFile(modulePath);
       parts.push('\n\n' + content);
     } else {
@@ -835,8 +844,8 @@ function compileSkill(query, contextHint, paths, personPrior = null, moduleAcces
 
   // Always append self-check last
   if (moduleMap[selfCheckId]) {
-    const selfCheckPath = paths.avaDir + moduleMap[selfCheckId].path;
-    if (existsSync(selfCheckPath)) {
+    const selfCheckPath = resolveModulePath(selfCheckId, { paths, manifest }).resolved_path_absolute;
+    if (selfCheckPath && existsSync(selfCheckPath)) {
       parts.push('\n\n' + cachedReadFile(selfCheckPath));
     }
   }
@@ -1496,11 +1505,55 @@ export async function handleModulesRestoreFromWp(body) {
   const files = body.files || {};
   const results = {};
 
+  // v13.39.0 (WO-2026-11-21-01 R15): a mirror push must not undo a quarantine.
+  // Before restoring any path under modules/, read the module file event log
+  // and skip a path whose most recent event is 'quarantined' with no later
+  // 'restored' (or 'purged', the permanent form of a quarantine). Skipped paths
+  // are reported, with the reason, never silently dropped. If the log exists
+  // but cannot be read, every modules/ path is skipped: a push that cannot
+  // tell which files were quarantined fails closed for module files only.
+  const skipped = [];
+  let quarantined = null;
+  let logError = null;
+  try {
+    quarantined = quarantinedPathIndex(paths);
+  } catch (err) {
+    logError = err.message;
+    log('error', `restore-modules: the module file event log could not be read (${err.message}); modules/ paths will be skipped`);
+  }
+
   for (const [relativePath, fileContent] of Object.entries(files)) {
     if (typeof fileContent !== 'string') continue;
     // Sanitise path - no .. traversal, no leading slash
     const safe = relativePath.replace(/\.\./g, '').replace(/^[\/\\]/, '');
     const fullPath = paths.avaDir + safe;
+
+    // R15: compare in the event log's own form ("modules/<...>", no "./", no
+    // doubled separators), so a spelling variant cannot slip past the check.
+    const logForm = safe.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/^(\.\/)+/, '');
+    // D15 / R11: the record and the quarantine are not mirror targets. A push
+    // that wrote module-history/ could rewrite the record of a purge; one that
+    // wrote quarantine/ could plant a file a later restore would move back.
+    if (logForm.startsWith('module-history/') || logForm.startsWith('quarantine/')) {
+      skipped.push({ path: relativePath, reason: 'module-history/ and quarantine/ are written only by module_delete and module_restore, never by a mirror push' });
+      log('warn', `restore-modules: SKIPPED ${logForm} (protected: event record or quarantine)`);
+      continue;
+    }
+    if (logForm.startsWith('modules/')) {
+      if (logError !== null) {
+        skipped.push({ path: relativePath, reason: `the module file event log could not be read (${logError}); a quarantined file cannot be ruled out` });
+        continue;
+      }
+      const q = quarantined.get(logForm);
+      if (q) {
+        skipped.push({ path: relativePath, reason: q.action === 'purged'
+          ? 'purged: its most recent module file event is a purge, so the mirror does not re-create it'
+          : 'quarantined: its most recent module file event is a quarantine with no later restore; restore it with module_restore, not a mirror push',
+        last_event: q });
+        log('warn', `restore-modules: SKIPPED ${logForm} (${q.action} ${q.at || ''}, event ${q.event_id || '?'})`);
+        continue;
+      }
+    }
 
     // Ensure parent directory exists
     const dir = fullPath.split('/').slice(0, -1).join('/');
@@ -1526,12 +1579,14 @@ export async function handleModulesRestoreFromWp(body) {
 
   const successCount = Object.values(results).filter(r => r.success).length;
   const failCount    = Object.values(results).filter(r => !r.success).length;
-  log('info', `restore-modules: complete — ${successCount} written, ${failCount} failed, ava_dir=${paths.avaDir}`);
+  log('info', `restore-modules: complete: ${successCount} written, ${failCount} failed, ${skipped.length} skipped, ava_dir=${paths.avaDir}`);
 
   return {
     success:       failCount === 0,
     files_restored: successCount,
     files_failed:   failCount,
+    files_skipped:  skipped.length,
+    skipped,
     ava_dir:        paths.avaDir,
     tenant_mode:    paths.isTenantMode,
     results,

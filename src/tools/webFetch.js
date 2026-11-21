@@ -132,6 +132,95 @@ function extractHeadings($) {
   return headings;
 }
 
+// ---------------------------------------------------------------------------
+// v13.37.0 (TENAX-2026-11-10-02, R2) -- structured data
+// ---------------------------------------------------------------------------
+//
+// A product page that carries schema.org JSON-LD states its own identity: gtin,
+// mpn, brand, model, itemCondition, the variant group. This tool parsed the
+// HTML, took headings and links from the parse, and then REMOVED every script
+// element before reading the text, so that declared identity was unreachable
+// to every caller. It is now returned, when asked for, as it was written.
+//
+// Each element is { "@type", data }: one per application/ld+json script that
+// parses. Nothing is interpreted here. The connector does not know what a
+// product is and must not grow an opinion about one; the caller reads the
+// vocabulary. A script that does not parse is counted, not guessed at.
+//
+// Bounded, because a page may carry a great deal of it and this result is
+// returned to a model: at most STRUCTURED_MAX_BLOCKS blocks and
+// STRUCTURED_MAX_CHARS serialised characters. What the bound left out is
+// counted in structured_data_dropped, so a short list is never read as "the
+// page declared nothing more".
+export const STRUCTURED_MAX_BLOCKS = 20;
+export const STRUCTURED_MAX_CHARS = 60000;
+
+export function extractStructuredData($) {
+  const blocks = [];
+  let invalid = 0;
+  let dropped = 0;
+  let chars = 0;
+  $("script[type='application/ld+json']").each((_, el) => {
+    const raw = String($(el).html() || "")
+      .replace(/^\s*<!--/, "")
+      .replace(/-->\s*$/, "")
+      .replace(/^\s*\/\/\s*<!\[CDATA\[/, "")
+      .replace(/\/\/\s*\]\]>\s*$/, "")
+      .trim();
+    if (!raw) return;
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      invalid++;
+      return;
+    }
+    if (data === null || typeof data !== "object") {
+      invalid++;
+      return;
+    }
+    const size = JSON.stringify(data).length;
+    if (blocks.length >= STRUCTURED_MAX_BLOCKS || chars + size > STRUCTURED_MAX_CHARS) {
+      dropped++;
+      return;
+    }
+    chars += size;
+    const t = Array.isArray(data) ? "ItemList" : data["@type"] ?? (data["@graph"] ? "@graph" : null);
+    blocks.push({ "@type": Array.isArray(t) ? t.join(",") : t || null, data });
+  });
+  return { blocks, invalid, dropped };
+}
+
+// ---------------------------------------------------------------------------
+// v13.37.0 (TENAX-2026-11-10-02, change K) -- a refusal is an answer
+// ---------------------------------------------------------------------------
+//
+// Every non-2xx upstream reply was thrown as an Error. The MCP layer answers a
+// thrown tool with a 500, so to a caller an anti-bot 403, a merchant's 404, a
+// 429 and a platform outage were one failure, and the status that told them
+// apart was destroyed in the service that received it.
+//
+// A caller may now ask for the reply as DATA (on_http_error: "return"). It
+// gets the status, the content type, the first characters of the body and
+// whether the reply looks like an anti-bot refusal. The DEFAULT IS UNCHANGED:
+// without the argument a non-2xx reply throws exactly as before, because the
+// other callers of this tool (the chat model, subject lookup, social compose)
+// were written against the throw and read an empty page as something else.
+//
+// A request that received NO reply still throws, and says which kind: a
+// timeout, or a transport failure with its code.
+export const BODY_EXCERPT_CHARS = 300;
+
+const CHALLENGE_HEADERS = ["cf-mitigated", "x-datadome", "x-px-block", "x-amzn-waf-action"];
+const CHALLENGE_BODY = /captcha|access denied|are you a (?:robot|human)|verify you are human|just a moment|unusual traffic|request blocked|bot detection/i;
+
+export function blockedHint(statusCode, headers, bodyExcerpt) {
+  if (statusCode === 401 || statusCode === 403) return true;
+  const get = (h) => (headers && typeof headers.get === "function" ? headers.get(h) : null);
+  if (CHALLENGE_HEADERS.some((h) => get(h))) return true;
+  return statusCode >= 400 && CHALLENGE_BODY.test(String(bodyExcerpt || ""));
+}
+
 function extractMainText($) {
   // Remove non-content elements
   $(
@@ -190,12 +279,32 @@ export const webFetchPageToolDefinition = {
         type: "number",
         description: `Request timeout in milliseconds (500-30000, default ${DEFAULT_TIMEOUT_MS}).`,
       },
+      include_structured_data: {
+        type: "boolean",
+        description:
+          "If true, also return structured_data: one { \"@type\", data } element for each " +
+          "application/ld+json block on the page, as written (schema.org Product, Offer and so on). " +
+          "Default false.",
+      },
+      on_http_error: {
+        type: "string",
+        enum: ["throw", "return"],
+        description:
+          "What to do when the site answers with a non-2xx status. \"throw\" (default) fails the call. " +
+          "\"return\" returns the reply as data: status_code, upstream_ok false, body_excerpt, " +
+          "blocked_hint and fetch_outcome \"upstream_non_2xx\".",
+      },
     },
     required: ["url"],
   },
 };
 
-export async function handleWebFetchPage(args) {
+export async function handleWebFetchPage(args, deps = {}) {
+  // `deps.fetchImpl` exists for the tests, which cannot reach a server through
+  // safeFetch (it refuses every non-public address, by design).
+  const doFetch = typeof deps.fetchImpl === "function" ? deps.fetchImpl : fetchWithTimeout;
+  const includeStructured = args?.include_structured_data === true;
+  const returnHttpErrors = args?.on_http_error === "return";
   const url = (args?.url || "").trim();
   if (!url) throw new Error("'url' is required.");
   if (!isAllowedScheme(url)) {
@@ -218,12 +327,14 @@ export async function handleWebFetchPage(args) {
   const start = Date.now();
   let resp;
   try {
-    resp = await fetchWithTimeout(url, timeoutMs);
+    resp = await doFetch(url, timeoutMs);
   } catch (err) {
     if (err.name === "AbortError") {
-      throw new Error(`Request to ${url} timed out after ${timeoutMs}ms.`);
+      throw new Error(`Request to ${url} timed out after ${timeoutMs}ms. (fetch_outcome: timeout)`);
     }
-    throw new Error(`Failed to fetch ${url}: ${err.message}`);
+    // v13.37.0: no reply was received. Named, so it is never read as a status.
+    const code = err && err.code ? ` ${err.code}` : "";
+    throw new Error(`Failed to fetch ${url}: ${err.message} (fetch_outcome: transport_error${code})`);
   }
 
   const elapsed = Date.now() - start;
@@ -232,9 +343,43 @@ export async function handleWebFetchPage(args) {
   const statusCode = resp.status;
 
   if (!resp.ok) {
-    throw new Error(
-      `HTTP ${statusCode} from ${finalUrl}. Content-Type: ${contentType}`
-    );
+    if (!returnHttpErrors) {
+      throw new Error(
+        `HTTP ${statusCode} from ${finalUrl}. Content-Type: ${contentType}`
+      );
+    }
+    // v13.37.0 (K): the reply, as data. The body is read only for its first
+    // characters; a body that cannot be read is an empty excerpt, not a throw.
+    let excerpt = "";
+    try {
+      excerpt = normalizeWs(String(await resp.text()).replace(/<[^>]+>/g, " ")).slice(0, BODY_EXCERPT_CHARS);
+    } catch {
+      excerpt = "";
+    }
+    log("info", `web_fetch_page: ${statusCode} ${finalUrl} - returned as data, ${elapsed}ms`);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              url: finalUrl,
+              status_code: statusCode,
+              content_type: contentType.split(";")[0].trim(),
+              fetch_elapsed_ms: elapsed,
+              upstream_ok: false,
+              fetch_outcome: "upstream_non_2xx",
+              blocked_hint: blockedHint(statusCode, resp.headers, excerpt),
+              body_excerpt: excerpt,
+              title: "",
+              text: "",
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
   }
 
   // Handle non-HTML content types
@@ -282,6 +427,8 @@ export async function handleWebFetchPage(args) {
 
   const headings = includeHeadings ? extractHeadings($) : [];
   const links = includeLinks ? extractLinks($, finalUrl) : [];
+  // v13.37.0 (R2): read BEFORE extractMainText, which removes every script.
+  const structured = includeStructured ? extractStructuredData($) : null;
 
   // Extract main text AFTER cheerio has been manipulated for headings/links.
   //
@@ -349,6 +496,14 @@ export async function handleWebFetchPage(args) {
       : undefined,
     max_chars: maxChars,
     links: includeLinks ? links : undefined,
+    // v13.37.0 (K): always present, so a consumer need not infer success.
+    upstream_ok: true,
+    fetch_outcome: streamTruncated ? "body_too_large" : "ok",
+    // v13.37.0 (R2): only when asked for. An empty list is an assertion that
+    // the page carried none that parsed; the two counts say what else it had.
+    structured_data: structured ? structured.blocks : undefined,
+    structured_data_invalid: structured ? structured.invalid : undefined,
+    structured_data_dropped: structured ? structured.dropped : undefined,
     text: mainText,
   };
 

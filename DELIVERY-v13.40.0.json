@@ -1,0 +1,50 @@
+{
+  "version": "13.40.0",
+  "previous": "13.39.0",
+  "work_orders": [
+    "TENAX-2026-10-17-03 'The ceiling, the bounded write path, and a diagnostic that survives a shell': the connector half (items A, C and D on the shared file; the boot line and /health field). Built on 13.39.0 as delivered in TENAX-2026-10-15-01 (the order notes that no connector archive was uploaded with it). Delivery record: Gateway Service TENAX-2026-10-17-03-DELIVERY-RECORD.md."
+  ],
+  "companion_release": "Gateway Service 2.266.0. Either order; set MEMORY_CAPACITY_PER_SCOPE on both services in one maintenance step.",
+  "changed_files": [
+    "src/tools-memory/memoryWriteGuard.js (the shared file, byte-identical to Gateway Service 2.266.0 lib/memory-write-guard.js)",
+    "src/tests/fixtures/memory-guard-fixture.json (the shared fixture, byte-identical to the gateway's)",
+    "src/server-http.js (boot line after 'Memory MCP'; memory_store on the authenticated /health; one import)",
+    "src/tests/memory-capacity.test.js (new, 5 tests)",
+    "src/tests/memory-write-guard.test.js (the two pinned digests only)",
+    "scripts/verify-tenax-2026-10-17-03-mutations.mjs (new, 12 named mutations)",
+    "CHANGELOG-v13.40.0.md (new)",
+    "DELIVERY-v13.40.0.json (new)",
+    "package.json (13.39.0 to 13.40.0; the tenax-2026-10-17-03:mutations script)"
+  ],
+  "existing_tests_modified": [
+    "src/tests/memory-write-guard.test.js: GUARD_SHA256 and FIXTURE_SHA256 only, to the new shared file and fixture, the same values the gateway pins. No assertion changed; its 'CAPACITY: PROVISIONAL' header check still holds because the shared header keeps that heading."
+  ],
+  "not_shipped_on_purpose": [
+    "data/google-service-account.json: a complete service-account private key. 13.39.0's archive carried it, as the uploaded 13.38.0 did. The code has not read it since v12.28.0 (src/config.js; GOOGLE_SERVICE_ACCOUNT_KEY_FILE instead), and .gitignore and .dockerignore exclude it. Left out of this archive. Rotating the key is recommended, since it has travelled in archives.",
+    ":memory: and src/voice/__pycache__/voice_stt_worker.cpython-313.pyc: files the test runs write in the working tree (a SQLite file and Python bytecode); neither was in the 13.39.0 archive, and neither is in this one"
+  ],
+  "variables": {
+    "added": [ "MEMORY_CAPACITY_PER_SCOPE (default 1000; whole decimal number, clamped to 100..100000; must equal the gateway's)" ],
+    "required": "none"
+  },
+  "full_suite": {
+    "runner": "per-file: each test file under src/tests, tests, src/tools, src/tools-memory and src/tools-self-model in its own `node --experimental-test-module-mocks --test` process, plus `npm test`; same tool and command on both trees, same node_modules",
+    "before": { "artifact": "13.39.0 as delivered", "files": 72, "tests": 1414, "pass": 1412, "fail": 1, "skipped": 1, "npm_test": "30/30" },
+    "after": { "artifact": "this tree (13.40.0)", "files": 73, "tests": 1419, "pass": 1417, "fail": 1, "skipped": 1, "npm_test": "30/30" },
+    "executed_delta": "+5, all in src/tests/memory-capacity.test.js (new); all 72 pre-existing files identical (tests, pass, fail, skipped, exit code)",
+    "net_new_failures": 0,
+    "carried": "voice-gpl-boundary 'no Piper artifact survives anywhere in the source tree' (present at 13.37.0, 13.38.0 and 13.39.0)"
+  },
+  "mutations": {
+    "command": "npm run tenax-2026-10-17-03:mutations",
+    "applied": 12,
+    "claims": 8,
+    "red": "12/12 named mutations demonstrated red, controls green.",
+    "older_verifier": "scripts/verify-tenax-2026-10-15-mutations.mjs C-MEM-CAPACITY-DEFINED, C-MEM-DUP-REJECTED and C-TWIN-PARITY re-run against the new shared file: each 1/1 red."
+  },
+  "twin_parity": {
+    "memory_guard_sha256": "a2a6ac99ccb16cb028fd3f9d47a2f15520f447b82bb7c6888fd4fb06c74a0639",
+    "memory_fixture_sha256": "12c9bde425c2cc11b29cace1c71472be42cd2947e283002fc4454c9aca9c7a45"
+  },
+  "boundary": "Gateway Service TENAX-2026-10-17-03-DELIVERY-RECORD.md, section 7. Recorded, not changed: the tenant path decides 'is this key new' from the gateway's /list (at most 500 rows, ordered by category then most recent), so at the ceiling an update to a key outside those rows is refused here before the gateway's exact check (CHANGELOG-v13.40.0.md)."
+}

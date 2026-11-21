@@ -52,6 +52,16 @@ import {
   statSync,
 } from 'node:fs';
 import { log } from '../utils/logger.js';
+// v13.38.0 (WO-2026-11-20-03 R4, R5, D6, D10): skill_audit groups the files by
+// module id through the one resolver the compile also uses.
+import {
+  buildModuleSnapshot,
+  moduleIdsIn,
+  resolveModulePath,
+  idsByFile,
+} from './module-files.js';
+import { getModularPaths } from './skill-modular.js';
+import { inferModulePath } from './manifest-fragments.js';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -693,7 +703,20 @@ export const skillAuditToolDefinition = {
     'Modular mode returns: CORE.md, PERSONALITY.md, MANIFEST.json, DISPATCH_RULES.json, ' +
     'and every specialist module file in the modules/ directory. ' +
     'Use to verify the health and completeness of skill files after any deployment, push, ' +
-    'or Railway redeploy. Safe read-only operation; no files are modified.',
+    'or Railway redeploy. Safe read-only operation; no files are modified. ' +
+    'v13.38.0: in modular mode it also returns modules_by_id, one entry per module id with the file the ' +
+    'compile loads for it (resolved_path), how that was decided (resolved_by: manifest, manifest_append, ' +
+    'manifest_fragment, or directory_walk for a file no manifest registers) and, where more than one ' +
+    'file or registration matches, every candidate with its hash; counts that separate path entries, ' +
+    'distinct files and distinct module ids; the two orphan lists (manifest entries with no file, files ' +
+    'with no manifest entry); and a floor that reports unverified, never clean, when no module was read. ' +
+    'The flat files list is unchanged. For the cross-module checks use skill_consistency_audit. ' +
+    'v13.39.0: registered_in lists DECLARED registrations as { source, id, path, declared_path }; a registration ' +
+    'with no path appears under pathless_registrations with path null, never under an inferred path. A file no ' +
+    'manifest registers, found once by directory walk, carries resolved_path with resolved_by directory_walk. ' +
+    'ids_by_file maps each file to the ids that claim it (multi_id_files: files claimed by more than one id), and ' +
+    'registration.manifest_entries_without_file_by_source groups the entries with no file by source fragment, ' +
+    'with the orphan ids that have no file anywhere.',
   inputSchema: {
     type: 'object',
     properties: {},
@@ -873,6 +896,27 @@ export async function handleSkillAudit(_args) {
   const existing = result.files.filter(f => f.exists);
   const missing  = result.files.filter(f => !f.exists);
 
+  // -------------------------------------------------------------------------
+  // v13.38.0 (WO-2026-11-20-03): the grouped answer.
+  //
+  // The flat list above labels each PATH, so one file reached at three labels
+  // appeared three times and the total could not be interpreted: 273 was at
+  // once a count of path entries, of files and of modules, and right as none
+  // of them. The flat list stays for compatibility; what follows is grouped by
+  // module id through resolveModulePath, the resolver skill_compile uses.
+  // -------------------------------------------------------------------------
+  let grouped = null;
+  if (modularEnabled) {
+    try {
+      grouped = groupedModuleAudit(getModularPaths(), existing);
+      Object.assign(result, grouped.result);
+    } catch (err) {
+      log('error', `skill_audit: grouped module audit failed: ${err.message}`);
+      result.modules_by_id_error = err.message;
+      result.floor = { status: 'unverified', reason: `the grouped audit failed: ${err.message}` };
+    }
+  }
+
   result.summary = {
     mode:           result.mode,
     mode_source:    modeSource,
@@ -881,6 +925,11 @@ export async function handleSkillAudit(_args) {
     missing_files:  missing.map(f => f.file),
     total_lines:    existing.reduce((sum, f) => sum + (f.lines || 0), 0),
   };
+  // R5. files_found keeps its meaning (present PATH ENTRIES in the flat list)
+  // for any reader of the old shape; the breakdown says what it counts and what
+  // it does not.
+  result.summary.files_found_counts = 'path entries in the flat list';
+  if (grouped) result.summary.counts = grouped.result.counts;
 
   // ---------------------------------------------------------------------------
   // Modular readiness check: if mode file says modular but core modular files
@@ -910,12 +959,150 @@ export async function handleSkillAudit(_args) {
     }
   }
 
-  log('info', `skill_audit: mode=${result.mode} (${modeSource}), env_var=${envVarValue}, files_found=${existing.length}, missing=${missing.length}`);
+  log('info', `skill_audit: mode=${result.mode} (${modeSource}), env_var=${envVarValue}, files_found=${existing.length}, missing=${missing.length}`
+    + (grouped ? `, module_ids=${grouped.result.counts.distinct_module_ids}, ambiguous=${grouped.result.counts.ambiguous_ids}` : ''));
 
   return {
     content: [{
       type: 'text',
       text: JSON.stringify(result, null, 2),
     }],
+  };
+}
+
+/**
+ * The grouped half of skill_audit (v13.38.0, WO-2026-11-20-03 R4, R5, D6, D10).
+ *
+ * @param {object} paths     getModularPaths().
+ * @param {object[]} flatPresent  The flat list's present entries, for the path-entry count.
+ * @returns {{ result: object }}
+ */
+export function groupedModuleAudit(paths, flatPresent = []) {
+  const snapshot = buildModuleSnapshot(paths);
+  const { scan, registrations } = snapshot;
+  const resolutions = moduleIdsIn(snapshot).map((id) => resolveModulePath(id, { snapshot }));
+  const mdFiles = scan.files.filter((f) => f.kind === 'module');
+
+  // R4: one entry per id. Unambiguous ids are compact; an ambiguous one carries
+  // every candidate with its hash, which is the evidence a decision needs.
+  const modulesById = resolutions.map((r) => {
+    const base = {
+      id: r.id,
+      resolved_path: r.resolved_path,
+      resolved_by: r.resolved_by,
+      resolved_from: r.resolved_from,
+      path_source: r.path_source,
+      candidate_count: r.candidate_count,
+      ambiguous: r.ambiguous,
+    };
+    if (r.loaders.disagree) base.loaders = r.loaders;
+    // v13.39.0 R12: a registration that declares no path, stated as such.
+    if (r.pathless_registrations && r.pathless_registrations.length) base.pathless_registrations = r.pathless_registrations;
+    // A directory-walk resolution (R13) keeps its candidates: the evidence is weaker and should be visible.
+    if (r.ambiguous || !r.resolved_path || r.resolved_by === 'directory_walk') {
+      base.candidates = r.candidates.map((c) => ({ path: c.path, exists: c.exists, sha256: c.sha256, size_bytes: c.size_bytes,
+        lines: c.lines, registered_in: c.registered_in, is_resolved: c.is_resolved }));
+    }
+    return base;
+  });
+  const resolutionById = new Map(resolutions.map((r) => [r.id, r]));
+
+  // D6: both orphan directions. A registration whose path is not a file, and a
+  // module file no registration names.
+  const registeredPaths = new Set();
+  const entriesWithoutFile = [];
+  for (const r of registrations) {
+    // A path-less entry is resolved the way the merge resolves it: inferred
+    // from modules/{category}/{id}.md or modules/{id}.md when that file exists.
+    const p = r.path || inferModulePath(paths.avaDir, r.entry) || null;
+    if (p) registeredPaths.add(p);
+    const exists = p ? existsSync(paths.avaDir + p) : false;
+    if (!exists) {
+      entriesWithoutFile.push({ id: r.id, path: p, source: r.source,
+        reason: p ? 'the registered path is not a file' : 'the entry declares no path and none can be inferred' });
+    }
+  }
+  const filesWithoutEntry = mdFiles.filter((f) => !registeredPaths.has(f.path))
+    .map((f) => ({ path: f.path, id: f.id, id_registered: resolutions.some((r) => r.id === f.id && r.registered) }));
+
+  // v13.39.0 (WO-2026-11-21-01 section 10, G2): the entries without a file,
+  // grouped by the source that holds them, so one path-less index fragment is
+  // one line with a count rather than one row per id. For each source: how
+  // many declare no path, how many name a path that is not a file, how many of
+  // those ids still resolve to a file through another registration or file,
+  // and the ids with no file anywhere (the genuine orphans).
+  const bySource = new Map();
+  for (const e of entriesWithoutFile) {
+    if (!bySource.has(e.source)) bySource.set(e.source, []);
+    bySource.get(e.source).push(e);
+  }
+  const entriesWithoutFileBySource = [...bySource.entries()].map(([source, list]) => {
+    const ids = [...new Set(list.map((e) => e.id))].sort();
+    const resolvesElsewhere = ids.filter((id) => { const r = resolutionById.get(id); return Boolean(r && r.resolved_path); });
+    const orphans = ids.filter((id) => { const r = resolutionById.get(id); return !r || r.existing_file_count === 0; });
+    return {
+      source,
+      count: list.length,
+      declares_no_path: list.filter((e) => !e.path).length,
+      registered_path_missing: list.filter((e) => e.path).length,
+      ids_resolving_elsewhere: resolvesElsewhere.length,
+      orphan_ids: orphans,
+      ids,
+    };
+  }).sort((a, b) => b.count - a.count || a.source.localeCompare(b.source));
+
+  // R14: the inverse index, file to the ids that claim it.
+  const inverse = idsByFile(resolutions);
+
+  const distinctContents = new Set(scan.files.map((f) => f.sha256));
+  const registeredIds = new Set(resolutions.filter((r) => r.registered).map((r) => r.id));
+  const counts = {
+    path_entries: flatPresent.length,
+    module_files: scan.files.length,
+    module_markdown_files: mdFiles.length,
+    distinct_files: distinctContents.size,
+    distinct_module_ids: new Set(mdFiles.map((f) => f.id)).size,
+    registered_ids: registeredIds.size,
+    ambiguous_ids: resolutions.filter((r) => r.ambiguous).length,
+    ids_with_more_than_one_file: resolutions.filter((r) => r.existing_file_count > 1).length,
+    unresolved_registered_ids: resolutions.filter((r) => r.registered && !r.loadable).length,
+    manifest_entries_without_file: entriesWithoutFile.length,
+    files_without_manifest_entry: filesWithoutEntry.length,
+    multi_id_files: inverse.multi_id_files.length,
+    meaning: {
+      path_entries: 'present entries in the flat files list (CORE, MANIFEST, DISPATCH_RULES and every path under modules/); the number summary.files_found has always reported',
+      distinct_files: 'distinct contents (by sha256) among the files under modules/; a file reached at three paths counts once',
+      distinct_module_ids: 'distinct module ids declared by the .md files under modules/ (frontmatter id, else the file name)',
+      registered_ids: 'distinct module ids the merged manifest registers',
+    },
+  };
+
+  // D10: floor before scan. An audit over nothing must not read as clean.
+  const floor = {
+    modules_read: mdFiles.length,
+    files_scanned: scan.files.length,
+    registered_ids: registeredIds.size,
+    unregistered_files: filesWithoutEntry.length,
+    scan_truncated: scan.truncated,
+    unreadable: scan.unreadable,
+    status: mdFiles.length === 0 || scan.truncated ? 'unverified' : 'verified',
+    ...(mdFiles.length === 0 ? { reason: 'no module file was read; an audit of an empty set proves nothing' } : {}),
+    ...(scan.truncated ? { reason: 'the scan stopped at MODULE_INDEX_MAX_FILES; the grouped view is partial' } : {}),
+  };
+
+  return {
+    result: {
+      modules_by_id: modulesById,
+      ids_by_file: inverse.ids_by_file,
+      multi_id_files: inverse.multi_id_files,
+      counts,
+      registration: {
+        manifest_entries_without_file_by_source: entriesWithoutFileBySource,
+        manifest_entries_without_file: entriesWithoutFile,
+        files_without_manifest_entry: filesWithoutEntry,
+        fragments_skipped: registrations.fragmentsSkipped || [],
+      },
+      floor,
+    },
   };
 }
