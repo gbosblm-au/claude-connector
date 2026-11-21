@@ -49,13 +49,16 @@ import os
 import re
 import sys
 import zipfile
+from collections import Counter
 from html import unescape
 
 # Section 5.2 step 5. Ordered most specific first: 'CHAPTER ONE' should be read
 # as a chapter heading rather than as a bare roman/word numeral line.
 CHAPTER_PATTERNS = [
     re.compile(r"^\s*(?:CHAPTER|Chapter)\s+([0-9]+|[IVXLCDM]+|[A-Za-z]+)\b\s*(.*)$"),
-    re.compile(r"^\s*(?:PART|Part|BOOK|Book)\s+([0-9]+|[IVXLCDM]+|[A-Za-z]+)\b\s*(.*)$"),
+    # v13.40.0 (WO-2026-11-21-01 B.5): DIVISION and SECTION beside PART and
+    # BOOK (Heidegger, Arendt, Buber).
+    re.compile(r"^\s*(?:PART|Part|BOOK|Book|DIVISION|Division|SECTION|Section)\s+([0-9]+|[IVXLCDM]+|[A-Za-z]+)\b\s*(.*)$"),
     # v13.21.3. "1. A Parade in Erhenrang" -- a number, a separator, and a
     # title on the same line. The commonest chapter style in modern fiction,
     # and the one that made the pilot book extract as a single chapter: it uses
@@ -66,15 +69,23 @@ CHAPTER_PATTERNS = [
     # rule below and would match every page number in the book.
     re.compile(r"^\s*([0-9]{1,3})\s*[.:\u2014-]\s+(\S.*)$"),
     re.compile(r"^\s*([IVXLCDM]{1,7})\s*[.:\u2014-]\s+(\S.*)$"),
+    # v13.40.0 (B.5). A section sign and a number at line start (Wittgenstein's
+    # remarks; Kant's "\u00a7 1."), and a standalone ALL-CAPS line (Hegel's
+    # PREFACE, CONTENTS, FOREWORD). Both explicit. An all-caps line that
+    # repeats is a running header, which the rejection rule removes.
+    re.compile(r"^\s*\u00A7\s*(\d+)\.?(?:\s+(.*))?$"),
+    re.compile(r"^\s*(?=[A-Z][A-Z0-9 ,'\u2019&\-]{2,59}$)(?=.*[A-Z]{3})([^a-z]+)$"),
     # A bare number alone on a line. Common in fiction, and the loosest rule
     # here -- guarded by the plausibility check in choose_chapters().
     re.compile(r"^\s*([0-9]{1,3})\s*$"),
     re.compile(r"^\s*([IVXLCDM]{1,7})\s*$"),
 ]
 
-# Patterns 0-3 name a chapter EXPLICITLY: the word CHAPTER or PART, or a
-# numeral followed by a title. Patterns 4-5 match a bare numeral, which in a
-# printed book is far more often a page number than a chapter.
+# Patterns 0-5 name a chapter EXPLICITLY: the word CHAPTER, PART, BOOK,
+# DIVISION or SECTION, a numeral followed by a title, a section sign and a
+# number, or a standalone ALL-CAPS line (v13.40.0 widened 0-3 to 0-5). Patterns
+# 6-7 match a bare numeral, which in a printed book is far more often a page
+# number than a chapter; the title-case rule ranks with them.
 #
 # v13.21.3. The two are ranked rather than pooled, and the pilot book is why.
 # The Left Hand of Darkness has nine headings of the form "1. A Parade in
@@ -87,7 +98,97 @@ CHAPTER_PATTERNS = [
 # numerals are ignored entirely. They remain as a last resort for books that
 # genuinely number chapters and nothing else -- which exist, and for which the
 # plausibility check is still the guard.
-STRONG_PATTERNS = 4
+STRONG_PATTERNS = 6
+
+# v13.40.0 (WO-2026-11-21-01 B.5). Widening the patterns mints false chapters
+# unless something refuses the fragments that look like headings. The fixture is
+# Being and Time, where "Part Two likewise has three divisions:1" -- a footnote
+# fragment -- was detected as a chapter title. A candidate is refused when it:
+#   ends with a colon followed by a numeral or a superscript marker;
+#   carries a footnote-like numeric run (digits glued to a word);
+#   continues a sentence (the previous line ends open and this one opens lower case);
+#   repeats more than three times in the body (a running header or footer);
+#   is text that also appears in the endnotes.
+SUPERSCRIPTS = "\u00B9\u00B2\u00B3\u2070\u2071\u2074\u2075\u2076\u2077\u2078\u2079"
+NOTES_HEADING = re.compile(r"^\s*(?:NOTES|Notes|ENDNOTES|Endnotes)\s*$")
+TITLE_SMALL_WORDS = {"a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into",
+                     "of", "on", "or", "the", "to", "with"}
+
+
+def heading_rejection(line, previous):
+    """Why a heading candidate is refused (the B.5 rejection rule), or None."""
+    t = line.strip()
+    if re.search(r":\s*[0-9%s]+\s*$" % SUPERSCRIPTS, t):
+        return "colon_then_numeral"
+    if re.search(r"[A-Za-z][.,;:]?[%s]" % SUPERSCRIPTS, t) or re.search(r"[a-z]{2}[0-9]{1,3}\b", t):
+        return "footnote_marker"
+    prev = (previous or "").strip()
+    if prev and re.search(r"[A-Za-z,;\u2014-]$", prev) and re.match(r"[a-z]", t):
+        return "sentence_continuation"
+    return None
+
+
+def title_case_heading(lines, index):
+    """B.5's last rule: a short line in title case, not ending in terminal
+    punctuation, followed by a blank line and a body paragraph. Weak: ranked
+    with the bare numerals, so explicit headings win where a book has them."""
+    t = lines[index].strip()
+    if not t or len(t) > 60 or re.search(r"[.!?:;,]$", t):
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z'\u2019-]*", t)
+    if not words or len(words) > 10:
+        return False
+    if not all(w[0].isupper() or w.lower() in TITLE_SMALL_WORDS for w in words):
+        return False
+    if not words[0][0].isupper():
+        return False
+    following = lines[index + 1:index + 3]
+    return (len(following) == 2 and not following[0].strip()
+            and len(following[1].strip()) >= 300)
+
+
+def candidate_marks(lines):
+    """Every heading candidate, as (line_no, text, pattern_no, rejection).
+
+    pattern_no is the CHAPTER_PATTERNS index, or len(CHAPTER_PATTERNS) for the
+    title-case rule (weak). rejection is None for a kept candidate."""
+    counts = Counter(l.strip() for l in lines if l.strip() and len(l.strip()) <= 60)
+    notes_at = None
+    for i, line in enumerate(lines):
+        if NOTES_HEADING.match(line):
+            notes_at = i
+    endnotes = "\n".join(lines[notes_at + 1:]) if notes_at is not None else ""
+
+    marks = []
+    previous = ""
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        number = None
+        if len(line) <= 90:
+            for n, pattern in enumerate(CHAPTER_PATTERNS):
+                if pattern.match(line):
+                    number = n
+                    break
+            if number is None and title_case_heading(lines, index):
+                number = len(CHAPTER_PATTERNS)
+        if number is not None:
+            rejection = heading_rejection(stripped, previous)
+            if rejection is None and counts.get(stripped, 0) > 3:
+                rejection = "running_header"
+            if (rejection is None and notes_at is not None and index < notes_at
+                    and len(stripped) >= 20 and stripped in endnotes):
+                rejection = "in_endnotes"
+            marks.append((index, stripped, number, rejection))
+        previous = stripped
+    return marks
+
+
+def is_strong(pattern_no):
+    """An explicit heading: patterns 0 to STRONG_PATTERNS-1."""
+    return pattern_no < STRONG_PATTERNS
+
 
 # Below this, a "chapter" is a heading page, a dedication or a section break
 # caught by the bare-number rule -- not a chapter. Deliberately generous: a
@@ -396,21 +497,20 @@ def heading_report(body):
     Prints to stderr, so it never disturbs the JSON contract on stdout.
     """
     lines = body.split("\n")
-    marks = []
-    for index, line in enumerate(lines):
-        if len(line) > 90:
-            continue
-        for number, pattern in enumerate(CHAPTER_PATTERNS):
-            if pattern.match(line):
-                marks.append((index, line.strip(), number))
-                break
+    every = candidate_marks(lines)
+    rejected = [m for m in every if m[3] is not None]
+    marks = [(i, t, n) for i, t, n, r in every if r is None]
+    if rejected:
+        print("rejected candidates: %d (B.5 rejection rule)" % len(rejected), file=sys.stderr)
+        for index, text, _, why in rejected[:20]:
+            print("  line %-7d %-20s %s" % (index, why, text[:60]), file=sys.stderr)
 
-    strong_count = sum(1 for _, _, n in marks if n < STRONG_PATTERNS)
+    strong_count = sum(1 for _, _, n in marks if is_strong(n))
     print("candidate headings: %d (%d explicit, %d bare numerals)"
           % (len(marks), strong_count, len(marks) - strong_count), file=sys.stderr)
     if strong_count >= 2:
         print("  -> explicit headings win; bare numerals ignored", file=sys.stderr)
-        marks = [m for m in marks if m[2] < STRONG_PATTERNS]
+        marks = [m for m in marks if is_strong(m[2])]
     for index, text, pattern_no in marks[:60]:
         print("  line %-7d pattern %d  %s" % (index, pattern_no, text[:70]),
               file=sys.stderr)
@@ -467,14 +567,12 @@ def choose_chapters(body):
     strong = []
     weak = []
 
-    for index, line in enumerate(lines):
-        if len(line) > 90:
-            continue  # A heading is short. This is a paragraph.
-        for number, pattern in enumerate(CHAPTER_PATTERNS):
-            if pattern.match(line):
-                target = strong if number < STRONG_PATTERNS else weak
-                target.append((index, line.strip()))
-                break
+    # v13.40.0 (B.5): one candidate scan, shared with heading_report, with the
+    # rejection rule applied. A rejected candidate is not a mark at all.
+    for index, text, number, rejection in candidate_marks(lines):
+        if rejection is not None:
+            continue
+        (strong if is_strong(number) else weak).append((index, text))
 
     # Explicit headings win outright when there are enough of them to be a
     # book's structure rather than a stray numbered line in the front matter.

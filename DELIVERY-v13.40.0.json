@@ -1,0 +1,88 @@
+{
+  "version": "13.40.0",
+  "previous": "13.39.0",
+  "work_orders": [
+    "WO-2026-11-21-01 (vault OCR correction, ingest ordering and pre-approved reading continuation), section B.5 only"
+  ],
+  "companions": [
+    "Gateway-Service 2.367.0 (sections A, B, D; migration 0106)"
+  ],
+  "deploy_order": "either; each is safe alone",
+  "scope": "B.5 heading widening and rejection rule in scripts/book_extract.py",
+  "changed_files": [
+    "scripts/book_extract.py",
+    "src/tests/book-extract-headings.test.js (new)",
+    "scripts/verify-module-files-mutations.mjs",
+    "package.json (CRLF kept)",
+    "CHANGELOG-v13.40.0.md (new)",
+    "DELIVERY-v13.40.0.json (new)"
+  ],
+  "files_changed_out_of_scope": [],
+  "ancillary_changes": [
+    {
+      "file": "scripts/verify-module-files-mutations.mjs",
+      "what": "adds the heading mutations and copies scripts/ into each mutated tree",
+      "why_now": "the B-6 and B.5 pins must be shown able to fail",
+      "consumers": [
+        "npm run module-files:mutations (the only caller)"
+      ],
+      "checked": "75 of 75 red",
+      "blast_radius": "test tooling only"
+    }
+  ],
+  "full_suite": {
+    "runner": "node conn-suite.mjs <tree> <out> (node --test per file, plus npm test exit)",
+    "before": {
+      "artifact": "claude-connector 13.39.0 as delivered last round (frozen copy)",
+      "files": 63,
+      "tests": 1324,
+      "pass": 1258,
+      "fail": 65,
+      "skipped": 1,
+      "executed": 1323
+    },
+    "after": {
+      "artifact": "claude-connector 13.40.0, this tree",
+      "files": 64,
+      "tests": 1329,
+      "pass": 1263,
+      "fail": 65,
+      "skipped": 1,
+      "executed": 1328
+    },
+    "executed_delta": 5,
+    "executed_delta_accounted": [
+      {
+        "file": "src/tests/book-extract-headings.test.js",
+        "why": "new, 5 executed"
+      }
+    ],
+    "net_new_failures": 0,
+    "baseline_red_carried": 65
+  },
+  "mutations_summary": "scripts/verify-module-files-mutations.mjs: 75 of 75 red",
+  "claims": [
+    {
+      "claim": "B.5 rejection rule refuses the Being and Time footnote fragment, running headers, sentence continuations, endnote text",
+      "status": "VERIFIED",
+      "against": "src/tests/book-extract-headings.test.js and mutations"
+    },
+    {
+      "claim": "Division/Section, section sign and ALL-CAPS headings detected",
+      "status": "VERIFIED",
+      "against": "src/tests/book-extract-headings.test.js and mutations"
+    },
+    {
+      "claim": "Behaviour on the real Being and Time file",
+      "status": "UNVERIFIED",
+      "against": "the file is not in the build environment; the fixture reproduces the cited fragment"
+    }
+  ],
+  "queued": [
+    {
+      "item": "Section C",
+      "detail": "its own round after C-7 passes"
+    }
+  ],
+  "out_of_scope_respected": "no re-ingest, no stored book touched, no ordinal changed"
+}

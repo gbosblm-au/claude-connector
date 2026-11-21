@@ -1,0 +1,449 @@
+{
+ "version": "13.38.0",
+ "previous": "13.37.0",
+ "work_orders": [
+  "WO-2026-11-20-03 rev 2 (2026-11-20): module file deletion with confirmation (Project 2) and a cross-module consistency audit (Project 1)"
+ ],
+ "version_lineage_warning": "Gateway runbooks refer to connector 13.38.0 to 13.43.0 (October) with features absent from the 13.37.0 archive supplied with this order (a frame /v1/credential fetch, a tenant-mode /skill-export). If the deployed connector is from that line, apply WO-2026-11-20-03-connector.patch (unified diff against 13.37.0) to the live tree and use the next free version number instead of deploying this archive over it.",
+ "patch": "WO-2026-11-20-03-connector.patch, delivered beside this archive",
+ "decisions_taken_as_defaults": {
+  "event_store": "append-only JSONL at <avaDir>/quarantine/module_file_events.jsonl, fsync on append. The connector has no database; the order allows a table or an append-only store.",
+  "frozen_registration": "a file registered in MANIFEST.json or MANIFEST_APPEND.json is refused (registered_in_frozen_manifest): D6 de-registration would edit a frozen file. Fragments under references/manifest/ are de-registered, as D6 requires, because they are the module_write registrations the order targets. Raised for decision.",
+  "path_form": "module_delete takes the path exactly as skill_audit lists it, starting \"modules/\", with no prefix stripping, so double-nested copies (modules/modules/...) can be named. A path without the prefix is refused (outside_modules).",
+  "c_g_calibration": "self-calibrating per run on a ten-module sample: not_run below ten, dropped above 20%",
+  "c_k": "left for the gateway (2.366.0), which runs vault_provenance_audit; the connector holds no provenance records",
+  "specialist_loader": "skill_load_specialist left first-wins (a dispatch change); C-C reports where it disagrees with the compile"
+ },
+ "scope": {
+  "declared": "One resolver for module paths shared by compile, audit and delete; a read-only cross-module consistency audit; and a guarded, recorded, reversible module file quarantine.",
+  "acceptance_criteria": [
+   {
+    "id": "AC-1",
+    "criterion": "skill_compile, skill_audit and module_delete call one exported resolveModulePath; compile output unchanged.",
+    "result": "PASS",
+    "evidence": "C-D3 pins (resolver and structural), reachability AUDITED entries, cmp of 13.37.0 and 13.38.0 compile output over five queries: identical"
+   },
+   {
+    "id": "AC-2",
+    "criterion": "skill_consistency_audit runs C-A to C-D and C-F as pass/fail, C-E and C-G to C-I as advisory, C-J and C-K as judgment, never summed, floor first.",
+    "result": "PASS",
+    "evidence": "module-files.test.js consistency tests; C-A to C-J and C-D10 mutations"
+   },
+   {
+    "id": "AC-3",
+    "criterion": "module_delete refuses each of D4's six cases with its code and nothing moved, and quarantines (dry run by default) with atomic de-registration and an event.",
+    "result": "PASS",
+    "evidence": "refused() helper asserts code and an unchanged tree hash; C-D4.1 to C-D4.6, C-FROZEN, C-D6 mutations"
+   },
+   {
+    "id": "AC-4",
+    "criterion": "module_restore reverses a quarantine byte for byte (except the event log); purge only from quarantine with the content kept in the event; events readable with filters.",
+    "result": "PASS",
+    "evidence": "R2 round trip, C-R2, C-D1, C-D5, C-R3 mutations"
+   },
+   {
+    "id": "AC-5",
+    "criterion": "Full connector suite like-for-like against 13.37.0, no net-new failure.",
+    "result": "PASS",
+    "evidence": "full_suite below"
+   }
+  ]
+ },
+ "changed_files": [
+  "src/tools/module-files.js (new)",
+  "src/tools/module-consistency.js (new)",
+  "src/tools/module-file-tools.js (new)",
+  "src/tools/skill-modular.js",
+  "src/tools/skill.js",
+  "src/tools/manifest-fragments.js",
+  "src/server-http.js",
+  "src/tests/module-files.test.js (new)",
+  "src/tests/reachability.test.js",
+  "scripts/verify-module-files-mutations.mjs (new)",
+  "package.json (CRLF preserved)",
+  "CHANGELOG-v13.38.0.md (new)",
+  "DELIVERY-v13.38.0.json (new)"
+ ],
+ "ancillary_changes": [
+  {
+   "file": "src/tools/manifest-fragments.js",
+   "what": "loadMergedManifest takes optional { fragments, exists, quiet }; inferModulePath and mergeFragmentsIntoManifest take an optional existence test; parseModuleFrontmatter is exported and reads version",
+   "why_now": "the quarantine plan must ask what the compile would load after a move without moving anything (D4.3, D4.6), and C-I reads version",
+   "consumers": [
+    "src/tools/skill-modular.js (loadMergedManifest at the compile and skill_load_specialist: no options, unchanged)",
+    "src/tools/skill-content.js (deriveModuleEntry, writeModuleFragment: unchanged functions)",
+    "src/tools/skill.js (inferModulePath, default existence test)",
+    "src/tools/module-files.js (new caller)",
+    "src/tests/manifest-h2-loop.test.js"
+   ],
+   "checked": "manifest-fragments, manifest-h2-loop, module-read-resolve, module-write-path: pass unchanged; compile output cmp-identical",
+   "blast_radius": "compile and module_write registration if wrong; both are covered by the unchanged suites and the cmp check"
+  },
+  {
+   "file": "src/tests/reachability.test.js",
+   "what": "three AUDITED entries (resolveModulePath, handleModuleDelete, handleSkillConsistencyAudit)",
+   "why_now": "the new exports must be shown wired",
+   "consumers": [
+    "this test only"
+   ],
+   "checked": "11/11",
+   "blast_radius": "none at runtime"
+  }
+ ],
+ "full_suite": {
+  "runner": "node /home/claude/tools/conn-suite.mjs <copy> <out.json> (per file, node --test), plus npm test",
+  "before": {
+   "artifact": "claude-connector 13.37.0 as supplied (claude-connector-v13_37_0_1.zip), from a /tmp copy",
+   "files": 62,
+   "tests": 1243,
+   "pass": 1187,
+   "fail": 55,
+   "skipped": 1,
+   "executed": 1242,
+   "npm_test_exit": 0
+  },
+  "after": {
+   "artifact": "claude-connector 13.38.0, this tree, from a /tmp copy",
+   "files": 63,
+   "tests": 1284,
+   "pass": 1228,
+   "fail": 55,
+   "skipped": 1,
+   "executed": 1283,
+   "npm_test_exit": 0
+  },
+  "executed_delta_accounted": [
+   {
+    "file": "src/tests/module-files.test.js",
+    "why": "new file",
+    "after": {
+     "tests": 38,
+     "pass": 38,
+     "fail": 0,
+     "skipped": 0
+    }
+   },
+   {
+    "file": "src/tests/reachability.test.js",
+    "why": "three AUDITED entries",
+    "before": {
+     "tests": 8,
+     "pass": 8
+    },
+    "after": {
+     "tests": 11,
+     "pass": 11
+    }
+   }
+  ],
+  "net_new_failures": 0,
+  "baseline_red_carried": "the same 55 failures in the same files before and after, none touched by this change: bundle-upload-http 0/17, voice-elevenlabs-race 0/4, voice-elevenlabs 6/15, voice-engine-form 32/38, voice-gpl-boundary 12/13, voice-segmenting 10/18, voice.test 0/1, tools-memory/memory.test 0/1, tools-self-model/identity-scoping 0/7, state-vector 0/1 (environmental in this build container; DELIVERY-v13.36.0 recorded 1 failure in its environment)"
+ },
+ "mutations": [
+  {
+   "claim": "C-D3",
+   "mutation": "the resolver takes the FIRST entry (skill_load_specialist's rule), not the compile's",
+   "reddened": true
+  },
+  {
+   "claim": "C-D3",
+   "mutation": "the compile looks up its own path again",
+   "reddened": true
+  },
+  {
+   "claim": "C-R4",
+   "mutation": "an inferred fragment path is reported as declared",
+   "reddened": true
+  },
+  {
+   "claim": "C-R4",
+   "mutation": "an unregistered file is reported as resolved by nothing",
+   "reddened": true
+  },
+  {
+   "claim": "C-R5",
+   "mutation": "distinct files counted as paths",
+   "reddened": true
+  },
+  {
+   "claim": "C-D10",
+   "mutation": "skill_audit of an empty tree reports verified",
+   "reddened": true
+  },
+  {
+   "claim": "C-D10",
+   "mutation": "the consistency audit of an empty set lets its checks pass",
+   "reddened": true
+  },
+  {
+   "claim": "C-A",
+   "mutation": "manifest entries with no file are not reported",
+   "reddened": true
+  },
+  {
+   "claim": "C-A",
+   "mutation": "files with no entry are not reported",
+   "reddened": true
+  },
+  {
+   "claim": "C-B",
+   "mutation": "classification by size, not hash",
+   "reddened": true
+  },
+  {
+   "claim": "C-C",
+   "mutation": "ambiguity resolved silently",
+   "reddened": true
+  },
+  {
+   "claim": "C-D",
+   "mutation": "shadow copies are not looked for",
+   "reddened": true
+  },
+  {
+   "claim": "C-F",
+   "mutation": "an id registered twice is not reported",
+   "reddened": true
+  },
+  {
+   "claim": "C-E",
+   "mutation": "the aggregate leaves the always-load modules out",
+   "reddened": true
+  },
+  {
+   "claim": "C-G",
+   "mutation": "a small sample is reported anyway",
+   "reddened": true
+  },
+  {
+   "claim": "C-G",
+   "mutation": "a noisy check is reported, not dropped",
+   "reddened": true
+  },
+  {
+   "claim": "C-G",
+   "mutation": "a missing capability is read as carried",
+   "reddened": true
+  },
+  {
+   "claim": "C-H",
+   "mutation": "a collision of two is not reported",
+   "reddened": true
+  },
+  {
+   "claim": "C-I",
+   "mutation": "line_count_estimate drift is not reported",
+   "reddened": true
+  },
+  {
+   "claim": "C-J",
+   "mutation": "a reciprocal disagreement is reported as one-sided",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.1",
+   "mutation": "a protected name is accepted",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.1",
+   "mutation": "a path without the modules/ prefix is accepted",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.2",
+   "mutation": "no hash is accepted",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.2",
+   "mutation": "a stale hash is accepted",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.3",
+   "mutation": "the live copy may go with no replacement",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.4",
+   "mutation": "the last file may go",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.5",
+   "mutation": "divergent copies need no acknowledgement",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.5",
+   "mutation": "an acknowledgement needs no reason",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.5",
+   "mutation": "the retained copy is the compile's, not the acknowledged one",
+   "reddened": true
+  },
+  {
+   "claim": "C-D4.6",
+   "mutation": "an always_load module may be dropped",
+   "reddened": true
+  },
+  {
+   "claim": "C-FROZEN",
+   "mutation": "a MANIFEST.json registration is left pointing at nothing",
+   "reddened": true
+  },
+  {
+   "claim": "C-D6",
+   "mutation": "the quarantined file's registration is left in place",
+   "reddened": true
+  },
+  {
+   "claim": "C-R2",
+   "mutation": "a restore overwrites an occupied location",
+   "reddened": true
+  },
+  {
+   "claim": "C-R2",
+   "mutation": "a restore re-inserts instead of putting the fragment back",
+   "reddened": true
+  },
+  {
+   "claim": "C-D1",
+   "mutation": "a purge reaches into modules/",
+   "reddened": true
+  },
+  {
+   "claim": "C-D5",
+   "mutation": "a purge record does not keep the content",
+   "reddened": true
+  },
+  {
+   "claim": "C-R3",
+   "mutation": "the event log returns snapshots by default",
+   "reddened": true
+  }
+ ],
+ "mutation_note": "37 of 37 red (node scripts/verify-module-files-mutations.mjs). Each control ran green first with at least one test executed.",
+ "calibration_run": {
+  "floor": {
+   "modules_read": 10,
+   "registered_ids": 10,
+   "status": "verified"
+  },
+  "deterministic": {
+   "C-A": true,
+   "C-B": true,
+   "C-C": true,
+   "C-D": false,
+   "C-F": true
+  },
+  "C-E": {
+   "modules": 0,
+   "bytes": 0,
+   "tokens": 0
+  },
+  "C-G": {
+   "status": "not_run",
+   "sample": 0,
+   "reason": "only 0 module(s) declare provides; the check is not reported without a 10-module calibration sample"
+  },
+  "C-H": {
+   "collisions": 6,
+   "modules_fired": 7,
+   "generic": 0
+  },
+  "C-I": {
+   "findings": 0
+  },
+  "C-J": {
+   "findings": 0
+  },
+  "sample": "self-model/volume-assets/skill/ava (10 bundled modules), with an empty CORE.md, {} DISPATCH_RULES.json and an empty MANIFEST.json; no references/manifest/ directory",
+  "fire_rates": {
+   "C-G": "not run: 0 of 10 modules declare provides, so no calibration sample exists",
+   "C-H": "7 of 10 modules (70%), 6 collisions: curiosities, maieutic, nudge, seam question, silence, socratic",
+   "C-I": "0 of 10 (0%)",
+   "C-J": "0 of 10 (0%)"
+  },
+  "C-D_note": "C-D fails on this fixture because references/manifest/ is absent, which is the work order wording (present exactly once); it is the fixture, not the check"
+ },
+ "claims": [
+  {
+   "claim": "Compile output is unchanged by the resolver refactor.",
+   "status": "VERIFIED",
+   "against": "cmp of 13.37.0 and 13.38.0 compileSkill output, five queries, a fixture with duplicate MANIFEST ids and a path-less always_load entry"
+  },
+  {
+   "claim": "D4 refusals each fail closed with nothing moved.",
+   "status": "VERIFIED",
+   "against": "module-files.test.js refused() (sha256 of every file before and after) and the D4 mutations"
+  },
+  {
+   "claim": "C-E aggregate on the live volume.",
+   "status": "UNVERIFIED",
+   "against": "no live volume in the build environment; 0 on the bundled self-model assets"
+  },
+  {
+   "claim": "C-G fire rate on a healthy corpus.",
+   "status": "UNVERIFIED",
+   "against": "no module in the bundled sample declares provides"
+  },
+  {
+   "claim": "Behaviour on a tenant-mode volume.",
+   "status": "UNVERIFIED",
+   "against": "tests ran on the default layout"
+  }
+ ],
+ "out_of_scope_respected": [
+  "no dispatch change (CORE.md, MANIFEST.json, DISPATCH_RULES.json, references/manifest/ untouched by the build)",
+  "no remediation of the listed duplicates",
+  "no module content change",
+  "nothing deleted on a live volume"
+ ],
+ "queued": [
+  {
+   "item": "Measure C-E on the live volume.",
+   "detail": "skill_consistency_audit with checks [\"C-E\"]; record aggregate_estimated_tokens and headroom_tokens against 40,000. Not measurable in the build environment (no live volume)."
+  },
+  {
+   "item": "C-G calibration on the live corpus.",
+   "detail": "None of the ten bundled modules declares provides, so the check reported not_run here. It self-calibrates each run (not_run below ten, dropped above 20%); record the first live fire rate."
+  },
+  {
+   "item": "C-H fires on 7 of 10 bundled modules.",
+   "detail": "Six collisions, all genuine family overlaps (socratic, maieutic, seam question, nudge, silence, curiosities). Advisory and severity low; the order applies the drop rule to C-G only and rules out dispatch changes (D8). Decide whether to raise GENERIC_AT or leave it."
+  },
+  {
+   "item": "WordPress module mirror is not told about quarantines.",
+   "detail": "A WP \"Push All\" could re-create a quarantined file. Needs a quarantine-aware push or a skip list."
+  },
+  {
+   "item": "module_write can create a second copy of an id at a new path (order section 10).",
+   "detail": "Out of scope; C-B and C-C report the result."
+  },
+  {
+   "item": "skill_load_specialist is first-wins; the compile is last-wins.",
+   "detail": "C-C reports the disagreement per id. Moving the loader onto resolveModulePath is a dispatch change and was not made."
+  },
+  {
+   "item": "skill_recompile reads MANIFEST.json only.",
+   "detail": "It does not see MANIFEST_APPEND.json or fragments; unchanged here."
+  },
+  {
+   "item": "Registrations in MANIFEST.json or MANIFEST_APPEND.json block a quarantine (registered_in_frozen_manifest).",
+   "detail": "D6 requires de-registration; the frozen files may not be edited. A decision is needed to allow it (a dispatch change, raised, not made)."
+  },
+  {
+   "item": "Eval harness surface prose and stub manifest.",
+   "detail": "README, report.js, stub-connector/server.js, filler-corpus.json and tool-surface.js still say 81; manifest.captured.json lacks the four tools. Recapture GET /tools from a 13.38.0 connector and update the prose to 85 (gateway)."
+  },
+  {
+   "item": "Tenant-mode volumes.",
+   "detail": "Path helpers use getModularPaths, which handles /data/clients/{tenant}/; tests ran on the default layout only."
+  }
+ ],
+ "deployment": "Deploy this connector first, then gateway 2.366.0. No volume change on install. See version_lineage_warning before deploying."
+}

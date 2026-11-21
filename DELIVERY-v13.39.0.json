@@ -1,0 +1,368 @@
+{
+ "version": "13.39.0",
+ "previous": "13.38.0",
+ "work_orders": [
+  "WO-2026-11-21-01 rev 1 (2026-11-21): the duplicate-minting guard, the frozen-manifest ruling, and the auditor's own reporting"
+ ],
+ "companions": {
+  "ts-client-gateway": "5.287.0 (R15: shows skipped paths in the push result)",
+  "Gateway-Service": "2.366.0, unchanged"
+ },
+ "deploy_order": "this connector first, then ts-client-gateway 5.287.0; no gateway redeploy; no volume change on install (the event log relocates itself on the first write)",
+ "version_lineage_warning": "As in DELIVERY-v13.38.0.json: if the deployed connector is from the October 13.38.0 to 13.43.0 line, apply WO-2026-11-21-01-connector.patch (unified diff against the supplied 13.38.0) to the live tree and use the next free version number.",
+ "scope": {
+  "declared": "Stop module_write minting duplicate module files, measure the frozen-manifest invariant, make the auditor's own status, tiers and report shapes honest, keep the mirror from undoing a quarantine, and keep the event log outside quarantine; reports, guards and refusals only, no deletion, no dispatch change.",
+  "acceptance_criteria": [
+   {
+    "id": "AC-1",
+    "criterion": "module_write resolves before any file operation and refuses duplicate_id_path and path_holds_other_id in the real and the dry-run call, writing nothing; a new id is created cleanly.",
+    "result": "PASS",
+    "evidence": "module-integrity tests R1 to R5 (tree hashed before and after); mutations WO-R1 to WO-R5"
+   },
+   {
+    "id": "AC-2",
+    "criterion": "deterministic.status takes exactly clean, findings, not_run, unverified with requested, ran, skipped; deterministic findings are tiered against a hand-maintained register, both ways.",
+    "result": "PASS",
+    "evidence": "R9 not_run/clean/unverified/findings tests; R10 both-ways test; mutations WO-R9, WO-R10 x3"
+   },
+   {
+    "id": "AC-3",
+    "criterion": "Resolution and frozen-manifest reports: structured registered_in (R12), directory-walk resolved_path (R13), multi_id_file (R14), divergent_frozen_registration and resolved_is_registered (R6/R7), external route on the frozen refusal (R8), nested trees (R16), G2 grouping, R17 to R19 shapes.",
+    "result": "PASS",
+    "evidence": "module-integrity tests; mutations WO-R6 to WO-R19, WO-G2"
+   },
+   {
+    "id": "AC-4",
+    "criterion": "The event log lives outside quarantine with a recorded relocation (R11), and a mirror push skips quarantined and purged paths and reports them (R15), on the connector and in the WordPress push result.",
+    "result": "PASS",
+    "evidence": "R11 and R15 tests; mutations WO-R11 x2, WO-R15 x3; ts-client-gateway mirror-skip-client tests and 3 mutations"
+   },
+   {
+    "id": "AC-5",
+    "criterion": "Full connector suite like-for-like against 13.38.0, no net-new failure, executed delta accounted for by name.",
+    "result": "PASS",
+    "evidence": "full_suite below"
+   }
+  ]
+ },
+ "changed_files": [
+  "src/tools/module-files.js",
+  "src/tools/skill-content.js",
+  "src/tools/module-consistency.js",
+  "src/tools/skill.js",
+  "src/tools/skill-modular.js",
+  "src/tools/module-file-tools.js",
+  "src/tests/module-integrity-wo-2026-11-21-01.test.js (new)",
+  "src/tests/module-files.test.js",
+  "src/tests/reachability.test.js",
+  "scripts/verify-module-files-mutations.mjs",
+  "package.json (CRLF preserved)",
+  "CHANGELOG-v13.39.0.md (new)",
+  "DELIVERY-v13.39.0.json (new)"
+ ],
+ "files_changed_out_of_scope": [],
+ "ancillary_changes": [
+  {
+   "file": "src/tools/skill-modular.js",
+   "what": "handleModulesRestoreFromWp skips quarantined/purged modules/ paths and never writes module-history/ or quarantine/",
+   "why_now": "R15 names the mirror push path as in scope; the protected prefixes keep a push from rewriting the record R11 moved (D15)",
+   "consumers": [
+    "src/server-http.js POST /restore-modules",
+    "src/server-http.js POST /restore-personality (calls it with PERSONALITY.md only)",
+    "src/server-http.js POST /restore-dispatch-rules (DISPATCH_RULES.json only)"
+   ],
+   "checked": "R15 tests drive the handler; PERSONALITY.md and DISPATCH_RULES.json are not under modules/, module-history/ or quarantine/, so those two routes are unaffected by construction",
+   "blast_radius": "a quarantined module file is not re-created by a push (intended); a non-module file is unaffected"
+  },
+  {
+   "file": "src/tests/module-files.test.js",
+   "what": "two assertions moved: directory-walk resolved_path (R13 reverses the old null) and the log location (R11)",
+   "why_now": "the order changes both contracts",
+   "consumers": [
+    "this test only"
+   ],
+   "checked": "38/38",
+   "blast_radius": "none at runtime"
+  },
+  {
+   "file": "src/tests/reachability.test.js",
+   "what": "three AUDITED entries",
+   "why_now": "the new wires must be shown reached",
+   "consumers": [
+    "this test only"
+   ],
+   "checked": "14/14",
+   "blast_radius": "none at runtime"
+  }
+ ],
+ "field_changes_for_readers": [
+  "registered_in entries are objects { source, id, path, declared_path } instead of strings; path-less registrations moved to pathless_registrations (R12). Consumers searched: module-files.js, module-consistency.js, skill.js in the connector; the gateway's consistency-audit-provenance.js reads only audit, judgment and registered_module_ids; nothing else in the three archives reads registered_in.",
+  "resolveModulePath(...).resolved_path is now set for a single-file directory-walk id (R13). Consumers: compileIntegrity uses the manifest form (unaffected); C-I now filters on loadable to keep its population; planQuarantine's retained_path/after.resolves_to can now name the remaining unregistered copy.",
+  "C-H findings are module pairs (each still carries modules [{id, load_priority}]); C-I findings are the worst 10 line drifts plus all version drifts.",
+  "deterministic.checks_run is empty when the floor is unverified (it listed the evaluated checks before); ran and skipped say why."
+ ],
+ "full_suite": {
+  "runner": "node /home/claude/tools/conn-suite.mjs <copy> <out.json>: every *.test.js / *.test.mjs outside node_modules, node --test one file per process, TAP totals per file; plus npm test",
+  "before": {
+   "artifact": "claude-connector 13.38.0 as supplied (claude-connector-v13_38_0.zip), /tmp copy",
+   "files": 62,
+   "tests": 1284,
+   "executed": 1283,
+   "pass": 1218,
+   "fail": 65,
+   "skipped": 1,
+   "npm_test_exit": 0
+  },
+  "after": {
+   "artifact": "claude-connector 13.39.0, this tree, /tmp copy",
+   "files": 63,
+   "tests": 1324,
+   "executed": 1323,
+   "pass": 1258,
+   "fail": 65,
+   "skipped": 1,
+   "npm_test_exit": 0
+  },
+  "executed_delta_accounted": [
+   {
+    "file": "src/tests/module-integrity-wo-2026-11-21-01.test.js",
+    "why": "new file",
+    "after": {
+     "tests": 37,
+     "pass": 37,
+     "fail": 0,
+     "skipped": 0
+    }
+   },
+   {
+    "file": "src/tests/reachability.test.js",
+    "why": "three AUDITED entries",
+    "before": {
+     "tests": 11,
+     "pass": 11
+    },
+    "after": {
+     "tests": 14,
+     "pass": 14
+    }
+   }
+  ],
+  "net_new_failures": 0,
+  "baseline_red_carried": [
+   "src/tests/bundle-upload-http.test.js 0/17",
+   "src/tests/voice-elevenlabs-race.test.js 0/4",
+   "src/tests/voice-elevenlabs.test.js 6/15",
+   "src/tests/voice-engine-form.test.js 32/38",
+   "src/tests/voice-gpl-boundary.test.js 12/13",
+   "src/tests/voice-incremental.test.js 6/16",
+   "src/tests/voice-segmenting.test.js 10/18",
+   "src/tests/voice.test.js 0/1",
+   "src/tools-memory/memory.test.js 0/1",
+   "src/tools-self-model/identity-scoping.test.js 0/7",
+   "src/tools-self-model/state-vector.test.js 0/1"
+  ],
+  "baseline_red_note": "identical tests in identical files before and after; environmental in this build container (voice engines, bundle upload server, self-model and memory stores); untouched by this change"
+ },
+ "mutations_summary": "68 of 68 red (node scripts/verify-module-files-mutations.mjs): the 37 from 13.38.0 still red against the changed code, plus 31 for this order. Each control ran green with at least one test executed first.",
+ "mutations_named_by_the_order": [
+  {
+   "mutation": "module_write does not call the resolver (moduleWriteGuard replaced by an empty verdict)",
+   "test": "R2: a second file for an existing id is refused...",
+   "reddened": true
+  },
+  {
+   "mutation": "the status builder returns clean unconditionally",
+   "tests": "R9 not_run, R9 unverified, R9 findings",
+   "reddened": true
+  }
+ ],
+ "wordpress_plugin": {
+  "version": "5.287.0",
+  "suite_before": "63 passed of 63 (run-all.mjs), PHP 19/20/57 checks",
+  "suite_after": "64 passed of 64 (the added file is mirror-skip-client.test.mjs), PHP 19/20/57 unchanged plus 11 new checks",
+  "mutations": "3 of 3 red, run by hand: passthrough dropped in do_post (4 checks fail), skipped list not collected (4 fail), skip sentence dropped from the success message (1 fails)",
+  "dependencies_note": "the plugin archive ships without node_modules; the suite was run in a scratch copy after npm ci --ignore-scripts (77 packages). Without them 46 of 63 files fail on a missing jsdom, before and after alike."
+ },
+ "section_9_rehearsal": {
+  "status": "REHEARSAL ON FIXTURES, NOT THE ACCEPTANCE",
+  "results": [
+   {
+    "id": "meta-deflection-watch",
+    "lines": 60,
+    "bytes": 1580,
+    "step1_dry_correct_hash": {
+     "done": false,
+     "dry_run": true,
+     "candidates": 3,
+     "divergent": 0,
+     "always_load": true,
+     "still_there": true
+    },
+    "step2_stale_hash": {
+     "codes": [
+      "hash_mismatch"
+     ],
+     "still_there": true
+    },
+    "step3_quarantine": {
+     "done": true,
+     "newly_broken_ids": [],
+     "always_load_unresolved": [],
+     "broken_after": []
+    },
+    "step4_event": {
+     "action": "quarantined",
+     "path": "modules/modules/meta/meta-deflection-watch.md",
+     "sha256_matches": true,
+     "size_bytes": 1580,
+     "retained_path": "modules/meta/meta-deflection-watch.md",
+     "log_path": "module-history/module_file_events.jsonl"
+    },
+    "extra_mirror_push_while_quarantined": {
+     "skipped": [
+      "modules/modules/meta/meta-deflection-watch.md"
+     ],
+     "recreated": false
+    },
+    "step5_compile_loads_identical": true,
+    "step6_restore": {
+     "done": true,
+     "byte_identical": true,
+     "log": [
+      "quarantined",
+      "restored"
+     ]
+    }
+   },
+   {
+    "id": "meta-mirror-distance",
+    "lines": 60,
+    "bytes": 1579,
+    "step1_dry_correct_hash": {
+     "done": false,
+     "dry_run": true,
+     "candidates": 2,
+     "divergent": 0,
+     "always_load": true,
+     "still_there": true
+    },
+    "step2_stale_hash": {
+     "codes": [
+      "hash_mismatch"
+     ],
+     "still_there": true
+    },
+    "step3_quarantine": {
+     "done": true,
+     "newly_broken_ids": [],
+     "always_load_unresolved": [],
+     "broken_after": []
+    },
+    "step4_event": {
+     "action": "quarantined",
+     "path": "modules/meta-mirror-distance.md",
+     "sha256_matches": true,
+     "size_bytes": 1579,
+     "retained_path": "modules/meta/meta-mirror-distance.md",
+     "log_path": "module-history/module_file_events.jsonl"
+    },
+    "extra_mirror_push_while_quarantined": {
+     "skipped": [
+      "modules/meta-mirror-distance.md"
+     ],
+     "recreated": false
+    },
+    "step5_compile_loads_identical": true,
+    "step6_restore": {
+     "done": true,
+     "byte_identical": true,
+     "log": [
+      "quarantined",
+      "restored"
+     ]
+    }
+   }
+  ]
+ },
+ "claims": [
+  {
+   "claim": "module_write refuses a duplicate before writing, in dry run and real call, and creates a new id cleanly.",
+   "status": "VERIFIED",
+   "against": "module-integrity tests on throwaway volumes, tree hashed before and after; mutations WO-R1 to WO-R5"
+  },
+  {
+   "claim": "The event log is outside quarantine and survives removal of the whole quarantine directory.",
+   "status": "VERIFIED",
+   "against": "R11 tests (rm -rf quarantine/ after a purge; both events still read)"
+  },
+  {
+   "claim": "A mirror push cannot re-create a quarantined or purged module file.",
+   "status": "VERIFIED",
+   "against": "R15 tests through handleModulesRestoreFromWp; WordPress side through the shipped push_files_to_connector against a fake connector"
+  },
+  {
+   "claim": "The live duplicate set, the live C-E aggregate, the four directory-walk ids and the four multi-id pairs on the live volume.",
+   "status": "UNVERIFIED",
+   "against": "no live volume in the build environment; fixtures reproduce each shape"
+  },
+  {
+   "claim": "Section 9 acceptance on the live volume.",
+   "status": "UNVERIFIED",
+   "against": "run after deployment, per the order; rehearsed on fixtures only"
+  },
+  {
+   "claim": "Behaviour on a tenant-mode volume.",
+   "status": "UNVERIFIED",
+   "against": "module_write's guard resolves against the tree module_write writes (modularPathsForAvaDir); tests ran on the default layout"
+  }
+ ],
+ "decisions_taken": {
+  "event_log_location": "module-history/module_file_events.jsonl under avaDir: outside quarantine/ and modules/, not exported by /skill-export (.jsonl), tenant-scoped like the quarantine",
+  "relocation": "copy forward on the first write, record log_relocated first, keep the old file (nothing deleted)",
+  "register_location": "{avaDir}audit/accepted_findings.json, or SKILL_AUDIT_ACCEPTED_REGISTER; read-only to the audit",
+  "tiers_scope": "deterministic findings only; advisory and judgment stay in their own sections (D9)",
+  "R15_purged": "a purged path is skipped as well as a quarantined one: a purge is the permanent form of a quarantine",
+  "R15_unreadable_log": "fail closed for modules/ paths only",
+  "R16_and_D11_placement": "skill_consistency_audit only (one place), measured every run with a four-valued status",
+  "R19_threshold": "more than 50% of the compile's modules stating line_count_estimate, decided on at least 10",
+  "guard_registered_without_file": "an id registered at a path with no file is treated as living at that path: writing elsewhere is refused, acknowledge_resolved_path writes the registered path",
+  "section_10": "tools-fast-index.json is not in the archive and both options edit references/manifest/ (section 12): neither taken; grouped instead"
+ },
+ "queued": [
+  {
+   "item": "Run section 9 on the live volume after deployment (meta-deflection-watch, then meta-mirror-distance).",
+   "detail": "The rehearsal output above is the expected shape for each step."
+  },
+  {
+   "item": "Decide tools-fast-index.json: add paths, or mark it pathless by declaration.",
+   "detail": "A references/manifest/ edit, outside this order. Until then a register entry matching C-A:entry:references/manifest/tools-fast-index.json:* accepts the 60 as one group; orphan_ids lists module-archive-tools and zip-workspace if the live volume matches the order."
+  },
+  {
+   "item": "Section 15 rulings.",
+   "detail": "Set SKILL_ALWAYS_LOAD_TOKEN_CEILING once the aggregate is measured. Dropping line_count_estimate edits module frontmatter and manifest entries, and module_write's deriveModuleEntry still writes the field into new fragments: a separate order. Remove modules/modules/ by hand; R16 reports regrowth."
+  },
+  {
+   "item": "Other WordPress callers of /restore-modules do not show skips.",
+   "detail": "connector-snapshot-manager, connector-restore-manager and neural-core push paths: the connector skips for every caller, so the quarantine holds; only their messages omit it."
+  },
+  {
+   "item": "module_write ignores requireContent's oversized-content return value (pre-existing).",
+   "detail": "skill-content.js: requireContent returns a module_too_large result object for content over MODULE_WRITE_MAX_CHARS, and handleModuleWrite discards it; checkChunkLimit runs next and may catch the same payload. Not touched here."
+  },
+  {
+   "item": "skill_load_specialist first-wins vs compile last-wins; skill_recompile reads MANIFEST.json only.",
+   "detail": "Carried from 13.38.0; dispatch changes."
+  },
+  {
+   "item": "Eval harness stub manifest (gateway).",
+   "detail": "Carried from 13.38.0; module_write now also advertises dry_run and acknowledge_resolved_path."
+  }
+ ],
+ "out_of_scope_respected": [
+  "no edit to CORE.md, MANIFEST.json, MANIFEST_APPEND.json, DISPATCH_RULES.json, dispatch selection, always_load flags or references/manifest/",
+  "no decision about any divergent group",
+  "no deletion or quarantine on a live volume",
+  "no directory-level removal",
+  "no module content change"
+ ]
+}

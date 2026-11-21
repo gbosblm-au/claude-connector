@@ -102,6 +102,47 @@ const AUDITED = [
       + 'module set from the volume and the gateway times out.',
     expect: [ 'src/tools/skill-modular.js' ],
   },
+  // v13.38.0 (WO-2026-11-20-03 D3). One resolver, used by the compile and the
+  // audit. Unreached from either, the delete guard protects a copy that is not
+  // the one loaded, which is the failure the order exists to prevent.
+  {
+    name: 'resolveModulePath',
+    definedIn: 'src/tools/module-files.js',
+    why: 'D3: skill_compile, skill_audit and module_delete must ask one resolver which file a module id is.',
+    expect: [ 'src/tools/skill-modular.js', 'src/tools/skill.js' ],
+  },
+  {
+    name: 'handleModuleDelete',
+    definedIn: 'src/tools/module-file-tools.js',
+    why: 'R1: the guarded quarantine. Defined and never dispatched, the tool is advertised and every call is Unknown tool.',
+    expect: [ 'src/server-http.js' ],
+  },
+  {
+    name: 'handleSkillConsistencyAudit',
+    definedIn: 'src/tools/module-consistency.js',
+    why: 'D7: the cross-module audit. Unreached, the checks exist and nothing can run them.',
+    expect: [ 'src/server-http.js' ],
+  },
+  // v13.39.0 (WO-2026-11-21-01). The write-time guard and the mirror skip are
+  // both refusals: unreached, nothing fails and the duplicate set regrows.
+  {
+    name: 'moduleWriteGuard',
+    definedIn: 'src/tools/module-files.js',
+    why: 'R1-R5: module_write must ask the resolver before it writes. Unreached, module_write mints duplicates again and every quarantine is undone by the next write.',
+    expect: [ 'src/tools/skill-content.js' ],
+  },
+  {
+    name: 'quarantinedPathIndex',
+    definedIn: 'src/tools/module-files.js',
+    why: 'R15: the WordPress mirror must read the event log before restoring a module path. Unreached, a Push All re-creates every quarantined file.',
+    expect: [ 'src/tools/skill-modular.js' ],
+  },
+  {
+    name: 'idsByFile',
+    definedIn: 'src/tools/module-files.js',
+    why: 'R14: the inverse index is the only view that can see one file claimed by two ids.',
+    expect: [ 'src/tools/skill.js', 'src/tools/module-consistency.js' ],
+  },
 ];
 
 /** Directories searched for callers. */

@@ -62,6 +62,9 @@ import { resolveContained } from '../utils/pathContainment.js';
 import { checkChunkLimit } from '../utils/chunkGuard.js';
 import { log } from '../utils/logger.js';
 import { deriveModuleEntry, writeModuleFragment } from './manifest-fragments.js';
+// v13.39.0 (WO-2026-11-21-01 R1-R5): module_write asks the shared resolver,
+// the one skill_compile uses, before it opens any file.
+import { moduleWriteGuard, modularPathsForAvaDir, REFUSAL as MODULE_REFUSAL } from './module-files.js';
 
 // ---------------------------------------------------------------------------
 // Typed validation error
@@ -496,7 +499,14 @@ export const moduleWriteToolDefinition = {
     '  1. Read the existing file content (e.g. via skill_read or skill_load_specialist) so you know what you are replacing.\n' +
     '  2. Explicitly notify Brian that you intend to overwrite this specific file and explain why.\n' +
     '  3. Set force: true ONLY after Brian has confirmed the overwrite.\n' +
-    'New files (paths that do not yet exist) are created immediately — force: true is not required for new files.',
+    'New files (paths that do not yet exist) are created immediately; force: true is not required for new files.\n\n' +
+    'DUPLICATE GUARD (v13.39.0): before touching any file, module_write resolves the module id it is about to write ' +
+    '(the content\'s frontmatter id, else the file name, plus manifest_entry.id if given) with the resolver skill_compile uses. ' +
+    'It REFUSES (code duplicate_id_path) when that id already resolves to a different path, naming resolved_path and every ' +
+    'candidate with its hash; to write to the resolved file instead pass acknowledge_resolved_path equal to resolved_path, ' +
+    'or quarantine the existing file first with module_delete. It REFUSES (code path_holds_other_id) when the path already ' +
+    'holds a file of a different module id; force does not override either refusal. A module id that exists nowhere is ' +
+    'created normally. dry_run: true returns the same verdict, including any refusal, and writes nothing.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -507,6 +517,8 @@ export const moduleWriteToolDefinition = {
       manifest_entry: { type: 'object', description: 'Optional manifest module entry (MANIFEST_APPEND schema: id, title, category, triggers{keywords,phrases,task_class}, provides, depends_on, load_priority, load_strategy, always_load). Fields you supply override the derived defaults; id and path are always ensured. Omit to auto-derive from the file path and content.' },
       dispatch_rule:  { type: 'object', description: 'Optional dispatch rule to register alongside the module in the same fragment (fragment schema: id, trigger_description, trigger_patterns{keywords,phrases,task_class}, module_to_add, confidence). Omit to register the module without a routing rule.' },
       skip_manifest:  { type: 'boolean', description: 'Set true to write the module file WITHOUT registering a manifest fragment (e.g. editing a body whose registration already exists and should not be touched). Default: false — registration is automatic.' },
+      dry_run:        { type: 'boolean', description: 'Set true to get the verdict without writing anything: the same duplicate_id_path or path_holds_other_id refusal a real call would return, or what a real call would do (create, overwrite, or be blocked by the overwrite guard). Default: false.' },
+      acknowledge_resolved_path: { type: 'string', description: 'Only after a duplicate_id_path refusal: the resolved_path it named (e.g. "modules/meta/x.md"). The write then goes to that resolved file instead of the requested path. Must match exactly; the overwrite guard still applies.' },
     },
     required: ['file', 'content'],
   },
@@ -679,6 +691,65 @@ export async function handleModuleWrite(args) {
   }
 
   const paths      = getContentPaths();
+  const dryRun     = args.dry_run === true;
+
+  // ── WO-2026-11-21-01 R1-R5: resolve before writing ───────────────────────
+  //
+  // Before any file operation, and before the overwrite guard below, ask the
+  // shared resolver about the id this write carries. A second file for an id
+  // that already resolves elsewhere, or a different id written over a file, is
+  // refused here, in the dry run and the real call alike (R5), so the duplicate
+  // set cannot regrow between audits. The call is unconditional: the guard
+  // derives the id itself and falls back to the file name if the frontmatter
+  // cannot be read.
+  let writeGuard;
+  try {
+    writeGuard = moduleWriteGuard({
+      requestedRel: `modules/${cleanPath}`,
+      content,
+      manifestEntryId: manifest_entry && typeof manifest_entry === 'object' ? manifest_entry.id : null,
+      acknowledgeResolvedPath: firstStringKey(args, 'acknowledge_resolved_path'),
+      paths: modularPathsForAvaDir(paths.avaDir),
+    });
+  } catch (err) {
+    log('error', `[module_write] write guard failed for modules/${cleanPath}: ${err.message}`);
+    writeGuard = { applies: true, verdict: 'refused', ids: [], redirected: false, resolutions: [],
+      refusals: [{ code: MODULE_REFUSAL.WRITE_GUARD_UNVERIFIED, message: `The duplicate guard could not run (${err.message}); nothing was written.` }] };
+  }
+  const guardSummary = {
+    verdict: writeGuard.verdict,
+    ids: writeGuard.ids,
+    redirected: writeGuard.redirected,
+    ...(writeGuard.redirected ? { redirected_from: writeGuard.requested_rel, redirected_to: writeGuard.target_rel } : {}),
+    resolutions: writeGuard.resolutions,
+    ...(writeGuard.note ? { note: writeGuard.note } : {}),
+  };
+  if (writeGuard.refusals.length) {
+    log('warn', `[module_write] REFUSED modules/${cleanPath}: ${writeGuard.refusals.map((r) => r.code).join(', ')}${dryRun ? ' (dry run)' : ''}`);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          blocked:         true,
+          written:         false,
+          dry_run:         dryRun,
+          code:            writeGuard.refusals[0].code,
+          refusals:        writeGuard.refusals,
+          write_guard:     guardSummary,
+          requested_file:  file ?? null,
+          normalised_file: cleanPath,
+          note: 'Nothing was written. Each refusal names the evidence it used and the routes forward.',
+        }, null, 2),
+      }],
+      ...(dryRun ? {} : { isError: true }),
+    };
+  }
+  if (writeGuard.redirected) {
+    // acknowledge_resolved_path matched resolved_path: write the resolved file.
+    // Every check below (containment, the double-nest guard, the overwrite
+    // guard) runs against the redirected path.
+    cleanPath = writeGuard.target_rel.slice('modules/'.length);
+  }
 
   // SPEC-FIX-MODULE-WRITE-001 §4.1, containment half.
   //
@@ -734,6 +805,26 @@ export async function handleModuleWrite(args) {
   const wpSkillKey = process.env.WP_SKILL_KEY || '';
 
   const isNew = !existsSync(fullPath);
+
+  // R5: a dry run reports what the real call would do, having passed the same
+  // guard, and writes nothing.
+  if (dryRun) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          dry_run:         true,
+          written:         false,
+          refusals:        [],
+          would:           isNew ? 'create' : (force ? 'overwrite' : 'be blocked by the overwrite guard (the file exists and force is not true)'),
+          resolved_path:   fullPath,
+          requested_file:  file ?? null,
+          normalised_file: cleanPath,
+          write_guard:     guardSummary,
+        }, null, 2),
+      }],
+    };
+  }
 
   // -------------------------------------------------------------------------
   // SAFETY GUARDRAIL: block overwrite of an existing file unless force=true.
@@ -791,6 +882,7 @@ export async function handleModuleWrite(args) {
             force_requested: force,
           },
           note: 'New files (non-existing paths) are created immediately without force: true.',
+          write_guard: guardSummary,
         }, null, 2),
       }],
     };
@@ -882,6 +974,7 @@ export async function handleModuleWrite(args) {
         normalised_file: cleanPath,
         resolved_path:   fullPath,
         manifest_registration: manifestResult,
+        write_guard: guardSummary,
         wp_backup:  formatWpResult(wpResult),
         note: manifestResult.registered
           ? `Module ${isNew ? 'created' : 'overwritten'} AND registered in ${manifestResult.fragment_file}. skill_compile, skill_recompile, skill_load_specialist, and brain_scan catalog it automatically — no MANIFEST.json edit or manifest_rebuild.py run is needed.`
