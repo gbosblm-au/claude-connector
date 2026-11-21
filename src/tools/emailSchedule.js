@@ -4,12 +4,15 @@
 //   email_schedule         -- queue a deferred send or define a drip sequence
 //   email_schedule_cancel  -- cancel a pending send or sequence
 //   email_schedule_list    -- list scheduled sends (filterable)
+//   email_schedule_release -- release a send held because it fell due while
+//                             nobody was there (v13.39.0, TENAX-2026-10-15-01 H-5)
 
 import {
   createDeferredSchedule,
   createDripSequence,
   cancelSchedule,
   listSchedules,
+  releaseHeldSchedule,
 } from "../utils/scheduler.js";
 import { config } from "../config.js";
 
@@ -179,8 +182,8 @@ export const emailScheduleListToolDefinition = {
   inputSchema: {
     type: "object",
     properties: {
-      status: { type: "string", enum: ["pending", "sent", "cancelled", "failed", "skipped", "all"],
-               description: "Default pending." },
+      status: { type: "string", enum: ["pending", "sent", "cancelled", "failed", "skipped", "held_overdue", "expired_unconfirmed", "all"],
+               description: "Default pending. held_overdue: due while nobody was there, waiting for email_schedule_release. expired_unconfirmed: a hold nobody released in time; not sent." },
       since_days: { type: "integer", description: "Lookback window for non-pending records. Default 7." },
       company: { type: "string", description: "Filter by company name" },
     },
@@ -195,4 +198,40 @@ export async function handleEmailScheduleList(args) {
     company: args.company,
   });
   return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+}
+
+// -----------------------------------------------------------------------
+// Tool: email_schedule_release  (v13.39.0, TENAX-2026-10-15-01 H-5)
+// -----------------------------------------------------------------------
+export const emailScheduleReleaseToolDefinition = {
+  name: "email_schedule_release",
+  description:
+    "Release a scheduled send that was HELD because its send time passed while the connector " +
+    "could not send it (status held_overdue). Released, it is sent on the next scheduler tick. " +
+    "Use only after confirming with the sender that the email should still go out this late.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      schedule_id: { type: "string", description: "The held send to release" },
+      released_by: { type: "string", description: "Who confirmed the release (recorded on the schedule)" },
+    },
+    required: ["schedule_id"],
+  },
+};
+
+export async function handleEmailScheduleRelease(args) {
+  args = args || {};
+  if (!args.schedule_id) {
+    const out = { status: "failed", code: "VALIDATION_ERROR", error: "schedule_id is required." };
+    return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }], isError: true };
+  }
+  const result = releaseHeldSchedule(args);
+  if (result.error) {
+    const out = { status: "failed", code: result.code || "UNKNOWN", error: result.error };
+    return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }], isError: true };
+  }
+  // The tool outcome is "released"; the schedule itself is now pending and
+  // goes on the next tick. Named separately so neither overwrites the other.
+  const { status: scheduleStatus, ...rest } = result;
+  return { content: [{ type: "text", text: JSON.stringify({ status: "released", schedule_status: scheduleStatus, ...rest }, null, 2) }] };
 }
