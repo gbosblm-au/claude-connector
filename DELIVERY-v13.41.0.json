@@ -1,0 +1,79 @@
+{
+  "version": "13.41.0",
+  "previous": "13.40.0",
+  "work_orders": [
+    "WO-ISO-276-001 rev 1, task A3, connector half: every tenant-mode memory call names the account it acts for: a gateway-proxied call its own context.user_id (a tenant with no user is refused), a direct MCP call TS_CLIENT_USER_ID, else a refusal before anything is sent.",
+    "TENAX-2026-10-23-01 (administrator's decision of 2026-10-24, after the Gateway 2.277.0 review): GET /skill-export also returns a tenant-mode connector's own client directory as `client`, the directory its compile reads, so the gateway's module draw derives its pool from it. Built on 13.40.0 as attached on 2026-10-24 (claude-connector.zip, git HEAD c1bca6b)."
+  ],
+  "companion_release": "Gateway Service 2.277.0. Deploy this connector FIRST: Gateway 2.276.0 already accepts the user_id it sends; Gateway 2.277.0 refuses a tenant memory request without one (memory_scope_refused / user_required).",
+  "changed_files": [
+    "+ src/utils/callContext.js (AsyncLocalStorage call scope; resolveMemoryUserId; positiveUserId)",
+    "+ src/tests/memory-user-forwarding.test.js (11 tests)",
+    "+ src/utils/skillExport.js (the export walk, rules unchanged; buildSkillExport adds `client` in tenant mode)",
+    "+ src/tests/skill-export-client.test.js (5 tests)",
+    "+ scripts/verify-wo-iso-276-001-mutations.mjs (10 named mutations, 7 claims)",
+    "+ CHANGELOG-v13.41.0.md",
+    "+ DELIVERY-v13.41.0.json",
+    "M src/server-http.js (two imports; dispatchToolCall runs dispatchToolCallCore inside runWithCallContext; GET /skill-export builds its body with buildSkillExport, a superset of the old response)",
+    "M src/tools-memory/wp-memory.js (one import; tenant mode sets body.user_id or throws TENANT_USER_REQUIRED)",
+    "M src/config.js (comment documenting TS_CLIENT_USER_ID)",
+    "M .env.example (TS_CLIENT_USER_ID documented)",
+    "M src/tests/memory-capacity.test.js, src/tests/memory-tiered-passthrough.test.js, src/tests/memory-write-guard.test.js (each tenant-mode case sets TS_CLIENT_USER_ID=7 and deletes it after; no assertion changed; line endings preserved)",
+    "M src/tools-memory/memoryWriteGuard.js, src/tests/fixtures/memory-guard-fixture.json (line endings only: CRLF in the attached tree restored to LF, the bytes of git HEAD and of Gateway Service's twins)",
+    "M package.json (13.40.0 to 13.41.0; the wo-iso-276-001:mutations script)"
+  ],
+  "existing_tests_modified": [
+    "src/tests/memory-capacity.test.js, memory-tiered-passthrough.test.js, memory-write-guard.test.js: TS_CLIENT_USER_ID set around their tenant-mode calls, because the transport now refuses a tenant call that names no account. No assertion changed."
+  ],
+  "not_shipped_on_purpose": [
+    "data/google-service-account.json: a complete service-account private key, present again in the attached archive (as in 13.38.0 and 13.39.0; 13.40.0's delivery left it out and recommended rotation). Not read by this build and left out of this archive. Rotating the key is recommended. It is also TRACKED by the attached repository (git ls-files data/ lists it), so it is in the git history as well: rotate the key, then remove the file from the repository and its history.",
+    "node_modules/ and .git/: present in the attached archive; reinstall with npm ci; the archive is the source tree.",
+    ":memory: and every __pycache__/ directory: files test runs and Python write in the working tree."
+  ],
+  "variables": {
+    "added": [
+      "TS_CLIENT_USER_ID (tenant mode only; the gateway ti_users.id a direct MCP session acts for; Gateway scripts/provision-tenant.mjs verify prints it)"
+    ],
+    "required": "TS_CLIENT_USER_ID on a tenant-mode connector used directly over MCP. Calls proxied by the gateway carry the account per call."
+  },
+  "full_suite": {
+    "runner": "per-file: every *.test.js / *.test.mjs under src/ and tests/ in its own `node --experimental-test-module-mocks --test` process with NODE_ENV=test (a scratch runner mirroring Gateway scripts/run-suite.mjs), plus `npm test`; same runner, same node_modules, Node v22.22.0, on both trees",
+    "before": {
+      "artifact": "13.40.0 as attached",
+      "files": 73,
+      "tests": 1419,
+      "pass": 1415,
+      "fail": 3,
+      "skipped": 1,
+      "npm_test": "30 passed, 0 failed"
+    },
+    "after": {
+      "artifact": "this tree (13.41.0)",
+      "files": 75,
+      "tests": 1435,
+      "pass": 1432,
+      "fail": 2,
+      "skipped": 1,
+      "npm_test": "30 passed, 0 failed"
+    },
+    "executed_delta": "+16: 11 in src/tests/memory-user-forwarding.test.js and 5 in src/tests/skill-export-client.test.js (both new). Every other file has the same tests, pass, fail, skipped and exit code, except src/tests/memory-write-guard.test.js: 18/19 to 19/19 (C-TWIN-PARITY, red on the attached tree because of the CRLF guard and fixture, green with them restored).",
+    "net_new_failures": 0,
+    "carried": [
+      "src/tests/voice-gpl-boundary.test.js: 'no Piper artifact survives anywhere in the source tree' (carried since 13.37.0)",
+      "src/tests/voice.test.js: C-10 'no connector path reads VOICE_TEST_USERS or any VOICE_ALLOWLIST_* variable' (red on the attached tree)"
+    ]
+  },
+  "mutations": {
+    "command": "npm run wo-iso-276-001:mutations",
+    "applied": 10,
+    "claims": 7,
+    "red": "10/10 named mutations demonstrated red, controls green.",
+    "note": "C-CONN-USER-CONCURRENT was strengthened before its mutation was written: each call now yields before it reaches the transport and the first-started finishes last. Without that, a process-wide 'current user' passed the test, because both calls read the identity before their first await.",
+    "older_verifiers": "npm run tenax-2026-10-15:mutations 47/47 red; npm run tenax-2026-10-17-03:mutations 12/12 red, on this tree."
+  },
+  "twin_parity": {
+    "memory_guard_sha256": "a2a6ac99ccb16cb028fd3f9d47a2f15520f447b82bb7c6888fd4fb06c74a0639",
+    "memory_fixture_sha256": "12c9bde425c2cc11b29cace1c71472be42cd2947e283002fc4454c9aca9c7a45"
+  },
+  "boundary": "Not changed: the dispatch layer, skill compilation, the module volume and its manifests, and every tool other than the tenant-mode memory transport. GET /skill-export gains the additive `client` field (tenant mode only; `files` unchanged). The random module draw of TENAX-2026-10-23-01 is the gateway's (Gateway 2.277.0 skill_load_random)."
+}

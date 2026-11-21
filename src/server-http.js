@@ -533,6 +533,20 @@ import {
   handleAvaMemoryRestore,
   handleAvaMemorySyncStatus,
 } from "./tools/avaMemorySync.js";
+// v13.38.0 (WO-2026-11-20-03): removing a module file (quarantine, restore,
+// purge, the event log) and the cross-module consistency audit.
+import {
+  moduleDeleteToolDefinition,
+  moduleRestoreToolDefinition,
+  moduleFileEventsToolDefinition,
+  handleModuleDelete,
+  handleModuleRestore,
+  handleModuleFileEvents,
+} from "./tools/module-file-tools.js";
+import {
+  skillConsistencyAuditToolDefinition,
+  handleSkillConsistencyAudit,
+} from "./tools/module-consistency.js";
 import {
   moduleWriteToolDefinition,
   // v13.27.0 (SPEC-SOCIAL-003 §3, §14): path-addressed reads for modules/.
@@ -989,6 +1003,9 @@ const TOOLS = [
         skillHistoryToolDefinition,
         skillRollbackToolDefinition,
         skillAuditToolDefinition,
+        // v13.38.0 (WO-2026-11-20-03 D7): the expensive cross-module audit is
+        // its own tool, beside the cheap structural one. Read-only.
+        skillConsistencyAuditToolDefinition,
         booksReadToolDefinition,
         booksLogWriteToolDefinition,
         // ---------- Content sections (archive / references / scripts) ----------
@@ -1038,6 +1055,10 @@ const TOOLS = [
         personalityWriteToolDefinition,
         dispatchRuleAddToolDefinition,
         moduleWriteToolDefinition,
+        // v13.38.0 (WO-2026-11-20-03)
+        moduleDeleteToolDefinition,
+        moduleRestoreToolDefinition,
+        moduleFileEventsToolDefinition,
       ]
     : []),
 
@@ -1123,6 +1144,9 @@ function buildEffectiveToolList() {
     moduleWriteToolDefinition,
     moduleReadToolDefinition,
     moduleResolveToolDefinition,
+    moduleDeleteToolDefinition,
+    moduleRestoreToolDefinition,
+    moduleFileEventsToolDefinition,
   ];
 
   const byName = new Map();
@@ -1343,6 +1367,8 @@ async function dispatchToolCallCore(name, args, context = null) {
         case "skill_history":           return await handleSkillHistory(args);
         case "skill_rollback":          return await handleSkillRollback(args);
         case "skill_audit":             return await handleSkillAudit(args);
+        // v13.38.0 (WO-2026-11-20-03). Read-only: not in SYSTEM_WRITE_TOOLS.
+        case "skill_consistency_audit": return handleSkillConsistencyAudit(args);
         // ---------- Modular Skill System (v11.0.0) ----------
         case "skill_compile":           return await handleSkillCompile(args, context);
         case "skill_load_specialist":   return await handleSkillLoadSpecialist(args);
@@ -1371,6 +1397,11 @@ async function dispatchToolCallCore(name, args, context = null) {
         // able to change them.
         case "module_read":             return handleModuleRead(args);
         case "module_resolve":          return handleModuleResolve(args);
+        // v13.38.0 (WO-2026-11-20-03). module_delete and module_restore move
+        // files and are in SYSTEM_WRITE_TOOLS; the event log is read-only.
+        case "module_delete":           return await handleModuleDelete(args, context);
+        case "module_restore":          return await handleModuleRestore(args, context);
+        case "module_file_events":      return handleModuleFileEvents(args);
         // v13.28.0 BOOKS-READ AUTHORITY CUTOVER: the reading record is per
         // account in Postgres, so both tools take the per-call context the
         // gateway supplies (and refuse when no account resolves).
@@ -1494,6 +1525,8 @@ const SYSTEM_WRITE_TOOLS = new Set([
   'skill_write', 'skill_write_addition', 'skill_merge_additions', 'skill_rollback',
   'module_write', 'script_write', 'archive_write', 'reference_write',
   'dispatch_rule_add',
+  // v13.38.0 (WO-2026-11-20-03): they move module files.
+  'module_delete', 'module_restore',
 ]);
 
 function createMcpServer(tenantContext) {
@@ -1510,6 +1543,7 @@ function createMcpServer(tenantContext) {
     const MODULAR_TOOL_NAMES = new Set([
       "skill_compile", "skill_load_specialist", "skill_recompile", "personality_write", "dispatch_rule_add", "module_write",
       "module_read", "module_resolve",
+      "module_delete", "module_restore", "module_file_events",
     ]);
     const baseTools = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
     const modularTools = isModularEnabled()
@@ -1522,6 +1556,9 @@ function createMcpServer(tenantContext) {
           moduleWriteToolDefinition,
           moduleReadToolDefinition,
           moduleResolveToolDefinition,
+          moduleDeleteToolDefinition,
+          moduleRestoreToolDefinition,
+          moduleFileEventsToolDefinition,
         ]
       : [];
     const allTools = [...baseTools, ...modularTools];
@@ -3342,6 +3379,7 @@ app.get("/tools", (req, res) => {
     "skill_compile", "skill_load_specialist", "skill_recompile",
     "personality_write", "dispatch_rule_add", "module_write",
     "module_read", "module_resolve",
+    "module_delete", "module_restore", "module_file_events",
   ]);
   const baseTools    = TOOLS.filter(t => !MODULAR_TOOL_NAMES.has(t.name));
   const modularTools = isModularEnabled()
@@ -3354,6 +3392,9 @@ app.get("/tools", (req, res) => {
         moduleWriteToolDefinition,
         moduleReadToolDefinition,
         moduleResolveToolDefinition,
+        moduleDeleteToolDefinition,
+        moduleRestoreToolDefinition,
+        moduleFileEventsToolDefinition,
       ]
     : [];
 
