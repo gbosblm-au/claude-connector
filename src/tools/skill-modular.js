@@ -1765,9 +1765,6 @@ export async function handleModulesRestoreFromWp(body) {
       log('error', `restore-modules: FAILED to write ${fullPath}: ${err.message}`);
     }
   }
-  } finally {
-    bulk.release();
-  }
 
   const successCount = Object.values(results).filter(r => r.success).length;
   const failCount    = Object.values(results).filter(r => !r.success).length;
