@@ -115,7 +115,7 @@ const MUTATIONS = [
 
   // ── Phase S ──
   { name: 'S1: stopword phrases not reported', file: MC, tests: 'S-1:',
-    find: "        if (typeof p === 'string' && phraseEndsWithStopword(p)) findings.push(", replace: "        if (false) findings.push(" },
+    find: "        if (typeof p === 'string' && phraseIsStopwordsOnly(p)) {", replace: "        if (false) {" },
   { name: 'S1: path-segment keywords not reported', file: MC, tests: 'S-1:',
     find: "        if (why && why !== 'empty') findings.push(", replace: "        if (false) findings.push(" },
   { name: 'S1: stale version not reported', file: MC, tests: 'S-1:',
@@ -126,8 +126,8 @@ const MUTATIONS = [
   { name: 'S1: C-L placed in the deterministic section', file: MC, tests: 'S-1:',
     find: "  if (on('C-F')) deterministic['C-F'] = checkF(snapshot, resolutions);",
     replace: "  if (on('C-F')) deterministic['C-F'] = checkF(snapshot, resolutions);\n  if (on('C-L')) deterministic['C-L'] = { pass: true };" },
-  { name: 'S-2: every phrase read as ending in a stopword', file: MF, tests: 'S-2:',
-    find: '  return tokens.length > 0 && STOPWORDS.has(bareWord(tokens[tokens.length - 1]));', replace: '  return tokens.length > 0;' },
+  { name: 'S-2: every phrase read as a stopword phrase', file: MF, tests: 'S-2:',
+    find: '  return !tokens.some((t) => {', replace: '  return true || !tokens.some((t) => {' },
   { name: 'S1: U+FFFD in a fragment string not reported', file: MC, tests: 'C-L: U\\+FFFD',
     find: "        if (value.includes('\\uFFFD')) findings.push(", replace: "        if (false) findings.push(" },
   { name: 'S1: line count drift not reported', file: MC, tests: 'C-L: U\\+FFFD',

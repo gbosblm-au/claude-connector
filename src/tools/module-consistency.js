@@ -49,6 +49,18 @@
 //   R1-R4 registration_repair_report (on request): every fragment registration
 //       that looks auto-derived, with a proposed corrected entry. It proposes;
 //       it never applies. Each repair is Brian's decision, one module at a time.
+//
+// v13.44.0 (WO-2026-11-24-03), still reporting only:
+//   R1  stopword_phrase now means "consists only of stopwords", the rule
+//       module_write applies (manifest-fragments.js phraseIsStopwordsOnly).
+//   R3  C-L reads the trigger_dropped block module_write persists: a recorded
+//       refusal is state "refused_on_write" (a live loss), a stored phrase the
+//       next write would refuse is "would_be_refused_on_next_write", and a
+//       module whose frontmatter declares phrases its registration does not
+//       hold gets a frontmatter_phrases_unregistered finding with the count.
+//   R6  C-L's phrase_rederivation re-derives each such phrase from the
+//       frontmatter under the current rule: newly kept, still refused (with
+//       reasons), refused only as a substring. Read-only.
 // ---------------------------------------------------------------------------
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -68,7 +80,8 @@ import {
   pathSegmentsOf,
   keywordLintReason,
   phraseLintReasons,
-  phraseEndsWithStopword,
+  phraseIsStopwordsOnly,
+  PHRASE_SUBSTRING_REASON_PREFIX,
   deriveRegistration,
   readRegistrationFrontmatter,
   REGISTERED_BY_MODULE_WRITE,
@@ -598,6 +611,9 @@ function checkI(snapshot, resolutions) {
   };
 }
 
+/** C-L (WO-2026-11-24-03 R3 item 6): a refusal already made, and one the next write would make. */
+export const CL_STATE = Object.freeze({ REFUSED_ON_WRITE: 'refused_on_write', WOULD_BE_REFUSED: 'would_be_refused_on_next_write' });
+
 /** C-L: string fields where a name is expected (a double space there is a lost character). */
 const NAME_KEYS = new Set(['id', 'title', 'category', 'keywords', 'phrases', 'task_class', 'provides', 'depends_on', 'module_to_add']);
 
@@ -614,6 +630,7 @@ function entryPathOf(snapshot, entry) {
 export function checkL(snapshot) {
   const findings = [];
   const fragments = snapshot.registrations.fragments || [];
+  const rederivation = { newly_kept: [], still_refused: [], refused_as_substring: [] };
   let entries = 0;
   for (const frag of fragments) {
     const source = `references/manifest/${frag.file}`;
@@ -624,7 +641,27 @@ export function checkL(snapshot) {
       const segments = path ? pathSegmentsOf(path) : new Set();
       const t = m.triggers && typeof m.triggers === 'object' ? m.triggers : {};
       for (const p of (Array.isArray(t.phrases) ? t.phrases : [])) {
-        if (typeof p === 'string' && phraseEndsWithStopword(p)) findings.push({ kind: 'stopword_phrase', source, id, value: p, detail: 'the phrase ends in a stopword' });
+        if (typeof p === 'string' && phraseIsStopwordsOnly(p)) {
+          findings.push({ kind: 'stopword_phrase', state: CL_STATE.WOULD_BE_REFUSED, live_loss: false, source, id, value: p,
+            detail: 'stored, and consists only of stopwords: the next write of this module would refuse it' });
+        }
+      }
+      // WO-2026-11-24-03 R3 item 6: the dropped set, as module_write persisted
+      // it. A refusal recorded there is a live loss: the phrase is not in the
+      // registration the compile reads.
+      for (const d of (Array.isArray(m.trigger_dropped) ? m.trigger_dropped : [])) {
+        if (!d || typeof d !== 'object') continue;
+        const field = typeof d.phrase === 'string' ? 'phrases' : typeof d.keyword === 'string' ? 'keywords' : typeof d.task_class === 'string' ? 'task_class' : null;
+        if (!field) continue;
+        const value = field === 'phrases' ? d.phrase : field === 'keywords' ? d.keyword : d.task_class;
+        const reason = typeof d.reason === 'string' ? d.reason : '';
+        if (field === 'phrases' && phraseIsStopwordsOnly(value)) {
+          findings.push({ kind: 'stopword_phrase', state: CL_STATE.REFUSED_ON_WRITE, live_loss: true, source, id, value, reason,
+            detail: 'refused when this registration was written (recorded in trigger_dropped): it consists only of stopwords' });
+        } else {
+          findings.push({ kind: 'trigger_dropped', state: CL_STATE.REFUSED_ON_WRITE, live_loss: true, source, id, field, value, reason,
+            detail: `refused when this registration was written (recorded in trigger_dropped): ${reason || 'no reason recorded'}` });
+        }
       }
       for (const k of (Array.isArray(t.keywords) ? t.keywords : [])) {
         if (typeof k !== 'string') continue;
@@ -633,6 +670,20 @@ export function checkL(snapshot) {
       }
       const f = path ? snapshot.scan.files.find((x) => x.path === path) : null;
       if (f) {
+        const rec = reconcileFrontmatterPhrases(f, m);
+        if (rec) {
+          findings.push({ kind: 'frontmatter_phrases_unregistered', source, id, path, count: rec.missing.length,
+            declared: rec.declared, registered: rec.registered, recorded_in_trigger_dropped: rec.recorded, unrecorded: rec.missing.length - rec.recorded,
+            value: rec.missing.map((x) => x.phrase),
+            detail: `the module's frontmatter declares ${rec.declared} phrase(s); the registration holds ${rec.missing.length} fewer of them`
+              + ` (${rec.recorded} recorded in trigger_dropped, ${rec.missing.length - rec.recorded} not recorded anywhere)` });
+          for (const x of rec.missing) {
+            const row = { id, source, phrase: x.phrase };
+            if (x.now === 'kept') rederivation.newly_kept.push(row);
+            else if (x.now === 'substring') rederivation.refused_as_substring.push({ ...row, reasons: x.reasons });
+            else rederivation.still_refused.push({ ...row, reasons: x.reasons });
+          }
+        }
         const fmVersion = f.frontmatter && f.frontmatter.version;
         if (m.version !== undefined && m.version !== null && fmVersion && String(m.version) !== String(fmVersion)) {
           findings.push({ kind: 'stale_version', source, id, value: String(m.version), frontmatter_version: String(fmVersion), path, detail: 'the registration\'s version differs from the module\'s frontmatter' });
@@ -672,9 +723,70 @@ export function checkL(snapshot) {
     entries_read: entries,
     finding_count: findings.length,
     by_kind: byKind,
+    by_state: {
+      [CL_STATE.REFUSED_ON_WRITE]: findings.filter((x) => x.state === CL_STATE.REFUSED_ON_WRITE).length,
+      [CL_STATE.WOULD_BE_REFUSED]: findings.filter((x) => x.state === CL_STATE.WOULD_BE_REFUSED).length,
+    },
     findings,
-    note: 'Advisory: C-L never blocks. Phrase and keyword findings use the rules module_write now applies on write (WO-2026-11-21-02 P4, P5); a keyword is a path segment when it equals a directory on the module\'s path or its file name.',
+    phrase_rederivation: {
+      basis: 'Every phrase a module\'s frontmatter declares that its registration does not hold, re-derived from that frontmatter under the rule module_write applies now (WO-2026-11-24-03 R6). '
+        + 'Read-only: nothing is written; a module keeps its registration until it is written again.',
+      newly_kept_count: rederivation.newly_kept.length,
+      still_refused_count: rederivation.still_refused.length,
+      refused_as_substring_count: rederivation.refused_as_substring.length,
+      newly_kept: rederivation.newly_kept,
+      still_refused: rederivation.still_refused,
+      refused_as_substring: rederivation.refused_as_substring,
+    },
+    note: 'Advisory: C-L never blocks. Phrase and keyword findings use the rules module_write now applies on write (WO-2026-11-21-02 P4, P5, '
+      + 'as amended by WO-2026-11-24-03 R1: a phrase is refused as a stopword phrase only when it consists only of stopwords); a keyword is a '
+      + 'path segment when it equals a directory on the module\'s path or its file name. state "refused_on_write" is a refusal recorded in the '
+      + 'registration\'s trigger_dropped block, a live loss; state "would_be_refused_on_next_write" is a stored phrase the next write would refuse. '
+      + 'frontmatter_phrases_unregistered names a module whose frontmatter declares phrases its registration does not hold, with the count.',
   };
+}
+
+/**
+ * WO-2026-11-24-03 R3 item 7: the phrases a module's frontmatter declares that
+ * its registration does not hold, each re-derived under the current rule from
+ * the same frontmatter (deriveRegistration, the derivation module_write runs).
+ * Case is ignored when comparing, as the registration's own dedupe ignores it.
+ *
+ * @param {{path:string, text:string}} file  The module file, from the scan.
+ * @param {object} entry  The fragment registration.
+ * @returns {null|{declared:number, registered:number, recorded:number, missing:Array<{phrase:string, now:'kept'|'substring'|'refused', reasons:string[], recorded:boolean}>}}
+ */
+export function reconcileFrontmatterPhrases(file, entry) {
+  if (!file || typeof file.text !== 'string' || !entry || typeof entry !== 'object') return null;
+  const fm = readRegistrationFrontmatter(file.text);
+  if (!fm.has_triggers) return null;
+  const declared = (Array.isArray(fm.triggers && fm.triggers.phrases) ? fm.triggers.phrases : [])
+    .filter((x) => typeof x === 'string').map((x) => x.trim()).filter(Boolean);
+  if (!declared.length) return null;
+  const t = entry.triggers && typeof entry.triggers === 'object' ? entry.triggers : {};
+  const stored = (Array.isArray(t.phrases) ? t.phrases : []).filter((x) => typeof x === 'string');
+  const held = new Set(stored.map((x) => x.trim().toLowerCase()));
+  const recordedSet = new Set((Array.isArray(entry.trigger_dropped) ? entry.trigger_dropped : [])
+    .filter((d) => d && typeof d.phrase === 'string').map((d) => d.phrase.trim().toLowerCase()));
+  const seen = new Set();
+  const missingPhrases = declared.filter((p) => {
+    const k = p.toLowerCase();
+    if (held.has(k) || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  if (!missingPhrases.length) return null;
+  const d = deriveRegistration(String(file.path || '').replace(/^modules\//, ''), file.text, {}, {});
+  const keptNow = new Set((d.entry.triggers.phrases || []).map((x) => x.toLowerCase()));
+  const why = new Map(d.dropped.filter((x) => x.field === 'phrases').map((x) => [x.value.toLowerCase(), x.reasons]));
+  const missing = missingPhrases.map((p) => {
+    const k = p.toLowerCase();
+    const reasons = why.get(k) || [];
+    const now = keptNow.has(k) ? 'kept'
+      : (reasons.length && reasons.every((r) => r.startsWith(PHRASE_SUBSTRING_REASON_PREFIX)) ? 'substring' : 'refused');
+    return { phrase: p, now, reasons, recorded: recordedSet.has(k) };
+  });
+  return { declared: declared.length, registered: stored.length, recorded: missing.filter((x) => x.recorded).length, missing };
 }
 
 /**
@@ -705,7 +817,9 @@ export function registrationRepairReport(snapshot, cl = checkL(snapshot)) {
     const segments = path ? pathSegmentsOf(path) : new Set();
     const keywordFailures = (Array.isArray(t.keywords) ? t.keywords : []).filter((k) => typeof k === 'string')
       .map((k) => ({ keyword: k, reason: keywordLintReason(k, segments) })).filter((x) => x.reason);
-    const quality = cl.findings.filter((x) => x.source === r.source && x.id === r.id);
+    // A refusal recorded in trigger_dropped is the record of a write, not a
+    // defect of the stored entry, so it does not make the entry a repair candidate.
+    const quality = cl.findings.filter((x) => x.source === r.source && x.id === r.id && x.state !== CL_STATE.REFUSED_ON_WRITE);
     const defects = phraseFailures.length + keywordFailures.length + quality.length;
     const frozen = regs.filter((x) => x.id === r.id && (x.kind === 'manifest' || x.kind === 'manifest_append')).map((x) => x.source);
     const atPath = regs.filter((x) => x.id === r.id && x.kind === 'manifest_fragment' && entryPathOf(snapshot, x.entry || {}) === path);
@@ -724,6 +838,7 @@ export function registrationRepairReport(snapshot, cl = checkL(snapshot)) {
       proposed = {
         triggers: d.entry.triggers,
         triggers_source: d.entry.triggers_source,
+        ...(d.entry.trigger_dropped !== undefined ? { trigger_dropped: d.entry.trigger_dropped } : {}),
         provides: d.entry.provides,
         title: d.entry.title,
         ...(d.entry.version !== undefined ? { version: d.entry.version } : {}),
@@ -1152,7 +1267,7 @@ export const skillConsistencyAuditToolDefinition = {
     + 'C-F one id registered in more than one place. Advisory, never added to the deterministic results: C-E the '
     + 'always-load total in bytes and estimated tokens against the ceiling; C-G provides against body content '
     + '(self-calibrated, dropped above 20% on a 10-module sample); C-H trigger collisions; C-I line_count_estimate and '
-    + 'version drift; C-L derived registration quality (stopword phrases, path-segment keywords, stale version, line count off '
+    + 'version drift; C-L derived registration quality (stopword-only phrases, refusals recorded in trigger_dropped, frontmatter phrases the registration does not hold, path-segment keywords, stale version, line count off '
     + 'by more than 20%, provides with a space, U+FFFD or a double space in a fragment string). C-F also judges each duplicate: '
     + 'a defect when more than one registration was created by module_write, told apart from registrations that predate the '
     + 'tool. registration_repair_report: true adds a read-only report of auto-derived fragment registrations with a proposed '

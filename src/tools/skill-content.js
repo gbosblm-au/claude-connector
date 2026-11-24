@@ -519,8 +519,10 @@ export const moduleWriteToolDefinition = {
     'manifest_entry.provides, else empty with a warning); title from frontmatter title: (else manifest_entry.title, else the id); ' +
     'version from frontmatter version: at every write; line_count_estimate from the file written. A keyword that is a segment ' +
     'of the module\'s own path, or module/skill/note, is dropped; a phrase is dropped unless it has two or more words, at least ' +
-    '12 characters, no stopword at either end and is not part of another phrase on the module. Every drop is listed in ' +
-    'registration_warnings. A string that does not survive UTF-8 unchanged refuses the write (registration_encoding_loss). ' +
+    '12 characters, is not made only of stopwords (WO-2026-11-24-03; a stopword at either end no longer refuses it) and is ' +
+    'not part of another phrase on the module. Every drop is listed in registration_warnings and persisted in the ' +
+    'registration\'s trigger_dropped block beside triggers, as [{ phrase, reason }] (or keyword / task_class), so the ' +
+    'fragment records what the write refused. A string that does not survive UTF-8 unchanged refuses the write (registration_encoding_loss). ' +
     'An update with no triggers or provides supplied keeps the existing registration\'s triggers and provides unchanged. ' +
     'REGISTRATION PLACE: an id already registered at this path is updated in place, never registered again; an id registered ' +
     'in MANIFEST.json or MANIFEST_APPEND.json gets no fragment registration (the reply names the frozen manifest; updating it is ' +

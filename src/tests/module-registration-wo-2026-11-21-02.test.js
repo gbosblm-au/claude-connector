@@ -236,12 +236,16 @@ test( 'P-6: "Alev Türker" in the frontmatter triggers is stored exactly; no "rk
 
 test( 'P9: a registration string that does not survive UTF-8 refuses the write, and nothing is written', async () => {
   // Negative inputs: an unpaired surrogate in a supplied phrase (it becomes
-  // U+FFFD in UTF-8), and a frontmatter title already carrying U+FFFD.
+  // U+FFFD in UTF-8), and a frontmatter title already carrying U+FFFD. The
+  // phrase is one the lint drops (stopwords only, under WO-2026-11-24-03 R1),
+  // so only the check on supplied strings can refuse it: a damaged string is
+  // refused, not quietly dropped.
   const vol = volume();
   try {
     await on( vol, async () => {
       const before = tree( vol );
-      const a = await write( { file: 'existential/surrogate.md', content: '# s\n', manifest_entry: { triggers: { phrases: [ 'a broken \uD800 surrogate phrase' ] } } } );
+      assert.ok( MF.phraseLintReasons( 'into the \uD800 of it', [] ).length > 0, 'the fixture phrase is one the lint drops' );
+      const a = await write( { file: 'existential/surrogate.md', content: '# s\n', manifest_entry: { triggers: { phrases: [ 'into the \uD800 of it' ] } } } );
       assert.equal( a.isError, true );
       assert.equal( a.body.code, 'registration_encoding_loss' );
       assert.match( a.body.refusals[ 0 ].problems[ 0 ].reason, /round-trip/ );
@@ -524,8 +528,12 @@ test( 'S-1: C-L against 100-existential.json as it stood before the hand correct
       for ( const k of [ 'path_segment_keyword', 'stopword_phrase', 'stale_version', 'provides_not_a_token' ] ) assert.ok( kinds.has( k ), `no ${ k } finding: ${ JSON.stringify( cl.by_kind ) }` );
       assert.ok( cl.finding_count >= 4 );
       assert.ok( cl.findings.some( ( f ) => f.kind === 'path_segment_keyword' && f.id === ATTUNE && f.value === 'existential' ) );
-      assert.ok( cl.findings.some( ( f ) => f.kind === 'stopword_phrase' && f.value === 'attunement the' ) );
-      assert.ok( cl.findings.some( ( f ) => f.kind === 'stopword_phrase' && f.value === 'into the' ) );
+      // WO-2026-11-24-03 R1 amended the stopword condition: a phrase is a
+      // stopword phrase only when it consists only of stopwords. "attunement
+      // the" has a content word, so it is no longer one; "into the" still is,
+      // and C-L says it is stored, so the next write would refuse it.
+      assert.equal( cl.findings.some( ( f ) => f.kind === 'stopword_phrase' && f.value === 'attunement the' ), false );
+      assert.ok( cl.findings.some( ( f ) => f.kind === 'stopword_phrase' && f.value === 'into the' && f.state === 'would_be_refused_on_next_write' ) );
       assert.ok( cl.findings.some( ( f ) => f.kind === 'stale_version' && f.id === ANGST && f.value === '1.0.0' && f.frontmatter_version === '1.3.0' ) );
       assert.ok( cl.findings.some( ( f ) => f.kind === 'provides_not_a_token' && f.value === 'fingarettes positive account v220' ) );
       assert.equal( cl.blocks, false, 'C-L is advisory' );

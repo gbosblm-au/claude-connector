@@ -447,6 +447,10 @@ export function parseModuleFrontmatter(content) {
 //              triggers_source "none" and a warning (P2, P3). Every keyword
 //              and phrase, whatever its source, passes the P4 and P5 lint or is
 //              dropped, and every drop is reported, never repaired (P4, P5).
+//              Every drop is also persisted in the entry's trigger_dropped
+//              block, beside triggers, as [{ phrase, reason }] (and
+//              { keyword, reason }, { task_class, reason }), so the fragment
+//              records what the write refused (WO-2026-11-24-03 R3, option b).
 //   provides   frontmatter provides, else manifest_entry.provides, else empty
 //              with a warning (P6). Never a heading.
 //   title      frontmatter title, else manifest_entry.title, else the module
@@ -470,7 +474,7 @@ export function parseModuleFrontmatter(content) {
 // including an explicit empty triggers object, always applies.
 // ---------------------------------------------------------------------------
 
-/** P5: English function words. A trigger phrase may not begin or end with one. Closed list, lower case. */
+/** P5: English function words. A trigger phrase made only of these is refused (WO-2026-11-24-03 R1). Closed list, lower case; unchanged by that order. */
 export const REGISTRATION_STOPWORDS = Object.freeze([
   'a', 'an', 'the',
   'and', 'or', 'but', 'nor', 'so', 'yet', 'if', 'then', 'than', 'as', 'because', 'while', 'though', 'although', 'whether',
@@ -508,7 +512,7 @@ const LIST_FIELDS = new Set(['keywords', 'phrases', 'task_class', 'provides', 'd
 
 /** Keys deriveRegistration decides; every other key of an existing entry is kept on an update. */
 const MANAGED_KEYS = Object.freeze(['id', 'title', 'version', 'category', 'path', 'load_priority', 'triggers',
-  'triggers_source', 'depends_on', 'provides', 'load_strategy', 'line_count_estimate', 'always_load', 'registered_by']);
+  'triggers_source', 'trigger_dropped', 'depends_on', 'provides', 'load_strategy', 'line_count_estimate', 'always_load', 'registered_by']);
 
 /**
  * P8: a file's line count by the compile's own rule (skill-modular.js
@@ -557,14 +561,41 @@ export function keywordLintReason(keyword, segments) {
   return null;
 }
 
-/** Does a phrase end with a stopword? (C-L reports exactly this.) */
-export function phraseEndsWithStopword(phrase) {
-  const tokens = String(phrase || '').trim().split(/\s+/).filter(Boolean);
-  return tokens.length > 0 && STOPWORDS.has(bareWord(tokens[tokens.length - 1]));
+/**
+ * WO-2026-11-24-03 R1: the reason a phrase made only of stopwords is refused.
+ * C-L and the re-derivation read this value; it is not reworded elsewhere.
+ */
+export const PHRASE_STOPWORDS_ONLY_REASON = 'consists only of stopwords';
+
+/** Condition 4's reason begins with this; the re-derivation tells a substring refusal apart by it. */
+export const PHRASE_SUBSTRING_REASON_PREFIX = 'a substring of another phrase on this module';
+
+/**
+ * WO-2026-11-24-03 R1: does a phrase consist only of stopwords? A token with
+ * no letter or digit (a dash, a lone quote) carries no content either, so
+ * "into the -" counts as stopwords only. An empty phrase does too.
+ * (C-L's stopword_phrase finding reports exactly this.)
+ *
+ * @param {*} phrase
+ * @returns {boolean}
+ */
+export function phraseIsStopwordsOnly(phrase) {
+  const tokens = String(phrase ?? '').trim().split(/\s+/).filter(Boolean);
+  return !tokens.some((t) => {
+    const w = bareWord(t);
+    return w !== '' && !STOPWORDS.has(w);
+  });
 }
 
 /**
- * P5: every reason a phrase fails the lint; empty when it passes.
+ * P5, as amended by WO-2026-11-24-03 R1: every reason a phrase fails the lint;
+ * empty when it passes. A phrase is kept only if:
+ *   1. it has two or more words;
+ *   2. it is at least twelve characters long;
+ *   3. it is not made only of stopwords (the old "no stopword at either end"
+ *      rule is gone: it refused "plan a trip to" and "nobody asked me");
+ *   4. it is not a substring of another phrase on the same module.
+ * Conditions 1, 2 and 4 and the stopword list are unchanged.
  *
  * @param {*} phrase
  * @param {string[]} [otherPhrases]  The module's other phrases (substring rule).
@@ -576,15 +607,30 @@ export function phraseLintReasons(phrase, otherPhrases = []) {
   const tokens = p.split(/\s+/).filter(Boolean);
   const reasons = [];
   if (tokens.length < PHRASE_MIN_TOKENS) reasons.push(`fewer than ${PHRASE_MIN_TOKENS} tokens`);
-  const first = bareWord(tokens[0]);
-  const last = bareWord(tokens[tokens.length - 1]);
-  if (STOPWORDS.has(first)) reasons.push(`begins with the stopword "${first}"`);
-  if (tokens.length > 1 && STOPWORDS.has(last)) reasons.push(`ends with the stopword "${last}"`);
+  if (phraseIsStopwordsOnly(p)) reasons.push(`${PHRASE_STOPWORDS_ONLY_REASON} (${tokens.map((t) => `"${bareWord(t) || t}"`).join(', ')})`);
   if ([...p].length < PHRASE_MIN_CHARS) reasons.push(`shorter than ${PHRASE_MIN_CHARS} characters`);
   const lower = p.toLowerCase();
   const container = otherPhrases.find((o) => typeof o === 'string' && o.trim().toLowerCase() !== lower && o.toLowerCase().includes(lower));
-  if (container) reasons.push(`a substring of another phrase on this module ("${container.trim()}")`);
+  if (container) reasons.push(`${PHRASE_SUBSTRING_REASON_PREFIX} ("${container.trim()}")`);
   return reasons;
+}
+
+/**
+ * WO-2026-11-24-03 R3 (option b): the trigger_dropped block a registration
+ * carries beside triggers. One item per value the lint refused on this write,
+ * in the order supplied: { phrase, reason } for a phrase, { keyword, reason }
+ * for a keyword, { task_class, reason } for a task class. reason is every
+ * failed condition, joined by "; ". It is a record of what was refused, never
+ * scored: the compile reads module.triggers only.
+ *
+ * @param {Array<{field:string, value:string, reasons:string[]}>} dropped  deriveRegistration's dropped list.
+ * @returns {object[]}
+ */
+export function triggerDroppedBlock(dropped) {
+  const key = { phrases: 'phrase', keywords: 'keyword', task_class: 'task_class' };
+  return (Array.isArray(dropped) ? dropped : [])
+    .filter((d) => d && key[d.field] && typeof d.value === 'string')
+    .map((d) => ({ [key[d.field]]: d.value, reason: (Array.isArray(d.reasons) ? d.reasons : []).join('; ') }));
 }
 
 function unquote(v) {
@@ -847,6 +893,15 @@ export function deriveRegistration(cleanPath, content, provided = {}, options = 
     triggers = { keywords: [], phrases: [], task_class: [] };
     triggersSource = TRIGGERS_SOURCE.NONE;
   }
+  // WO-2026-11-24-03 R3 (option b): what this write refused, persisted beside
+  // triggers. Retained triggers keep the record that came with them; when that
+  // registration has none, none is invented (it is not known what was refused).
+  let triggerDropped;
+  if (triggersRetained) {
+    triggerDropped = Array.isArray(existing.trigger_dropped) ? JSON.parse(JSON.stringify(existing.trigger_dropped)) : undefined;
+  } else {
+    triggerDropped = triggerDroppedBlock(dropped);
+  }
   for (const d of dropped) {
     warnings.push({ code: 'trigger_dropped', module_id: id, field: d.field, value: d.value, reasons: d.reasons,
       message: `Dropped ${d.field === 'keywords' ? 'keyword' : d.field === 'phrases' ? 'phrase' : d.field} "${d.value}": ${d.reasons.join('; ')}. It was not stored and was not changed into anything else.` });
@@ -876,6 +931,7 @@ export function deriveRegistration(cleanPath, content, provided = {}, options = 
     load_priority: loadPriority,
     triggers,
     ...(triggersSource !== null ? { triggers_source: triggersSource } : {}),
+    ...(triggerDropped !== undefined ? { trigger_dropped: triggerDropped } : {}),
     depends_on: dependsOn,
     provides,
     load_strategy: loadStrategy,

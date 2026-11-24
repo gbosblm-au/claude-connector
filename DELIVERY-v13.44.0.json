@@ -1,0 +1,82 @@
+{
+  "version": "13.44.0",
+  "previous": "13.43.0 (per the CHANGELOG and DELIVERY files in the tree; its package.json said 13.40.0)",
+  "work_orders": [
+    "WO-2026-11-24-03 (trigger-phrase validation: the rule, and making a drop impossible to miss)"
+  ],
+  "companion_release": "Gateway Service 2.376.0 and ts-client-gateway 5.290.0, both unchanged",
+  "decision": "R1 shipped as condition (a) only (refuse a phrase made only of stopwords), with conditions 1, 2 and 4 and the stopword list unchanged. R1 condition (b) refused 4 of R2's 6 must-keep rows and was not shipped (Brian, 2026-11-24). R3 persistence: option (b), a trigger_dropped block beside triggers.",
+  "changed_files": {
+    "new": [
+      "src/tests/trigger-phrases-wo-2026-11-24-03.test.js",
+      "scripts/verify-wo-2026-11-24-03-mutations.mjs",
+      "CHANGELOG-v13.44.0.md",
+      "DELIVERY-v13.44.0.json"
+    ],
+    "modified": [
+      "src/tools/manifest-fragments.js",
+      "src/tools/module-consistency.js",
+      "src/tools/skill-content.js (module_write contract text)",
+      "package.json (13.40.0 to 13.44.0; test:trigger-phrases and wo-2026-11-24-03:mutations scripts)",
+      "src/tests/module-registration-wo-2026-11-21-02.test.js",
+      "scripts/verify-wo-2026-11-21-02-mutations.mjs"
+    ]
+  },
+  "existing_tests_modified": [
+    "module-registration-wo-2026-11-21-02 S-1: 'attunement the' asserted NOT a stopword_phrase (it has a content word under R1); 'into the' still one, with state would_be_refused_on_next_write",
+    "module-registration-wo-2026-11-21-02 P9: the damaged supplied phrase changed from 'a broken \\uD800 surrogate phrase' (now kept by the lint, so the pin stopped being able to fail) to 'into the \\uD800 of it' (still dropped), restoring the pin's protected property"
+  ],
+  "not_shipped_on_purpose": [
+    "data/google-service-account.json (a private key; as noted since 13.38.0)",
+    "node_modules",
+    "__pycache__ files written by the test run"
+  ],
+  "full_suite": {
+    "runner": "/home/claude/wo8/run-connector-suite.mjs: every *.test.js / *.test.mjs under src/ and tests/ in its own `node --experimental-test-module-mocks --test` process (manifest-h2-loop also --expose-gc), NODE_ENV=test, 240 s per file, plus `node src/test.js`; same runner and node_modules on both trees",
+    "before": {
+      "artifact": "the attached claude-connector.zip, unmodified",
+      "files": 83,
+      "collected": 1528,
+      "executed": 1527,
+      "pass": 1484,
+      "fail": 43,
+      "skipped": 1
+    },
+    "after": {
+      "artifact": "this tree (13.44.0)",
+      "files": 84,
+      "collected": 1559,
+      "executed": 1558,
+      "pass": 1515,
+      "fail": 43,
+      "skipped": 1
+    },
+    "executed_delta": "+31, all in src/tests/trigger-phrases-wo-2026-11-24-03.test.js (new). Every other file identical in tests, pass, fail, skipped, cancelled and timeout.",
+    "net_new_failures": 0,
+    "baseline_red_carried": [
+      "src/tests/books-cutover.test.js",
+      "src/tests/bundle-upload-http.test.js",
+      "src/tests/coding-delivery-http.test.js",
+      "src/tests/compile-occupancy.test.js",
+      "src/tests/memory-capacity.test.js",
+      "src/tests/memory-write-guard.test.js",
+      "src/tests/module-intake.test.js",
+      "src/tests/module-ledger.test.js",
+      "src/tests/store-write-discipline.test.js",
+      "src/tests/voice-gpl-boundary.test.js",
+      "src/tests/voice.test.js",
+      "src/tools-memory/memory.test.js",
+      "src/tools-self-model/identity-scoping.test.js",
+      "src/tools-self-model/state-vector.test.js",
+      "tests/manifest-fragments.test.js"
+    ],
+    "baseline_red_note": "Red in both runs with identical counts. Not investigated this round. The 13.42.0 delivery recorded 2 failures on its own runner, so most of these are probably environment-dependent here; that is unverified."
+  },
+  "mutations": {
+    "wo-2026-11-24-03": "26 of 26 red (npm run wo-2026-11-24-03:mutations)",
+    "wo-2026-11-21-02": "50 of 50 red after re-pointing two pins (baseline 50 of 50)",
+    "tenax-2026-10-15": "27 of 47, identical non-red set to the baseline (carried)",
+    "module-files": "74 of 75, the same pin (WO-R5, find text not found) as the baseline (carried)"
+  },
+  "not_measurable_here": "The live tree (27 fragments, 229 entries) is not in the attached archive. R6's three figures and the stopword_phrase before/after count for the live tree come from running skill_consistency_audit with checks [\"C-L\"] on the deployed connector. phil-consent-manufacture and phil-protection-as-theft will appear under frontmatter_phrases_unregistered, with their phrases listed in phrase_rederivation, until each is written again with module_write."
+}
