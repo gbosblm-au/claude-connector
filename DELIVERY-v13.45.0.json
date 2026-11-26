@@ -1,0 +1,93 @@
+{
+  "version": "13.45.0",
+  "previous": "13.44.0",
+  "work_orders": [
+    "WORK-ORDER-2026-11-26-01 (image-aware ingestion): the extractor half of R1, R3, R6, R9 and R11"
+  ],
+  "companion_release": "Gateway Service 2.383.0 (reads the images block). ts-client-gateway 5.293.0 unchanged.",
+  "changed_files": {
+    "new": [
+      "src/tests/book-extract-images.test.js",
+      "src/tests/fixtures/make_image_books.py",
+      "CHANGELOG-v13.45.0.md",
+      "DELIVERY-v13.45.0.json"
+    ],
+    "modified": [
+      "scripts/book_extract.py (--images count|describe, --image-max-bytes, --image-payload-budget; ImageCollector; output byte-identical without --images)",
+      "package.json (13.44.0 to 13.45.0)"
+    ]
+  },
+  "existing_tests_modified": [],
+  "not_shipped_on_purpose": [
+    "data/google-service-account.json (a private key; as noted since 13.38.0)",
+    "node_modules",
+    "__pycache__ files written by the test run"
+  ],
+  "byte_identity": "Without --images, the 13.44.0 script and this one were run on every fixture (illustrated.epub, stripped.epub, text_only.epub, born_digital.pdf, scanned.pdf) and the payloads compared with cmp: identical. With --images, every key but images is deep-equal (src/tests/book-extract-images.test.js C-IMG-TEXT-UNCHANGED).",
+  "full_suite": {
+    "runner": "node --test --test-timeout 60000 'src/tests/*.test.js' (the Connector suite step of .github/workflows/ci.yml), plus the same files one process each for per-file counts; Python 3 with Pillow 12.3.0 and PyMuPDF installed on both runs",
+    "before": {
+      "artifact": "the attached claude-connector.zip (13.44.0), unmodified",
+      "files": 72,
+      "tests": 1382,
+      "pass": 1338,
+      "fail": 43,
+      "skipped": 1,
+      "cancelled": 0
+    },
+    "after": {
+      "artifact": "this tree (13.45.0)",
+      "files": 73,
+      "tests": 1392,
+      "pass": 1348,
+      "fail": 43,
+      "skipped": 1,
+      "cancelled": 0
+    },
+    "executed_delta": "+10, all in the new src/tests/book-extract-images.test.js; every other file's executed, pass, fail and skip counts are identical before and after",
+    "net_new_failures": 0,
+    "baseline_red_carried": "43 failures present before and after, identical by name (upload gate, voice routes, module intake and ledger, memory capacity, skill audit and others); none touches book_extract.py"
+  },
+  "pins": [
+    {
+      "mutation": "positions not carried through the blank-line step",
+      "reddens": true
+    },
+    {
+      "mutation": "a bare filename accepted as alt text",
+      "reddens": true
+    },
+    {
+      "mutation": "figcaption not attributed",
+      "reddens": true
+    },
+    {
+      "mutation": "the scanned-book refusal switched off",
+      "reddens": true
+    },
+    {
+      "mutation": "the images block written to stdout",
+      "reddens": true
+    },
+    {
+      "mutation": "the images block added without --images",
+      "reddens": true
+    },
+    {
+      "mutation": "the PDF anchor taken at its first occurrence",
+      "reddens": true
+    },
+    {
+      "mutation": "no dedupe by content hash",
+      "reddens": true
+    },
+    {
+      "mutation": "the payload ceiling ignored",
+      "reddens": true
+    },
+    {
+      "mutation": "an image in a text-free document never placed",
+      "reddens": true
+    }
+  ]
+}
